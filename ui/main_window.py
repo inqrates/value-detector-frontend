@@ -116,7 +116,6 @@ class MainWindow(QMainWindow):
         for p in self.pages:
             self.stack.addWidget(p)
 
-        # Подключаем сигналы изменений
         self.pages[3].accounts_changed.connect(self._refresh_dashboard)
         self.pages[2].strategies_changed.connect(self._refresh_dashboard)
         self.pages[3].accounts_changed.connect(self._refresh_accounts_in_strategies)
@@ -138,7 +137,7 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: rgba(199,214,223,0.62); padding: 4px 12px;")
         self.statusBar().addPermanentWidget(self.status_label)
 
-        # ---- Создаём движок послегола ----
+        # ---- Движок послегола ----
         self.after_goal_engine = AfterGoalEngine()
 
         # WebSocket
@@ -153,6 +152,20 @@ class MainWindow(QMainWindow):
         self.client.connect()
         self.client.missed_received.connect(self._on_missed)
         self.client.preopen_received.connect(self._on_preopen)
+
+    # ---------- ИСПРАВЛЕНО: корректное завершение ----------
+    def closeEvent(self, event):
+        """Корректное завершение при закрытии окна."""
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+        try:
+            for match_id in list(self.after_goal_engine._monitoring_tasks.keys()):
+                asyncio.create_task(self.after_goal_engine.stop_monitoring(match_id))
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _refresh_dashboard(self):
         self.pages[0].load_accounts()
@@ -181,6 +194,8 @@ class MainWindow(QMainWindow):
 
     # ---------- Обработчики WebSocket ----------
     def _on_signal(self, payload):
+        # Обработку preopen делаем всегда (даже если signal не is_new) —
+        # cooldown защищает от дублей
         if self.strategy_store.is_signal_relevant(payload):
             strategy = self.strategy_store.get_matching_strategy(payload)
             if strategy:
@@ -196,7 +211,6 @@ class MainWindow(QMainWindow):
         if not payload.get("is_new", False):
             return
 
-        print(f"🔔 Новый сигнал: {payload}")
         self.pages[1].add_event("signal", payload)
         signal_count = sum(1 for e in self.pages[1].events if e.get("type") == "Задержка")
         self.pages[0].update_signal_count(signal_count)
@@ -217,21 +231,12 @@ class MainWindow(QMainWindow):
         asyncio.create_task(self.after_goal_engine.place_corridor_bet(payload, strategies))
 
     def _on_advisor(self, payload):
-        # ИЗМЕНЕНО: print только в отладочном режиме — убрал постоянный шум
-        # print(f"📊 [MainWindow] _on_advisor получил: {payload}")
         self.pages[0].update_advisor_stats(payload)
 
     def _on_missed(self, payload):
         self.pages[1].add_event("missed_opportunity", payload)
 
-    # ============================================================
-    # ИЗМЕНЕНО: _on_preopen больше не вызывает несуществующий
-    # метод preopen_match(payload, accounts). Теперь логика та же,
-    # что и в _on_signal: ищем подходящую стратегию и открываем матч
-    # через preopen_match_with_profile.
-    # ============================================================
     def _on_preopen(self, payload):
-        # Ищем стратегию, подходящую под этот preopen-сигнал
         strategy = self.strategy_store.get_matching_strategy(payload)
         if not strategy:
             print(f"⚠️ preopen: нет подходящей стратегии для {payload.get('slow_bk')}")
@@ -249,4 +254,3 @@ class MainWindow(QMainWindow):
                 payload, profile_id, headless
             )
         )
-    # ============================================================

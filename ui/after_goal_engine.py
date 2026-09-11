@@ -23,7 +23,7 @@ from .after_goal import (
 )
 from core.adspower_browser import AdsPowerBrowser
 from .paths import get_app_data_dir
-from .after_goal.match_urls import build_match_url      # <-- ИСПРАВЛЕНО (было без точки)
+from .after_goal.match_urls import build_match_url
 
 ADSPOWER_API_URL = "http://localhost:50325"
 AFTER_GOAL_TIMEOUT = 15
@@ -56,7 +56,6 @@ class AfterGoalEngine:
     # ---------- Публичные методы ----------
 
     async def activate_strategy(self, strategy: dict):
-        """Запускает профиль AdsPower и открывает лайв-раздел БК."""
         profile_id = strategy.get('profile_id')
         if not profile_id:
             logger.warning("Стратегия не имеет profile_id, пропускаем активацию")
@@ -95,7 +94,6 @@ class AfterGoalEngine:
         logger.info(f"✅ Профиль {profile_id} активирован (headless={headless})")
 
     async def preopen_match_with_profile(self, payload: dict, profile_id: str, headless: bool = False):
-        """Открывает конкретный матч (URL или клик) и запускает мониторинг."""
         match_id = payload.get('match_id')
         if not match_id:
             logger.warning("Нет match_id в payload")
@@ -303,7 +301,17 @@ class AfterGoalEngine:
         else:
             logger.error(f"❌ Ошибка отправки Value-ставки: {result.get('error')}")
 
-        await page.close()
+        # ---- ИСПРАВЛЕНО: пересоздаём страницу, чтобы wrapper не держал мёртвый объект ----
+        try:
+            await page.close()
+        except Exception as e:
+            logger.warning(f"Ошибка закрытия страницы: {e}")
+
+        try:
+            new_page = await browser_wrapper._context.new_page()
+            browser_wrapper._page = new_page
+        except Exception as e:
+            logger.error(f"Не удалось пересоздать страницу: {e}")
 
     async def place_arbitrage_bet(self, payload: dict, strategies: List[dict]):
         logger.info("Arbitrage: пока не реализовано")
@@ -316,7 +324,6 @@ class AfterGoalEngine:
     # ---------- AdsPower ----------
 
     async def _get_api_key_for_profile(self, profile_id: str) -> Optional[str]:
-        """Ищет api_key в accounts.json по profile_id."""
         data_dir = get_app_data_dir()
         path = os.path.join(data_dir, "accounts.json")
         logger.info(f"🔍 Поиск accounts.json по пути: {path}")
@@ -373,13 +380,20 @@ class AfterGoalEngine:
     # ---------- Работа со страницами ----------
 
     async def _click_match_on_page(self, page: Page, player1: str, player2: str) -> bool:
-        """Поиск матча в лайв-списке по токенам имён."""
+        """Поиск матча в лайв-списке по токенам имён (с учётом границ слов)."""
         if not player1 or not player2:
             return False
 
         p1_tokens = [t.lower() for t in re.split(r"\W+", player1) if len(t) >= 3]
         p2_tokens = [t.lower() for t in re.split(r"\W+", player2) if len(t) >= 3]
         if not p1_tokens or not p2_tokens:
+            return False
+
+        # ---- ИСПРАВЛЕНО: сравнение по границам слов ----
+        def has_token(text: str, tokens: list) -> bool:
+            for t in tokens:
+                if re.search(rf"\b{re.escape(t)}\b", text):
+                    return True
             return False
 
         try:
@@ -391,7 +405,7 @@ class AfterGoalEngine:
                     text = (await el.inner_text()).lower()
                 except Exception:
                     continue
-                if any(t in text for t in p1_tokens) and any(t in text for t in p2_tokens):
+                if has_token(text, p1_tokens) and has_token(text, p2_tokens):
                     href = await el.get_attribute("href")
                     if not href:
                         continue
@@ -460,7 +474,7 @@ class AfterGoalEngine:
             if not self._monitoring_active.get(match_id, False):
                 return
 
-            # Берём актуальный payload — он мог обновиться через _update_monitoring_params
+            # ---- ИСПРАВЛЕНО: берём актуальный payload, а не из замыкания ----
             current_payload = self._monitoring_payloads.get(match_id, payload)
 
             best_bet = self._choose_best_bet(data, current_payload)
@@ -477,11 +491,11 @@ class AfterGoalEngine:
                 return
 
             bet_data = {
-                "amount": payload.get('bet_size', 100),
+                "amount": current_payload.get('bet_size', 100),
                 "value": best_bet['odd'],
             }
 
-            bk = payload.get('slow_bk')
+            bk = current_payload.get('slow_bk')
             if bk == 'fonbet':
                 bet_data['event_id'] = data.get('match_id')
                 bet_data['factor_id'] = outcome_info.get('id')
@@ -497,20 +511,21 @@ class AfterGoalEngine:
             elif bk == 'olimp':
                 bet_data['matchid'] = outcome_info.get('matchid')
                 bet_data['market_data'] = outcome_info.get('market_data')
-                bet_data['event_name'] = f"{payload['match_teams'][0]} - {payload['match_teams'][1]}"
+                teams = current_payload.get('match_teams', ['', ''])
+                bet_data['event_name'] = f"{teams[0]} - {teams[1]}"
             elif bk == 'ligastavok':
                 bet_data['outcomeId'] = outcome_info.get('outcomeId')
                 bet_data['factorId'] = outcome_info.get('factorId')
             elif bk == 'marathon':
-                # ⚠️ event_id — это eventId Marathon (29053598), НЕ treeId!
+                # event_id — это eventId Marathon (не treeId!)
                 bet_data['coefficient_id'] = outcome_info.get('coefficient_id')
-                bet_data['event_id']       = int(
+                bet_data['event_id'] = int(
                     data.get('event_id')
                     or data.get('match_id')
-                    or payload.get('match_id')
+                    or current_payload.get('match_id')
                 )
-                bet_data['selection_id']   = outcome_info.get('selection_id')
-                bet_data['odds']           = best_bet['odd']
+                bet_data['selection_id'] = outcome_info.get('selection_id')
+                bet_data['odds'] = best_bet['odd']
             else:
                 logger.error(f"Отправка для БК {bk} не реализована")
                 return
@@ -525,7 +540,7 @@ class AfterGoalEngine:
             else:
                 logger.error(f"❌ Ошибка отправки ставки: {result.get('error')}")
 
-        # FonbetHandler и LeonHandler принимают match_id опционально
+        # setup_listener с match_id для Fonbet/Leon, без — для остальных
         try:
             await handler.setup_listener(page, on_update, match_id=match_id)
         except TypeError:
