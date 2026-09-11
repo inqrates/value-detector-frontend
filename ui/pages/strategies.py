@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 
 from ui.components.switch import Switch
 from ui.strategy_store import StrategyStore
+from ui.log_bus import log_bus
 
 logger = logging.getLogger(__name__)
 
@@ -267,22 +268,25 @@ class StrategiesPage(QWidget):
         self.cards_layout.addStretch()
 
     def _on_switch(self, index, on):
-        """ИЗМЕНЕНО: при включении запускаем AdsPower профиль."""
         self.store.set_enabled(index, on)
         self.store.save()
         self.strategies_changed.emit()
 
+        st = self.store.strategies[index]
+        name = st.get('name', '?')
+        log_bus.info("Стратегия", f"'{name}' — {'включена' if on else 'выключена'}")
+
         if on:
             main = self.window()
             if hasattr(main, 'after_goal_engine'):
-                st = self.store.strategies[index]
                 if st.get('profile_id'):
                     asyncio.create_task(
                         main.after_goal_engine.activate_strategy(st)
                     )
-                    logger.info(f"Стратегия '{st.get('name')}' включена, запускаем AdsPower")
+                    logger.info(f"Стратегия '{name}' включена, запускаем AdsPower")
                 else:
-                    logger.warning(f"Стратегия '{st.get('name')}' без profile_id — AdsPower не запущен")
+                    logger.warning(f"Стратегия '{name}' без profile_id")
+                    log_bus.warning("Стратегия", f"'{name}' — не указан profile_id")
 
     def _on_add(self):
         idx = self.store.add()

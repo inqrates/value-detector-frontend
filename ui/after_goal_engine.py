@@ -24,6 +24,7 @@ from .after_goal import (
 from core.adspower_browser import AdsPowerBrowser
 from .paths import get_app_data_dir
 from .after_goal.match_urls import build_match_url
+from ui.log_bus import log_bus
 
 ADSPOWER_API_URL = "http://localhost:50325"
 AFTER_GOAL_TIMEOUT = 15
@@ -88,10 +89,12 @@ class AfterGoalEngine:
                     logger.info(f"✅ Перешли на лайв-раздел {bk}: {start_url}")
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось перейти на {start_url}: {e}")
+                    log_bus.warning("AdsPower", f"Не удалось перейти на лайв-раздел {bk}: {e}")
             else:
                 logger.warning(f"⚠️ Неизвестная БК {bk}, пропускаем переход")
 
         logger.info(f"✅ Профиль {profile_id} активирован (headless={headless})")
+        log_bus.info("Стратегия", f"Активирован профиль {profile_id} ({bk or '—'})")
 
     async def preopen_match_with_profile(self, payload: dict, profile_id: str, headless: bool = False):
         match_id = payload.get('match_id')
@@ -139,15 +142,20 @@ class AfterGoalEngine:
                 await page.goto(match_url, wait_until="domcontentloaded",
                                 timeout=AFTER_GOAL_TIMEOUT * 1000)
                 logger.info(f"✅ Перешли по URL: {match_url}")
+                log_bus.info("Матч", f"Открыт по URL · {player1} vs {player2}")
                 url_ok = True
             except Exception as e:
                 logger.warning(f"⚠️ URL не сработал ({e}), пробуем клик по лайв-списку")
+                log_bus.warning("Матч", f"URL не сработал ({e}), ищем кликом")
 
         if not url_ok:
             found = await self._click_match_on_page(page, player1, player2)
             if not found:
                 logger.error(f"❌ Не удалось открыть матч {player1} vs {player2} ни по URL, ни кликом")
+                log_bus.error("Матч", f"Не удалось открыть {player1} vs {player2}")
                 return
+            else:
+                log_bus.info("Матч", f"Найден кликом · {player1} vs {player2}")
 
         # ---- 3) Регистрация мониторинга ----
         self._pages[match_id] = page
@@ -298,8 +306,13 @@ class AfterGoalEngine:
         if result.get('success'):
             self._last_bet_time[match_id] = time.time()
             logger.info(f"✅ Value-ставка отправлена! ID: {result.get('bet_id', 'N/A')}")
+            log_bus.success(
+                "Ставка",
+                f"Value · {bk} · {amount}₽ · ID {result.get('bet_id', 'N/A')}"
+            )
         else:
             logger.error(f"❌ Ошибка отправки Value-ставки: {result.get('error')}")
+            log_bus.error("Ставка", f"Value · {bk} · {result.get('error')}")
 
         # ---- ИСПРАВЛЕНО: пересоздаём страницу, чтобы wrapper не держал мёртвый объект ----
         try:
@@ -372,9 +385,11 @@ class AfterGoalEngine:
             await wrapper.__aenter__()
             self._browsers[profile_id] = wrapper
             logger.info(f"✅ Браузер для профиля {profile_id} запущен (headless={headless})")
+            log_bus.success("AdsPower", f"Браузер запущен · профиль {profile_id}")
             return wrapper
         except Exception as e:
             logger.error(f"❌ Ошибка запуска AdsPower для профиля {profile_id}: {e}", exc_info=True)
+            log_bus.error("AdsPower", f"Не удалось запустить профиль {profile_id}: {e}")
             return None
 
     # ---------- Работа со страницами ----------
@@ -534,11 +549,18 @@ class AfterGoalEngine:
             if result.get('success'):
                 self._last_bet_time[match_id] = time.time()
                 logger.info(f"✅ Ставка отправлена! ID: {result.get('bet_id', 'N/A')}")
+                log_bus.success(
+                    "Ставка",
+                    f"{bk} · {current_payload.get('bet_size', 100)}₽ · "
+                    f"{best_bet['market']} {best_bet['side']} @ {best_bet['odd']:.2f} · "
+                    f"ID {result.get('bet_id', 'N/A')}"
+                )
                 bet_sent = True
                 event.set()
                 await self.stop_monitoring(match_id)
             else:
                 logger.error(f"❌ Ошибка отправки ставки: {result.get('error')}")
+                log_bus.error("Ставка", f"{bk} · {result.get('error')}")
 
         # setup_listener с match_id для Fonbet/Leon, без — для остальных
         try:
