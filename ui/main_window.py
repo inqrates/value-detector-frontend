@@ -298,31 +298,57 @@ class MainWindow(QMainWindow):
             },
         )
 
+        # Троттлинг: логируем не чаще, чем раз в N секунд на один match_id
+    _value_logged: dict = {}
+    _arbitrage_logged: dict = {}
+    _corridor_logged: dict = {}
+    _LOG_THROTTLE_SEC = 30.0
+
+    def _should_log(self, cache: dict, key, now: float) -> bool:
+        last = cache.get(key, 0.0)
+        if now - last < self._LOG_THROTTLE_SEC:
+            return False
+        cache[key] = now
+        # Не даём кэшу расти бесконечно
+        if len(cache) > 500:
+            for k in list(cache.keys())[:250]:
+                cache.pop(k, None)
+        return True
+
     def _on_value(self, payload):
-        log_bus.info(
-            "Валуй",
-            f"{payload.get('player1')} vs {payload.get('player2')} · "
-            f"{payload.get('bk')} · {payload.get('outcome')} @ {payload.get('odd')}"
-        )
+        import time
+        key = (payload.get('match_id'), payload.get('bk'), payload.get('outcome'))
+        if self._should_log(self._value_logged, key, time.time()):
+            log_bus.info(
+                "Валуй",
+                f"{payload.get('player1')} vs {payload.get('player2')} · "
+                f"{payload.get('bk')} · {payload.get('outcome')} @ {payload.get('odd')}"
+            )
         strategies = self.strategy_store.enabled_list()
         asyncio.create_task(self.after_goal_engine.place_value_bet(payload, strategies))
 
     def _on_arbitrage(self, payload):
-        log_bus.info(
-            "Вилка",
-            f"{payload.get('player1')} vs {payload.get('player2')} · "
-            f"{payload.get('bk_p1')} / {payload.get('bk_p2')} · "
-            f"+{payload.get('profit_percent', 0):.2f}%"
-        )
+        import time
+        key = (payload.get('match_id_p1'), payload.get('bk_p1'), payload.get('bk_p2'))
+        if self._should_log(self._arbitrage_logged, key, time.time()):
+            log_bus.info(
+                "Вилка",
+                f"{payload.get('player1')} vs {payload.get('player2')} · "
+                f"{payload.get('bk_p1')} / {payload.get('bk_p2')} · "
+                f"+{payload.get('profit_percent', 0):.2f}%"
+            )
         strategies = self.strategy_store.enabled_list()
         asyncio.create_task(self.after_goal_engine.place_arbitrage_bet(payload, strategies))
 
     def _on_corridor(self, payload):
-        log_bus.info(
-            "Коридор",
-            f"{payload.get('player1')} vs {payload.get('player2')} · "
-            f"{payload.get('bk1')} / {payload.get('bk2')}"
-        )
+        import time
+        key = (payload.get('match_id1'), payload.get('bk1'), payload.get('bk2'))
+        if self._should_log(self._corridor_logged, key, time.time()):
+            log_bus.info(
+                "Коридор",
+                f"{payload.get('player1')} vs {payload.get('player2')} · "
+                f"{payload.get('bk1')} / {payload.get('bk2')}"
+            )
         strategies = self.strategy_store.enabled_list()
         asyncio.create_task(self.after_goal_engine.place_corridor_bet(payload, strategies))
 

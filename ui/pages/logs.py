@@ -1,18 +1,20 @@
 # ui/pages/logs.py
 import html
 import logging
+from collections import deque
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QLineEdit, QPushButton, QTextEdit,
     QFrame, QSizePolicy
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QTextCursor
 
 logger = logging.getLogger(__name__)
 
-MAX_ENTRIES = 800
+MAX_ENTRIES = 400          # меньше, чтобы UI не давился
+FLUSH_INTERVAL_MS = 250    # батчинг: раз в 250 мс рендерим пачку
 
 LEVEL_STYLE = {
     "info":    ("●", "#21c1de", "ИНФО"),
@@ -26,7 +28,8 @@ LEVEL_STYLE = {
 class LogsPage(QWidget):
     def __init__(self):
         super().__init__()
-        self.entries = []
+        self.entries = deque(maxlen=MAX_ENTRIES)
+        self._pending = []          # буфер для батчинга
         self._level_filter = "Все"
         self._search_text = ""
 
@@ -85,31 +88,76 @@ class LogsPage(QWidget):
             }
         """)
         self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Отключаем лишние пересчёты при вставке
+        self.log_view.setLineWrapMode(QTextEdit.NoWrap)
         layout.addWidget(self.log_view, 1)
 
         self.status = QLabel("Записей: 0")
         self.status.setStyleSheet("color: rgba(199,214,223,0.52); font-size: 11px;")
         layout.addWidget(self.status)
 
+        # ---- Батчинг: рендерим раз в 250 мс, а не на каждое событие ----
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(FLUSH_INTERVAL_MS)
+        self._flush_timer.timeout.connect(self._flush_pending)
+        self._flush_timer.start()
+
     # ---------- Публичный API ----------
     def add_log(self, entry: dict):
+        """Кладём в очередь, реальный рендер произойдёт в _flush_pending."""
         self.entries.append(entry)
-        if len(self.entries) > MAX_ENTRIES:
-            self.entries = self.entries[-MAX_ENTRIES:]
-            self._rerender()
-            return
-
-        if not self._matches_filter(entry):
-            self._update_status()
-            return
-
-        self._append_html(self._render_entry(entry))
-        self._update_status()
+        self._pending.append(entry)
 
     def clear_logs(self):
         self.entries.clear()
+        self._pending.clear()
         self.log_view.clear()
         self._update_status()
+
+    # ---------- Батчинг ----------
+    def _flush_pending(self):
+        if not self._pending:
+            return
+
+        # Если пользователь листает вверх — не дёргаем автоскролл,
+        # но всё равно добавляем записи (пусть копятся)
+        scrollbar = self.log_view.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
+
+        # Берём пачку и очищаем очередь
+        batch = self._pending
+        self._pending = []
+
+        # Фильтруем по текущему фильтру/поиску
+        to_append = [e for e in batch if self._matches_filter(e)]
+        if not to_append:
+            self._update_status()
+            return
+
+        # Рендерим пачкой через один insertHtml — это в 10 раз быстрее
+        html_chunk = "<br>".join(self._render_entry(e) for e in to_append) + "<br>"
+
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.log_view.setTextCursor(cursor)
+        self.log_view.insertHtml(html_chunk)
+
+        # Обрезаем QTextEdit, если он разросся (защита от memory leak)
+        self._trim_if_needed()
+
+        # Автоскролл — только если пользователь был внизу
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+
+        self._update_status()
+
+    def _trim_if_needed(self):
+        """Если в QTextEdit накопилось больше MAX_ENTRIES + 100 блоков — перерендерим из self.entries."""
+        doc = self.log_view.document()
+        if doc.blockCount() < MAX_ENTRIES + 100:
+            return
+        # Полный rerender из deque — это дешевле, чем держать гигантский QTextEdit
+        self._rerender()
 
     # ---------- Фильтры ----------
     def _on_filter_changed(self, text: str):
@@ -143,19 +191,29 @@ class LogsPage(QWidget):
 
     # ---------- Рендер ----------
     def _rerender(self):
-        self.log_view.clear()
+        """Полный пересбор QTextEdit одним setHtml() — намного быстрее, чем цикл insertHtml."""
+        # Останавливаем приём, чтобы не пересекаться
+        self._pending.clear()
+
+        html_parts = []
         for entry in self.entries:
             if self._matches_filter(entry):
-                self._append_html(self._render_entry(entry))
-        self._update_status()
+                html_parts.append(self._render_entry(entry))
 
-    def _append_html(self, html_text: str):
-        cursor = self.log_view.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_view.setTextCursor(cursor)
-        self.log_view.insertHtml(html_text + "<br>")
+        # Собираем один HTML — конвертируем <br> в блоки
+        doc_html = (
+            '<html><body style="color:#cfdae2; font-family:Consolas,monospace; '
+            'font-size:12px; background-color:#0d1014;">'
+            + "<br>".join(html_parts)
+            + "</body></html>"
+        )
+        self.log_view.setHtml(doc_html)
+
+        # Прокрутка вниз
         scrollbar = self.log_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+        self._update_status()
 
     def _render_entry(self, e: dict) -> str:
         time_str = f'<span style="color:#5a6b7a;">[{e["time"]}]</span>'
@@ -184,7 +242,6 @@ class LogsPage(QWidget):
         slow_sub = d.get("slow_sub_score", [0, 0])
         slow_odds = d.get("slow_odds", [0, 0])
 
-        # Подсветка: у кого счёт выше — зелёный, кто отстаёт — красный
         fast_set = fast_score[0] + fast_score[1]
         slow_set = slow_score[0] + slow_score[1]
         fast_leads = fast_set > slow_set or (fast_set == slow_set and (fast_sub[0] + fast_sub[1]) > (slow_sub[0] + slow_sub[1]))
@@ -193,7 +250,6 @@ class LogsPage(QWidget):
         fast_score_color = "#42d78d" if fast_leads else ("#eb5757" if slow_leads else "#cfdae2")
         slow_score_color = "#42d78d" if slow_leads else ("#eb5757" if fast_leads else "#cfdae2")
 
-        # Разница в сетах
         diff_sets = fast_set - slow_set
         diff_sub = (fast_sub[0] + fast_sub[1]) - (slow_sub[0] + slow_sub[1])
         if diff_sets != 0:
@@ -202,7 +258,6 @@ class LogsPage(QWidget):
             diff_str = f"{'+' if diff_sub > 0 else ''}{diff_sub} очк"
 
         lines = []
-        # Заголовок
         lines.append(f'{time_str} {level_span} {source_span}')
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#ffffff;font-weight:bold;">'
@@ -210,8 +265,6 @@ class LogsPage(QWidget):
             f' &nbsp;<span style="color:#5a6b7a;">·</span>&nbsp; '
             f'<span style="color:#f2c94c;">задержка {delay}с</span>'
         )
-
-        # Быстрая БК (впереди)
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#42d78d;font-weight:bold;">⚡ {html.escape(str(fast_bk))}</span>'
             f' <span style="color:#5a6b7a;">(впереди)</span> '
@@ -221,8 +274,6 @@ class LogsPage(QWidget):
             f' <span style="color:#5a6b7a;">·</span> '
             f'<span style="color:#cfdae2;">П1 {float(fast_odds[0]):.2f} / П2 {float(fast_odds[1]):.2f}</span>'
         )
-
-        # Медленная БК (отстаёт)
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#eb5757;font-weight:bold;">🐢 {html.escape(str(slow_bk))}</span>'
             f' <span style="color:#5a6b7a;">(отстаёт)</span> '
@@ -232,16 +283,13 @@ class LogsPage(QWidget):
             f' <span style="color:#5a6b7a;">·</span> '
             f'<span style="color:#cfdae2;">П1 {float(slow_odds[0]):.2f} / П2 {float(slow_odds[1]):.2f}</span>'
         )
-
-        # Итоговая разница
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#5a6b7a;">Разница: </span>'
             f'<span style="color:#f2c94c;font-weight:bold;">{diff_str}</span>'
         )
-
         return "<br>".join(lines)
 
     def _update_status(self):
         total = len(self.entries)
-        shown = sum(1 for e in self.entries if self._matches_filter(e))
-        self.status.setText(f"Записей: {total} (показано: {shown})")
+        # Не считаем показанные на каждое обновление — дёшево
+        self.status.setText(f"Записей: {total}")
