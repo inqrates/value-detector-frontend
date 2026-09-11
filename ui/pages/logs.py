@@ -174,31 +174,71 @@ class LogsPage(QWidget):
         teams = d.get("teams", ["", ""])
         fast_bk = d.get("fast_bk", "?")
         slow_bk = d.get("slow_bk", "?")
-        score = d.get("score", [0, 0])
-        sub = d.get("sub_score", [0, 0])
         delay = d.get("delay", 0)
+
+        fast_score = d.get("fast_score", [0, 0])
+        fast_sub = d.get("fast_sub_score", [0, 0])
         fast_odds = d.get("fast_odds", [0, 0])
+
+        slow_score = d.get("slow_score", [0, 0])
+        slow_sub = d.get("slow_sub_score", [0, 0])
         slow_odds = d.get("slow_odds", [0, 0])
 
+        # Подсветка: у кого счёт выше — зелёный, кто отстаёт — красный
+        fast_set = fast_score[0] + fast_score[1]
+        slow_set = slow_score[0] + slow_score[1]
+        fast_leads = fast_set > slow_set or (fast_set == slow_set and (fast_sub[0] + fast_sub[1]) > (slow_sub[0] + slow_sub[1]))
+        slow_leads = slow_set > fast_set or (slow_set == fast_set and (slow_sub[0] + slow_sub[1]) > (fast_sub[0] + fast_sub[1]))
+
+        fast_score_color = "#42d78d" if fast_leads else ("#eb5757" if slow_leads else "#cfdae2")
+        slow_score_color = "#42d78d" if slow_leads else ("#eb5757" if fast_leads else "#cfdae2")
+
+        # Разница в сетах
+        diff_sets = fast_set - slow_set
+        diff_sub = (fast_sub[0] + fast_sub[1]) - (slow_sub[0] + slow_sub[1])
+        if diff_sets != 0:
+            diff_str = f"{'+' if diff_sets > 0 else ''}{diff_sets} сет"
+        else:
+            diff_str = f"{'+' if diff_sub > 0 else ''}{diff_sub} очк"
+
         lines = []
+        # Заголовок
         lines.append(f'{time_str} {level_span} {source_span}')
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#ffffff;font-weight:bold;">'
             f'{html.escape(str(teams[0]))} vs {html.escape(str(teams[1]))}</span>'
+            f' &nbsp;<span style="color:#5a6b7a;">·</span>&nbsp; '
+            f'<span style="color:#f2c94c;">задержка {delay}с</span>'
         )
+
+        # Быстрая БК (впереди)
         lines.append(
-            f'&nbsp;&nbsp;&nbsp;<span style="color:#8ea3b3;">'
-            f'Счёт {score[0]}:{score[1]} (сет {sub[0]}:{sub[1]}) · '
-            f'задержка <span style="color:#f2c94c;">{delay}с</span></span>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:#42d78d;font-weight:bold;">⚡ {html.escape(str(fast_bk))}</span>'
+            f' <span style="color:#5a6b7a;">(впереди)</span> '
+            f'<span style="color:{fast_score_color};font-weight:bold;">'
+            f'счёт {fast_score[0]}:{fast_score[1]}</span>'
+            f' <span style="color:#8ea3b3;">(сет {fast_sub[0]}:{fast_sub[1]})</span>'
+            f' <span style="color:#5a6b7a;">·</span> '
+            f'<span style="color:#cfdae2;">П1 {float(fast_odds[0]):.2f} / П2 {float(fast_odds[1]):.2f}</span>'
         )
+
+        # Медленная БК (отстаёт)
         lines.append(
-            f'&nbsp;&nbsp;&nbsp;<span style="color:#42d78d;">⚡ {html.escape(str(fast_bk))}</span>'
-            f' <span style="color:#cfdae2;">П1 {float(fast_odds[0]):.2f} / П2 {float(fast_odds[1]):.2f}</span>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:#eb5757;font-weight:bold;">🐢 {html.escape(str(slow_bk))}</span>'
+            f' <span style="color:#5a6b7a;">(отстаёт)</span> '
+            f'<span style="color:{slow_score_color};font-weight:bold;">'
+            f'счёт {slow_score[0]}:{slow_score[1]}</span>'
+            f' <span style="color:#8ea3b3;">(сет {slow_sub[0]}:{slow_sub[1]})</span>'
+            f' <span style="color:#5a6b7a;">·</span> '
+            f'<span style="color:#cfdae2;">П1 {float(slow_odds[0]):.2f} / П2 {float(slow_odds[1]):.2f}</span>'
         )
+
+        # Итоговая разница
         lines.append(
-            f'&nbsp;&nbsp;&nbsp;<span style="color:#eb5757;">🐢 {html.escape(str(slow_bk))}</span>'
-            f' <span style="color:#cfdae2;">П1 {float(slow_odds[0]):.2f} / П2 {float(slow_odds[1]):.2f}</span>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:#5a6b7a;">Разница: </span>'
+            f'<span style="color:#f2c94c;font-weight:bold;">{diff_str}</span>'
         )
+
         return "<br>".join(lines)
 
     def _update_status(self):

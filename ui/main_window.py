@@ -285,11 +285,16 @@ class MainWindow(QMainWindow):
                 "teams": teams,
                 "fast_bk": fast_bk,
                 "slow_bk": slow_bk,
-                "score": payload.get('score', [0, 0]),
-                "sub_score": payload.get('sub_score', [0, 0]),
-                "delay": payload.get('delay', 0),
+                # Быстрая БК
+                "fast_score": payload.get('fast_score', payload.get('score', [0, 0])),
+                "fast_sub_score": payload.get('fast_sub_score', payload.get('sub_score', [0, 0])),
                 "fast_odds": payload.get('fast_odds', [0, 0]),
+                # Медленная БК
+                "slow_score": payload.get('slow_score', [0, 0]),
+                "slow_sub_score": payload.get('slow_sub_score', [0, 0]),
                 "slow_odds": payload.get('slow_odds', [0, 0]),
+                # Прочее
+                "delay": payload.get('delay', 0),
             },
         )
 
