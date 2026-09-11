@@ -2,6 +2,7 @@
 import json
 import os
 import asyncio
+import logging
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame,
     QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox, QLineEdit,
@@ -11,6 +12,8 @@ from PyQt5.QtCore import Qt, pyqtSignal
 
 from ui.components.switch import Switch
 from ui.strategy_store import StrategyStore
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyCard(QFrame):
@@ -185,7 +188,6 @@ class StrategiesPage(QWidget):
         self.max_loss.setSuffix(" подряд")
         auto_form.addRow("Макс. убытков:", self.max_loss)
 
-        # ---- Headless режим ----
         self.headless_checkbox = QCheckBox("Headless режим (без интерфейса)")
         self.headless_checkbox.setChecked(False)
         auto_form.addRow(self.headless_checkbox)
@@ -208,8 +210,6 @@ class StrategiesPage(QWidget):
         self._load_form(0)
 
     # ---------- Загрузка аккаунтов ----------
-    # ui/pages/strategies.py (фрагмент)
-
     def _load_accounts(self):
         from ui.paths import get_app_data_dir
         data_dir = get_app_data_dir()
@@ -223,12 +223,11 @@ class StrategiesPage(QWidget):
         return []
 
     def refresh_accounts(self):
-        """Обновляет список аккаунтов из accounts.json и перезаполняет выпадающий список."""
+        """Обновляет список аккаунтов из accounts.json."""
         self.accounts = self._load_accounts()
         self.account_display_names = self._get_account_display_names()
         self.account_combo.clear()
         self.account_combo.addItems(self.account_display_names)
-        # Восстановить выбор, если возможно
         if 0 <= self.selected < len(self.store.strategies):
             st = self.store.strategies[self.selected]
             profile_id = st.get('profile_id', '')
@@ -253,7 +252,6 @@ class StrategiesPage(QWidget):
             return self.accounts[index]
         return None
 
-
     # ---------- Методы управления карточками ----------
     def _rebuild_cards(self):
         while self.cards_layout.count():
@@ -269,9 +267,22 @@ class StrategiesPage(QWidget):
         self.cards_layout.addStretch()
 
     def _on_switch(self, index, on):
+        """ИЗМЕНЕНО: при включении запускаем AdsPower профиль."""
         self.store.set_enabled(index, on)
         self.store.save()
         self.strategies_changed.emit()
+
+        if on:
+            main = self.window()
+            if hasattr(main, 'after_goal_engine'):
+                st = self.store.strategies[index]
+                if st.get('profile_id'):
+                    asyncio.create_task(
+                        main.after_goal_engine.activate_strategy(st)
+                    )
+                    logger.info(f"Стратегия '{st.get('name')}' включена, запускаем AdsPower")
+                else:
+                    logger.warning(f"Стратегия '{st.get('name')}' без profile_id — AdsPower не запущен")
 
     def _on_add(self):
         idx = self.store.add()

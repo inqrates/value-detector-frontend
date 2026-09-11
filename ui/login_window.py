@@ -12,7 +12,7 @@ from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 
 from ui.styles import APP_STYLE
 from ui.user_session import user_session
-from ui.config_loader import load_config   # <-- импорт
+from ui.config_loader import load_config
 
 
 # ---- Функция получения HWID ----
@@ -29,8 +29,13 @@ def get_hwid() -> str:
         data = f"{volume_serial}{cpu}{mac}{product_id}".encode()
         return hashlib.sha256(data).hexdigest()
     except Exception:
-        # fallback
-        return hashlib.sha256(f"{uuid.getnode()}{volume_serial}".encode()).hexdigest()
+        # Безопасный fallback — не используем volume_serial,
+        # т.к. он может быть не определён
+        try:
+            mac = uuid.getnode()
+        except Exception:
+            mac = 0
+        return hashlib.sha256(f"fallback-{mac}".encode()).hexdigest()
 
 
 class LoginWindow(QWidget):

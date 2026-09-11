@@ -5,6 +5,7 @@ import sys
 from typing import Optional, List, Dict
 from ui.paths import get_app_data_dir
 
+
 def _default(name, stype, enabled, profile_id="", bk=""):
     return {
         "name": name,
@@ -26,12 +27,14 @@ def _default(name, stype, enabled, profile_id="", bk=""):
         "headless": False,
     }
 
+
 DEFAULT_STRATEGIES = [
     _default("Послегол", "After-goal", True, "", ""),
     _default("Валуй", "Value", True, "", ""),
     _default("Вилки", "Arbitrage", False, "", ""),
     _default("Коридоры", "Corridor", False, "", ""),
 ]
+
 
 class StrategyStore:
     def __init__(self):

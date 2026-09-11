@@ -460,7 +460,10 @@ class AfterGoalEngine:
             if not self._monitoring_active.get(match_id, False):
                 return
 
-            best_bet = self._choose_best_bet(data, payload)
+            # Берём актуальный payload — он мог обновиться через _update_monitoring_params
+            current_payload = self._monitoring_payloads.get(match_id, payload)
+
+            best_bet = self._choose_best_bet(data, current_payload)
             if not best_bet:
                 return
 

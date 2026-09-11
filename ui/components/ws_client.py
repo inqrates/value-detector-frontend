@@ -1,9 +1,12 @@
 # ui/components/ws_client.py
 import json
+import logging
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QUrl
 from PyQt5.QtWebSockets import QWebSocket
 from PyQt5.QtNetwork import QAbstractSocket
 from ui.config_loader import load_config
+
+logger = logging.getLogger(__name__)
 
 
 class SignalClient(QObject):
@@ -37,12 +40,24 @@ class SignalClient(QObject):
         if self.socket.state() != QAbstractSocket.ConnectedState:
             self.socket.open(QUrl(self.url))
 
+    def disconnect(self):
+        """Останавливает реконнект и закрывает сокет."""
+        try:
+            self._reconnect_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.socket.close()
+        except Exception:
+            pass
+
     def _on_text(self, message):
         try:
             data = json.loads(message)
             msg_type = data.get("type")
             payload = data.get("payload", {})
-            print(f"📨 [WebSocket] Получено: {msg_type} -> {payload}")
+            # print убран — слишком шумно. Раскомментируй при отладке:
+            # logger.debug(f"WS ← {msg_type}")
             if msg_type == "signal":
                 self.signal_received.emit(payload)
             elif msg_type == "advisor":
@@ -58,4 +73,4 @@ class SignalClient(QObject):
             elif msg_type == "preopen":
                 self.preopen_received.emit(payload)
         except Exception as e:
-            print(f"❌ Ошибка обработки WebSocket: {e}")
+            logger.error(f"Ошибка обработки WebSocket: {e}")
