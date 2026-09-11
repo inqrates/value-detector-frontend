@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Playwright
+.playwright/
+
+# Secrets
+.env
+secrets.json
+accounts.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Тестовые
+test_bet.py
+test_betcity.py
