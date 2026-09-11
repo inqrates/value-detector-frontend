@@ -7,6 +7,7 @@ from .base import BookmakerHandler
 
 logger = logging.getLogger(__name__)
 
+
 class BetcityHandler(BookmakerHandler):
     _callback = None
     _page = None
@@ -22,7 +23,7 @@ class BetcityHandler(BookmakerHandler):
     async def stop_listener(page: Page):
         try:
             page.remove_listener("response", BetcityHandler._on_response)
-        except:
+        except Exception:
             pass
         BetcityHandler._callback = None
         logger.info("Betcity: перехват остановлен")
@@ -62,7 +63,7 @@ class BetcityHandler(BookmakerHandler):
                 score_str = ev_data.get('sc_ev', '0:0')
                 try:
                     score1, score2 = map(int, score_str.split(':'))
-                except:
+                except Exception:
                     score1, score2 = 0, 0
 
                 # Сеты
@@ -74,10 +75,9 @@ class BetcityHandler(BookmakerHandler):
                         last_set = parts[-1].strip()
                         try:
                             sub1, sub2 = map(int, last_set.split(':'))
-                        except:
+                        except Exception:
                             pass
 
-                # Игроки
                 player1 = ev_data.get('name_ht', '')
                 player2 = ev_data.get('name_at', '')
 
@@ -93,7 +93,6 @@ class BetcityHandler(BookmakerHandler):
                     rows = market_data.get('rows', {})
                     for row_id, row in rows.items():
                         row_name = row.get('name', '')
-                        # Извлекаем номер партии (сета) из названия строки
                         match = re.search(r'(\d+)-я партия', row_name)
                         if not match:
                             continue
@@ -102,72 +101,74 @@ class BetcityHandler(BookmakerHandler):
                         data_block = row.get('data', {})
                         for block_key, block in data_block.items():
                             blocks = block.get('blocks', {})
+
                             # --- Победы в партии (market_id=35) ---
                             if market_id == '35':
-                                # Блок W содержит P1 и P2
                                 w_block = blocks.get('W', {})
                                 if 'P1' in w_block:
                                     p1 = w_block['P1']
                                     odd = float(p1.get('kf', 0))
                                     ps = p1.get('ps')
                                     set_markets.setdefault(set_key, {}).setdefault('winner', {})['1'] = odd
-                                    outcome_ids.setdefault(set_key, {}).setdefault('winner', {}).setdefault('1', {}) = {
+                                    # ✅ ИСПРАВЛЕНО
+                                    outcome_ids.setdefault(set_key, {}).setdefault('winner', {})['1'] = {
                                         'id': ev_id,
                                         'pos': ps,
                                         'kf': odd,
-                                        # lv для победы не нужен
                                     }
                                 if 'P2' in w_block:
                                     p2 = w_block['P2']
                                     odd = float(p2.get('kf', 0))
                                     ps = p2.get('ps')
                                     set_markets.setdefault(set_key, {}).setdefault('winner', {})['2'] = odd
-                                    outcome_ids.setdefault(set_key, {}).setdefault('winner', {}).setdefault('2', {}) = {
+                                    # ✅ ИСПРАВЛЕНО
+                                    outcome_ids.setdefault(set_key, {}).setdefault('winner', {})['2'] = {
                                         'id': ev_id,
                                         'pos': ps,
                                         'kf': odd,
                                     }
+
                             # --- Форы по партиям (market_id=905) ---
                             elif market_id == '905':
-                                # Блоки F1, F2, F3, ... содержат F1, F2, Kf_F1, Kf_F2 и lv
                                 for f_key, f_block in blocks.items():
                                     if f_key.startswith('F') and 'Kf_F1' in f_block and 'Kf_F2' in f_block:
                                         line1 = float(f_block.get('F1', 0))
                                         odd1 = float(f_block['Kf_F1'].get('kf', 0))
                                         ps1 = f_block['Kf_F1'].get('ps')
-                                        lv1 = f_block['Kf_F1'].get('lv', 0)  # линия для первого игрока
-                                        # Для второго игрока линия обычно противоположная
+                                        lv1 = f_block['Kf_F1'].get('lv', 0)
+
                                         line2 = float(f_block.get('F2', 0))
                                         odd2 = float(f_block['Kf_F2'].get('kf', 0))
                                         ps2 = f_block['Kf_F2'].get('ps')
                                         lv2 = f_block['Kf_F2'].get('lv', 0)
-                                        # Сохраняем в set_markets
-                                        set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault('1', {}) = {
-                                            'line': line1,
-                                            'odd': odd1,
-                                        }
-                                        set_markets[set_key]['handicap']['2'] = {
-                                            'line': line2,
-                                            'odd': odd2,
-                                        }
-                                        # Сохраняем outcome_ids
-                                        outcome_ids.setdefault(set_key, {}).setdefault('handicap', {}).setdefault('1', {}) = {
+
+                                        # set_markets
+                                        set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault('1', {})
+                                        set_markets[set_key]['handicap']['1']['line'] = line1
+                                        set_markets[set_key]['handicap']['1']['odd'] = odd1
+
+                                        set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault('2', {})
+                                        set_markets[set_key]['handicap']['2']['line'] = line2
+                                        set_markets[set_key]['handicap']['2']['odd'] = odd2
+
+                                        # outcome_ids
+                                        outcome_ids.setdefault(set_key, {}).setdefault('handicap', {}).setdefault('1', {})
+                                        outcome_ids[set_key]['handicap']['1'] = {
                                             'id': ev_id,
                                             'pos': ps1,
                                             'kf': odd1,
                                             'lv': lv1,
                                         }
+                                        outcome_ids.setdefault(set_key, {}).setdefault('handicap', {}).setdefault('2', {})
                                         outcome_ids[set_key]['handicap']['2'] = {
                                             'id': ev_id,
                                             'pos': ps2,
                                             'kf': odd2,
                                             'lv': lv2,
                                         }
-                                        # Если есть несколько линий (F2, F3...), они будут добавлены в отдельные блоки,
-                                        # но мы сохраним только первую найденную (можно расширить для нескольких линий)
-                            # --- Индивидуальные тоталы по партиям (market_id=913) ---
+
+                            # --- Индивидуальные тоталы (market_id=913) ---
                             elif market_id == '913':
-                                # Блоки IT1_T1, IT1_T2, IT2_T1, IT2_T2, ... содержат Tm, Tb и Tot
                                 for it_key, it_block in blocks.items():
                                     if 'Tm' in it_block and 'Tb' in it_block:
                                         line = float(it_block.get('Tot', 0))
@@ -177,54 +178,40 @@ class BetcityHandler(BookmakerHandler):
                                         odd_over = float(it_block['Tb'].get('kf', 0))
                                         ps_over = it_block['Tb'].get('ps')
                                         lv_over = it_block['Tb'].get('lv', line)
-                                        # Определяем, для какого игрока
+
                                         if 'IT1_T1' in it_key:
                                             player = '1'
                                         elif 'IT1_T2' in it_key:
                                             player = '2'
                                         else:
-                                            # Можно попробовать определить по T1/T2 в ключе
                                             if '_T1' in it_key:
                                                 player = '1'
                                             elif '_T2' in it_key:
                                                 player = '2'
                                             else:
                                                 player = 'unknown'
-                                        if player == '1' or player == '2':
-                                            set_key_it = set_key  # используем тот же сет
-                                            set_markets.setdefault(set_key_it, {}).setdefault('it', {}).setdefault(player, {}) = {
-                                                'line': line,
-                                                'over': odd_over,
-                                                'under': odd_under,
-                                            }
-                                            outcome_ids.setdefault(set_key_it, {}).setdefault('it', {}).setdefault(player, {}).setdefault('over', {}) = {
+
+                                        if player in ('1', '2'):
+                                            set_markets.setdefault(set_key, {}).setdefault('it', {}).setdefault(player, {})
+                                            set_markets[set_key]['it'][player]['line'] = line
+                                            set_markets[set_key]['it'][player]['over'] = odd_over
+                                            set_markets[set_key]['it'][player]['under'] = odd_under
+
+                                            outcome_ids.setdefault(set_key, {}).setdefault('it', {}).setdefault(player, {}).setdefault('over', {})
+                                            outcome_ids[set_key]['it'][player]['over'] = {
                                                 'id': ev_id,
                                                 'pos': ps_over,
                                                 'kf': odd_over,
                                                 'lv': lv_over,
                                             }
-                                            outcome_ids[set_key_it]['it'][player]['under'] = {
+                                            outcome_ids.setdefault(set_key, {}).setdefault('it', {}).setdefault(player, {}).setdefault('under', {})
+                                            outcome_ids[set_key]['it'][player]['under'] = {
                                                 'id': ev_id,
                                                 'pos': ps_under,
                                                 'kf': odd_under,
                                                 'lv': lv_under,
                                             }
 
-                # ---- Основные рынки (матч) ----
-                main = ev_data.get('main', {})
-                # Победа в матче (market 69)
-                if '69' in main:
-                    wm = main['69'].get('data', {}).get(str(match_id), {}).get('blocks', {}).get('Wm', {})
-                    if 'P1' in wm:
-                        odd1 = float(wm['P1'].get('kf', 0))
-                        ps1 = wm['P1'].get('ps')
-                        # можно сохранить как общие рынки, но для послегола они не нужны
-                # Тотал матча (market 72)
-                if '72' in main:
-                    t1m = main['72'].get('data', {}).get(str(match_id), {}).get('blocks', {}).get('T1m', {})
-                    # и т.д.
-
-                # Возвращаем собранные данные
                 return {
                     "match_id": match_id,
                     "player1": player1,
@@ -253,7 +240,6 @@ class BetcityHandler(BookmakerHandler):
         (async function() {{
             const data = {json.dumps(bet_data)};
             try {{
-                // Шаг 1: добавить в корзину
                 let addUrl = `https://hdr.betcity.ru/d/basket/add?sys=1&id=${{data.event_id}}&pos=${{data.pos}}&k=${{data.kf}}&ts=0&is_live=1`;
                 if (data.lv !== undefined && data.lv !== null) {{
                     addUrl += `&lv=${{data.lv}}`;
@@ -272,7 +258,6 @@ class BetcityHandler(BookmakerHandler):
                 if (!addResult.ok) throw new Error('Basket add failed: ' + JSON.stringify(addResult));
                 const ts = addResult.reply.ts;
 
-                // Шаг 2: checkout
                 const checkoutUrl = `https://hdr.betcity.ru/d/basket/checkout?type=6&ts=${{ts}}&token=${{data.token}}&tum=${{Date.now()}}_221925&ver=88&csn=ooca9s`;
                 const checkoutResp = await fetch(checkoutUrl, {{
                     method: 'POST',
