@@ -199,19 +199,59 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------- Закрытие ----------
+    
     def closeEvent(self, event):
-        log_bus.info("Система", "Приложение закрывается")
-        self._save_today_stats()
+        # Вторая фаза: реальное закрытие после завершения shutdown
+        if getattr(self, '_closing', False):
+            try:
+                self._save_today_stats()
+            except Exception:
+                pass
+            super().closeEvent(event)
+            return
+
+        # Первая фаза: запускаем graceful shutdown, окно пока не закрываем
+        log_bus.info("Система", "Начинаю graceful shutdown...")
+        event.ignore()
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self._graceful_close())
+            else:
+                loop.run_until_complete(self._graceful_close())
+        except Exception as e:
+            log_bus.warning("Система", f"Ошибка shutdown: {e}")
+            self._closing = True
+            self.close()
+
+    async def _graceful_close(self):
+        # 1) Останавливаем движок: все мониторинги, страницы, AdsPower-браузеры
+        try:
+            await asyncio.wait_for(
+                self.after_goal_engine.shutdown(), timeout=8.0
+            )
+            log_bus.info("Система", "Движок остановлен")
+        except asyncio.TimeoutError:
+            log_bus.warning(
+                "Система",
+                "Движок не остановился за 8с — форсирую выход"
+            )
+        except Exception as e:
+            log_bus.warning("Система", f"Ошибка остановки движка: {e}")
+
+        # 2) Отключаем WebSocket
         try:
             self.client.disconnect()
         except Exception:
             pass
+
+        # 3) Ставим флаг и закрываем окно
+        self._closing = True
         try:
-            for match_id in list(self.after_goal_engine._monitoring_tasks.keys()):
-                asyncio.create_task(self.after_goal_engine.stop_monitoring(match_id))
+            self.close()
         except Exception:
             pass
-        super().closeEvent(event)
 
     # ---------- Логи ----------
     def _on_log_entry(self, entry: dict):
@@ -250,10 +290,9 @@ class MainWindow(QMainWindow):
             strategy = self.strategy_store.get_matching_strategy(payload)
             if strategy:
                 profile_id = strategy.get('profile_id')
-                headless = strategy.get('headless', False)
                 if profile_id:
                     asyncio.create_task(
-                        self.after_goal_engine.preopen_match_with_profile(payload, profile_id, headless)
+                        self.after_goal_engine.preopen_match_with_profile(payload, strategy)
                     )
                 else:
                     log_bus.warning(
@@ -285,20 +324,20 @@ class MainWindow(QMainWindow):
                 "teams": teams,
                 "fast_bk": fast_bk,
                 "slow_bk": slow_bk,
-                # Быстрая БК
+                "sport": payload.get('sport', 'table_tennis'),
+                "fast_phase": payload.get('fast_phase', ''),
+                "tournament": payload.get('tournament', ''),
+                "match_url": payload.get('match_url', ''),
                 "fast_score": payload.get('fast_score', payload.get('score', [0, 0])),
                 "fast_sub_score": payload.get('fast_sub_score', payload.get('sub_score', [0, 0])),
                 "fast_odds": payload.get('fast_odds', [0, 0]),
-                # Медленная БК
                 "slow_score": payload.get('slow_score', [0, 0]),
                 "slow_sub_score": payload.get('slow_sub_score', [0, 0]),
                 "slow_odds": payload.get('slow_odds', [0, 0]),
-                # Прочее
                 "delay": payload.get('delay', 0),
             },
         )
 
-        # Троттлинг: логируем не чаще, чем раз в N секунд на один match_id
     _value_logged: dict = {}
     _arbitrage_logged: dict = {}
     _corridor_logged: dict = {}
@@ -309,7 +348,6 @@ class MainWindow(QMainWindow):
         if now - last < self._LOG_THROTTLE_SEC:
             return False
         cache[key] = now
-        # Не даём кэшу расти бесконечно
         if len(cache) > 500:
             for k in list(cache.keys())[:250]:
                 cache.pop(k, None)
@@ -353,7 +391,6 @@ class MainWindow(QMainWindow):
         asyncio.create_task(self.after_goal_engine.place_corridor_bet(payload, strategies))
 
     def _on_advisor(self, payload):
-        # Обновление дашборда статистикой активных БК
         self.pages[0].update_advisor_stats(payload)
 
     def _on_missed(self, payload):
@@ -370,7 +407,6 @@ class MainWindow(QMainWindow):
         profile_id = strategy.get('profile_id')
         if not profile_id:
             return
-        headless = strategy.get('headless', False)
         asyncio.create_task(
-            self.after_goal_engine.preopen_match_with_profile(payload, profile_id, headless)
+            self.after_goal_engine.preopen_match_with_profile(payload, strategy)
         )

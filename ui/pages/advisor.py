@@ -10,6 +10,22 @@ from datetime import datetime
 
 from ui.components.stat_card import StatCard
 
+# Вид спорта → (иконка, короткое имя)
+SPORT_STYLE = {
+    "table_tennis":     ("🏓", "НТ"),
+    "volleyball":       ("🏐", "Волейбол"),
+    "basketball":       ("🏀", "Баскетбол"),
+    "cyber_basketball": ("🎮", "Кибер"),
+}
+
+SPORT_FILTER_VALUES = {
+    "Все":          None,
+    "🏓 НТ":        "table_tennis",
+    "🏐 Волейбол":  "volleyball",
+    "🏀 Баскетбол": "basketball",
+    "🎮 Кибер":     "cyber_basketball",
+}
+
 
 def _center(text, color=None):
     item = QTableWidgetItem(text)
@@ -22,8 +38,8 @@ def _center(text, color=None):
 class AdvisorPage(QWidget):
     def __init__(self):
         super().__init__()
-        self.events = []  # список для отображения
-        self._event_cache = {}  # ключ: (match_id, type), значение: последнее событие
+        self.events = []
+        self._event_cache = {}
         self.filter_type = "Все"
 
         layout = QVBoxLayout(self)
@@ -55,12 +71,19 @@ class AdvisorPage(QWidget):
         self.type_filter.currentTextChanged.connect(self._refresh)
         filter_layout.addWidget(self.type_filter)
 
-        filter_layout.addSpacing(16)
+        filter_layout.addSpacing(12)
+        filter_layout.addWidget(QLabel("Вид спорта:"))
+        self.sport_filter = QComboBox()
+        self.sport_filter.addItems(list(SPORT_FILTER_VALUES.keys()))
+        self.sport_filter.currentTextChanged.connect(self._refresh)
+        filter_layout.addWidget(self.sport_filter)
+
+        filter_layout.addSpacing(12)
         filter_layout.addWidget(QLabel("Поиск:"))
         self.search = QLineEdit()
         self.search.setPlaceholderText("🔍 Игроки...")
         self.search.textChanged.connect(self._refresh)
-        filter_layout.addWidget(self.search)
+        filter_layout.addWidget(self.search, 1)
 
         filter_layout.addStretch()
         layout.addWidget(filter_card)
@@ -82,28 +105,31 @@ class AdvisorPage(QWidget):
         layout.addStretch()
 
     def add_event(self, event_type: str, payload: dict):
-        """
-        Добавляет событие в ленту.
-        - Для signal используется is_new для фильтрации.
-        - Для arbitrage, value, corridor обновляет существующую запись по match_id.
-        """
         now = datetime.now().strftime("%H:%M:%S")
 
         if event_type == "signal":
-            # Показываем только новые задержки (is_new == True)
             if not payload.get("is_new", False):
                 return
+
+            sport = payload.get("sport", "table_tennis")
+            icon, _ = SPORT_STYLE.get(sport, ("🏓", "НТ"))
+            fast_phase = payload.get("fast_phase", "") or ""
+
+            score = payload.get("fast_score", payload.get("score", [0, 0]))
+            sub = payload.get("fast_sub_score", payload.get("sub_score", [0, 0]))
+
+            teams = payload.get("match_teams", ["", ""])
             row = {
                 "type": "Задержка",
-                "match": f"{payload['match_teams'][0]} vs {payload['match_teams'][1]}",
-                "details": f"Сет: {payload['score'][0]}:{payload['score'][1]} | Счет: {payload['sub_score'][0]}:{payload['sub_score'][1]}",
-                "bk": f"{payload['fast_bk']} → {payload['slow_bk']}",
-                "value": f"Задержка {payload['delay']:.1f}с",
+                "match": f"{icon} {teams[0]} vs {teams[1]}",
+                "details": f"{fast_phase} · {score[0]}:{score[1]} ({sub[0]}:{sub[1]})",
+                "bk": f"{payload.get('fast_bk', '?')} → {payload.get('slow_bk', '?')}",
+                "value": f"Задержка {payload.get('delay', 0):.1f}с",
                 "time": now,
                 "color": QColor("#f2c94c"),
-                "match_id": payload.get('match_id', '')
+                "match_id": payload.get("match_id", ""),
+                "sport": sport,
             }
-            # Для сигналов добавляем новую запись (так как они новые)
             self.events.insert(0, row)
             self._refresh()
             return
@@ -111,25 +137,19 @@ class AdvisorPage(QWidget):
         # Для остальных типов используем кэш по match_id + event_type
         match_id = payload.get('match_id') or payload.get('match_id_p1') or payload.get('match_id1')
         if not match_id:
-            # Если match_id нет, просто добавляем (редкий случай)
             self._add_raw_event(event_type, payload, now)
             return
 
         cache_key = (match_id, event_type)
-        # Формируем строку события
         row = self._create_event_row(event_type, payload, now)
         if not row:
             return
 
-        # Обновляем кэш
         self._event_cache[cache_key] = row
-
-        # Перестраиваем список events из кэша (сортируем по времени)
         self._rebuild_events_from_cache()
         self._refresh()
 
     def _create_event_row(self, event_type, payload, time_str):
-        """Создаёт словарь события для разных типов."""
         if event_type == "arbitrage":
             return {
                 "type": "Вилка",
@@ -139,7 +159,8 @@ class AdvisorPage(QWidget):
                 "value": f"Прибыль {payload['profit_percent']:.2f}%",
                 "time": time_str,
                 "color": QColor("#21c1de"),
-                "match_id": payload.get('match_id_p1', '')
+                "match_id": payload.get('match_id_p1', ''),
+                "sport": payload.get("sport"),
             }
         elif event_type == "value":
             return {
@@ -150,7 +171,8 @@ class AdvisorPage(QWidget):
                 "value": f"Выше среднего в {payload['ratio']:.2f}x",
                 "time": time_str,
                 "color": QColor("#42d78d"),
-                "match_id": payload.get('match_id', '')
+                "match_id": payload.get('match_id', ''),
+                "sport": payload.get("sport"),
             }
         elif event_type == "corridor":
             return {
@@ -161,7 +183,8 @@ class AdvisorPage(QWidget):
                 "value": f"profit {payload['profit']:.2f}",
                 "time": time_str,
                 "color": QColor("#ff8c42"),
-                "match_id": payload.get('match_id1', '')
+                "match_id": payload.get('match_id1', ''),
+                "sport": payload.get("sport"),
             }
         elif event_type == "missed_opportunity":
             return {
@@ -172,32 +195,38 @@ class AdvisorPage(QWidget):
                 "value": payload.get('recommendation', ''),
                 "time": time_str,
                 "color": QColor("#9b59b6"),
-                "match_id": payload.get('match_id', '')
+                "match_id": payload.get('match_id', ''),
+                "sport": payload.get("sport"),
             }
         return None
 
     def _add_raw_event(self, event_type, payload, time_str):
-        """Добавляет событие без кэширования (fallback)."""
         row = self._create_event_row(event_type, payload, time_str)
         if row:
             self.events.append(row)
             self._refresh()
 
     def _rebuild_events_from_cache(self):
-        """Перестраивает список events из кэша (сортировка по времени)."""
-        # Берем все записи из кэша и сортируем по времени (новые сверху)
         self.events = list(self._event_cache.values())
-        # Сортировка по времени (предполагаем, что время в формате HH:MM:SS)
         self.events.sort(key=lambda x: x["time"], reverse=True)
 
     def _refresh(self):
         filter_type = self.type_filter.currentText()
+        sport_target = SPORT_FILTER_VALUES.get(self.sport_filter.currentText())
         search_text = self.search.text().strip().lower()
 
         filtered = []
         for ev in self.events:
             if filter_type != "Все" and ev["type"] != filter_type:
                 continue
+
+            # Вид спорта — применяется только к «Задержке»
+            if sport_target is not None:
+                if ev["type"] != "Задержка":
+                    continue
+                if ev.get("sport") != sport_target:
+                    continue
+
             if search_text and search_text not in ev["match"].lower():
                 continue
             filtered.append(ev)

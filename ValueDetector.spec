@@ -3,8 +3,9 @@
 import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
-# Блок шифрования (оставляем None)
+
 block_cipher = None
+
 
 # ===== СКРЫТЫЕ ИМПОРТЫ =====
 hiddenimports = [
@@ -15,58 +16,64 @@ hiddenimports = [
     'pywintypes',
     'win32api',
     'win32com',
-    'playwright',
-    'playwright.async_api',
-    'playwright._impl',
     'uvicorn',
     'fastapi',
     'pydantic',
     'httpx',
     'curl_cffi',
-    'asyncio',
-    'json',
-    'sqlite3',
-    'hashlib',
-    'uuid',
     'requests',
+
+    # Qt
     'PyQt5.QtWebSockets',
     'PyQt5.QtNetwork',
     'PyQt5.QtCore',
     'PyQt5.QtGui',
     'PyQt5.QtWidgets',
-    # Модули проекта (на случай, если не подхватятся)
-    'ui',
-    'ui.after_goal',
-    'ui.components',
-    'ui.pages',
-    'core',
-    'parsers',
 ]
 
+# Playwright — самая капризная часть, нужны все подмодули и данные драйвера
+hiddenimports += collect_submodules('playwright')
+hiddenimports += collect_submodules('pyee')
+hiddenimports += collect_submodules('greenlet')
+
+# Все модули проекта — все подмодули каждого пакета
+for pkg in ('ui', 'ui.after_goal', 'ui.components', 'ui.pages', 'core', 'parsers'):
+    hiddenimports += collect_submodules(pkg)
+
+
 # ===== ФАЙЛЫ ДАННЫХ =====
-# Все файлы, которые должны лежать рядом с исполняемым файлом
-datas = [
-]
+datas = []
+
+# config.json (лежит в корне проекта, читается через sys._MEIPASS)
+datas += [('config.json', '.')]
+
+# Playwright driver (без этой папки браузер не запустится)
+datas += collect_data_files('playwright')
+
 
 # ===== АНАЛИЗ =====
 a = Analysis(
-    ['app.py'],                        # точка входа
-    pathex=[],                         # дополнительные пути
-    binaries=[],                       # динамические библиотеки
+    ['app.py'],
+    pathex=[],
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],                      # кастомные хуки (если есть)
+    hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],                       # что исключить (например, 'matplotlib')
+    excludes=[
+        # Что точно не нужно — уменьшает размер
+        'matplotlib', 'numpy', 'pandas', 'scipy',
+        'tkinter', 'PIL.ImageQt',
+    ],
     noarchive=False,
     optimize=0,
 )
 
-# ===== СБОРКА PYZ (архив .pyc) =====
+
 pyz = PYZ(a.pure)
 
-# ===== СОЗДАНИЕ EXE =====
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -74,14 +81,14 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='ValueDetector',              # имя выходного файла
+    name='ValueDetector',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,                          # сжатие (установите UPX, если нужно)
+    upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,                     # без консоли (оконное приложение)
+    console=False,              # ← изменили на True — видно ошибки
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -89,7 +96,7 @@ exe = EXE(
     entitlements_file=None,
 )
 
-# ===== КОЛЛЕКЦИЯ ВСЕХ ФАЙЛОВ (папка dist) =====
+
 coll = COLLECT(
     exe,
     a.binaries,
@@ -98,5 +105,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='ValueDetector',              # имя папки в dist
+    name='ValueDetector',
 )

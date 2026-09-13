@@ -1,224 +1,290 @@
 # ui/after_goal/ligastavok.py
+"""
+LigaStavok handler — мультиспорт (НТ / волейбол / баскетбол / кибербаскет).
+
+Формат actionLines (v6):
+  result[0].event.ids.gameId  → вид спорта
+    1246 = table_tennis
+    128  = volleyball
+    25   = basketball
+    23139= cyber_basketball
+  event.statusTranslated      → "4-я четверть" / "2-й сет" / "1-я партия"
+  parts                       → {partKey: {id, title, code, main, ...}}
+    "ot"     — Весь матч
+    "main"   — Основное время
+    "_NNN"   — конкретная фаза (например "_262145496" = 4-я четверть)
+  markets["_NNN"]             → {type: "WIN"/"TTL"/"HAN", partId, ...}
+  outcomes["_NNN"]            → {outcomeKey: "_1"/"x"/"gross"/"less"/"1"/"2", marketId, value, adValue}
+  outcomesWinner              → {partKey: marketId}
+  outcomesHandicap1           → {partKey: marketId}
+  outcomesTotal1              → {partKey: marketId}
+"""
 import json
 import logging
 import re
-import time
-import uuid
-from typing import Dict, Optional
+from typing import Optional, Dict, List
 from playwright.async_api import Page, Response, WebSocket
 from .base import BookmakerHandler
 
 logger = logging.getLogger(__name__)
 
 
+# gameId → sport_key
+_GAME_ID_TO_SPORT = {
+    1246:  "table_tennis",
+    128:   "volleyball",
+    25:    "basketball",
+    23139: "cyber_basketball",
+}
+
+
 class LigaStavokHandler(BookmakerHandler):
     _callback = None
     _page = None
-    _ws = None
 
+    # ============================================================
+    # Перехват
+    # ============================================================
     @staticmethod
     async def setup_listener(page: Page, callback):
         LigaStavokHandler._page = page
         LigaStavokHandler._callback = callback
         page.on("response", LigaStavokHandler._on_response)
-        page.on("websocket", LigaStavokHandler._on_websocket)
-        logger.info("Liga Stavok: перехват установлен (HTTP + WS)")
+        logger.info("LigaStavok: перехват установлен")
 
     @staticmethod
     async def stop_listener(page: Page):
         try:
             page.remove_listener("response", LigaStavokHandler._on_response)
-            page.remove_listener("websocket", LigaStavokHandler._on_websocket)
         except Exception:
             pass
         LigaStavokHandler._callback = None
-        logger.info("Liga Stavok: перехват остановлен")
+        logger.info("LigaStavok: перехват остановлен")
 
     @staticmethod
     async def _on_response(response: Response):
         url = response.url
-        if '/rest/events/v8/eventsList' in url:
+        # v6/actionLines (новый) и v8/eventsList (старый) — оба слушаем
+        if ('actionLines' in url
+                or 'eventsList' in url
+                or '/rest/events/' in url):
             try:
                 data = await response.json()
                 parsed = LigaStavokHandler.parse_update(data)
                 if parsed and LigaStavokHandler._callback:
                     await LigaStavokHandler._callback(parsed)
             except Exception as e:
-                logger.error(f"Liga Stavok HTTP ошибка: {e}")
+                logger.debug(f"LigaStavok parse error: {e}")
 
+    # ============================================================
+    # Определение активной фазы
+    # ============================================================
     @staticmethod
-    def _on_websocket(ws: WebSocket):
-        if 'lds-api-sites.ligastavok.ru/ws' in ws.url:
-            LigaStavokHandler._ws = ws
-            ws.on("framereceived", LigaStavokHandler._on_ws_frame)
-            logger.info("Liga Stavok: WebSocket подключён")
+    def _find_active_phase(event: dict, parts: dict):
+        """
+        Возвращает (phase_num, phase_key, phase_title).
+        phase_key — ключ в parts, например "_262145496".
+        """
+        # 1) Из statusTranslated
+        status = (event.get('statusTranslated') or '').strip()
+        m = re.search(r'(\d+)', status)
+        phase_num = int(m.group(1)) if m else 0
 
+        if phase_num == 0:
+            return 0, None, ''
+
+        # 2) Ищем в parts часть с этим номером
+        # parts: {"ot": ..., "main": ..., "_262145496": {id, title, code, ...}}
+        for key, info in (parts or {}).items():
+            if not isinstance(info, dict):
+                continue
+            title = info.get('title', '')
+            code = info.get('code', '')
+            # совпадение по номеру в title или в code (QUARTER_4, SET_4, ...)
+            if (str(phase_num) in title and ('четверт' in title.lower()
+                                             or 'сет' in title.lower()
+                                             or 'партия' in title.lower())
+                    or re.search(rf'_{phase_num}$', code)):
+                return phase_num, key, title
+
+        return phase_num, None, ''
+
+    # ============================================================
+    # Разбор outcomes фазы
+    # ============================================================
     @staticmethod
-    def _on_ws_frame(frame):
-        try:
-            payload = frame if isinstance(frame, str) else (frame.payload if hasattr(frame, 'payload') else str(frame))
-            data = json.loads(payload)
-            if not isinstance(data, dict):
-                return
-            if data.get("id") is not None:
-                return
-            result = data.get("result", {})
-            payload_data = result.get("payload")
-            if not isinstance(payload_data, list):
-                return
-            parsed = LigaStavokHandler.parse_update(payload_data, is_ws=True)
-            if parsed and LigaStavokHandler._callback:
-                import asyncio
-                asyncio.create_task(LigaStavokHandler._callback(parsed))
-        except Exception as e:
-            logger.error(f"Liga Stavok WS ошибка: {e}")
+    def _parse_phase_outcomes(
+        phase_num: int,
+        outcomes: dict,
+        market_ids: Dict[str, int],
+        set_markets: dict,
+        outcome_ids: dict,
+    ):
+        """
+        market_ids: {"winner": 833343809, "handicap": 833343810, "total": 833349118}
+        """
+        set_key = f"set_{phase_num}"
+        winner_mid = market_ids.get("winner")
+        handicap_mid = market_ids.get("handicap")
+        total_mid = market_ids.get("total")
 
+        for out_key, out in (outcomes or {}).items():
+            if not isinstance(out, dict):
+                continue
+            mid = out.get("marketId")
+            okey = (out.get("outcomeKey") or "").strip()
+            val = out.get("value")
+            adv = out.get("adValue", "0")
+            fac_id = out.get("facId")
+
+            if val is None:
+                continue
+
+            # --- WINNER ---
+            if mid == winner_mid:
+                w = set_markets.setdefault(set_key, {}).setdefault("winner", {})
+                o = outcome_ids.setdefault(set_key, {}).setdefault("winner", {})
+                if okey in ("_1", "1"):
+                    w["1"] = val
+                    o["1"] = {"id": fac_id, "kf": val}
+                elif okey == "x":
+                    w["X"] = val
+                    o["X"] = {"id": fac_id, "kf": val}
+                elif okey in ("_2", "2"):
+                    w["2"] = val
+                    o["2"] = {"id": fac_id, "kf": val}
+
+            # --- HANDICAP ---
+            elif mid == handicap_mid:
+                h = set_markets.setdefault(set_key, {}).setdefault("handicap", {})
+                o = outcome_ids.setdefault(set_key, {}).setdefault("handicap", {})
+                try:
+                    line = float(str(adv).replace(',', '.'))
+                except Exception:
+                    line = 0.0
+                if okey == "1":
+                    h.setdefault("1", {})["line"] = line
+                    h["1"]["odd"] = val
+                    o["1"] = {"id": fac_id, "kf": val, "line": line}
+                elif okey == "2":
+                    h.setdefault("2", {})["line"] = line
+                    h["2"]["odd"] = val
+                    o["2"] = {"id": fac_id, "kf": val, "line": line}
+
+            # --- TOTAL ---
+            elif mid == total_mid:
+                t = set_markets.setdefault(set_key, {}).setdefault("total", {})
+                o = outcome_ids.setdefault(set_key, {}).setdefault("total", {})
+                try:
+                    line = float(str(adv).replace(',', '.'))
+                except Exception:
+                    line = 0.0
+                if okey == "gross":
+                    t["line"] = line
+                    t["over"] = val
+                    o["over"] = {"id": fac_id, "kf": val, "line": line}
+                elif okey == "less":
+                    t["line"] = line
+                    t["under"] = val
+                    o["under"] = {"id": fac_id, "kf": val, "line": line}
+
+    # ============================================================
+    # Основной парсер
+    # ============================================================
     @staticmethod
-    def parse_update(data, is_ws=False) -> Optional[Dict]:
-        """Парсит данные из HTTP (eventsList) или WebSocket (обновления)."""
-        if not is_ws:
-            # HTTP ответ eventsList
-            result = data.get('result', {})
-            events_data = result.get('data', [])
-            for ev in events_data:
-                if ev.get('gameId') != 1246:
-                    continue
-                event_id = ev.get('id')
-                event = ev.get('event', {})
-                scores = ev.get('scores', {})
-                outcomes = ev.get('outcomes', {})
+    def parse_update(data) -> Optional[dict]:
+        """
+        Принимает ответ /v6/actionLines (dict с result[]) или старый /v8/eventsList.
+        Возвращает {match_id, sport, phase_num, score, sub_score, set_markets, outcome_ids}.
+        """
+        if not isinstance(data, dict):
+            return None
 
-                competitors = event.get('competitors', [])
-                if len(competitors) >= 2:
-                    player1 = competitors[0].get('name', '')
-                    player2 = competitors[1].get('name', '')
-                else:
-                    player1 = player2 = ''
+        # --- Достаём список событий ---
+        # 1) actionLines: result = [...]  (список)
+        # 2) actionLine:  result = {event, outcomes, ids, ...}  (одиночное)
+        # 3) eventsList:  result = {data: [...]}
+        result = data.get('result')
+        events_list = []
+        if isinstance(result, list):
+            events_list = result
+        elif isinstance(result, dict):
+            if isinstance(result.get('data'), list):
+                events_list = result['data']
+            elif 'event' in result and 'ids' in result:
+                # Одиночное событие из actionLine
+                events_list = [result]
+            else:
+                return None
+        else:
+            return None
 
-                total = scores.get('total', {})
-                score1 = int(total.get('ScoreTeam1', 0))
-                score2 = int(total.get('ScoreTeam2', 0))
-                current = scores.get('current', {})
-                sub1 = int(current.get('ScoreTeam1', 0))
-                sub2 = int(current.get('ScoreTeam2', 0))
-                if sub1 == 0 and sub2 == 0:
-                    all_sets = scores.get('all', [])
-                    if all_sets:
-                        last = all_sets[-1]
-                        sub1 = int(last.get('ScoreTeam1', 0))
-                        sub2 = int(last.get('ScoreTeam2', 0))
+        for ev in events_list:
+            if not isinstance(ev, dict):
+                continue
 
-                set_markets = {}
-                outcome_ids = {}
+            # --- Определяем вид спорта ---
+            game_id = (ev.get('ids') or {}).get('gameId') or ev.get('gameId')
+            try:
+                game_id = int(game_id) if game_id is not None else 0
+            except Exception:
+                game_id = 0
+            sport_key = _GAME_ID_TO_SPORT.get(game_id)
+            if not sport_key:
+                continue
 
-                for out_key, out_val in outcomes.items():
-                    outcome_key = out_val.get('outcomeKey')
-                    odd = float(out_val.get('value', 0) or 0)
-                    line = float(out_val.get('adValue', 0) or 0)
+            event = ev.get('event')
+            if not isinstance(event, dict):
+                continue
 
-                    set_num = None
-                    if outcome_key and '_' in outcome_key:
-                        parts = outcome_key.split('_')
-                        if len(parts) == 2 and parts[0].isdigit():
-                            set_num = int(parts[0])
-                    if set_num is None:
-                        continue
+            match_id = ev.get('id') or event.get('extId')
+            if not match_id:
+                continue
 
-                    set_key = f"set_{set_num}"
+            # --- Счёт ---
+            scores = ev.get('scores') or {}
+            total = scores.get('total') or {}
+            current = scores.get('current') or {}
+            try:
+                score1 = int(total.get('ScoreTeam1') or 0)
+                score2 = int(total.get('ScoreTeam2') or 0)
+            except Exception:
+                score1 = score2 = 0
+            try:
+                sub1 = int(current.get('ScoreTeam1') or 0)
+                sub2 = int(current.get('ScoreTeam2') or 0)
+            except Exception:
+                sub1 = sub2 = 0
 
-                    # ---- Победа игрока 1 ----
-                    if outcome_key in ('_1', '1'):
-                        set_markets.setdefault(set_key, {}).setdefault('winner', {})['1'] = odd
-                        # ✅ ИСПРАВЛЕНО: сначала setdefault, потом присваивание через ['1']
-                        outcome_ids.setdefault(set_key, {}).setdefault('winner', {})['1'] = {
-                            'outcomeId': out_key,
-                            'factorId': None,
-                            'odd': odd,
-                        }
+            # --- Активная фаза ---
+            parts = ev.get('parts') or {}
+            phase_num, phase_key, phase_title = LigaStavokHandler._find_active_phase(event, parts)
 
-                    # ---- Победа игрока 2 ----
-                    elif outcome_key in ('_2', '2'):
-                        set_markets.setdefault(set_key, {}).setdefault('winner', {})['2'] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault('winner', {})['2'] = {
-                            'outcomeId': out_key,
-                            'factorId': None,
-                            'odd': odd,
-                        }
+            set_markets: Dict[str, dict] = {}
+            outcome_ids: Dict[str, dict] = {}
 
-                    # ---- Тотал больше ----
-                    elif outcome_key == 'gross':
-                        set_markets.setdefault(set_key, {}).setdefault('total', {})['line'] = line
-                        set_markets[set_key]['total']['over'] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault('total', {})['over'] = {
-                            'outcomeId': out_key,
-                            'factorId': None,
-                            'odd': odd,
-                        }
+            # --- marketId для каждого рынка в активной фазе ---
+            if phase_key:
+                winner_map = ev.get('outcomesWinner') or {}
+                handicap_map = ev.get('outcomesHandicap1') or {}
+                total_map = ev.get('outcomesTotal1') or {}
 
-                    # ---- Тотал меньше ----
-                    elif outcome_key == 'less':
-                        set_markets.setdefault(set_key, {}).setdefault('total', {})['line'] = line
-                        set_markets[set_key]['total']['under'] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault('total', {})['under'] = {
-                            'outcomeId': out_key,
-                            'factorId': None,
-                            'odd': odd,
-                        }
-
-                return {
-                    "match_id": event_id,
-                    "player1": player1,
-                    "player2": player2,
-                    "score1": score1,
-                    "score2": score2,
-                    "sub_score1": sub1,
-                    "sub_score2": sub2,
-                    "set_markets": set_markets,
-                    "outcome_ids": outcome_ids,
+                market_ids = {
+                    "winner":   winner_map.get(phase_key),
+                    "handicap": handicap_map.get(phase_key),
+                    "total":    total_map.get(phase_key),
                 }
 
-        else:
-            # WebSocket обновления — более точные
-            set_markets = {}
-            outcome_ids = {}
-            match_id = None
-
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                ev_id = item.get('id')
-                if ev_id:
-                    match_id = ev_id
-                ws_data = item.get('data', {})
-                if not isinstance(ws_data, dict):
-                    continue
-
-                headers = ws_data.get('headers', [])
-                score1 = score2 = sub1 = sub2 = None
-                for h in headers:
-                    path = h.get('path')
-                    val = h.get('value')
-                    if path == '/scores/current/ScoreTeam1':
-                        sub1 = int(val)
-                    elif path == '/scores/current/ScoreTeam2':
-                        sub2 = int(val)
-                    elif path == '/scores/total/ScoreTeam1':
-                        score1 = int(val)
-                    elif path == '/scores/total/ScoreTeam2':
-                        score2 = int(val)
-
-                outcomes = ws_data.get('outcomes', [])
-                for op in outcomes:
-                    op_type = op.get('op')
-                    path = op.get('path')
-                    val = op.get('value')
-                    if op_type in ('add', 'replace') and isinstance(val, dict):
-                        # Здесь можно было бы обновлять outcome_ids,
-                        # но пока оставим без изменений — HTTP-ответ главный.
-                        pass
+                if any(market_ids.values()):
+                    LigaStavokHandler._parse_phase_outcomes(
+                        phase_num, ev.get('outcomes') or {}, market_ids,
+                        set_markets, outcome_ids,
+                    )
 
             return {
-                "match_id": match_id,
+                "match_id": str(match_id),
+                "sport": sport_key,
+                "phase_num": phase_num,
                 "score1": score1,
                 "score2": score2,
                 "sub_score1": sub1,
@@ -229,14 +295,16 @@ class LigaStavokHandler(BookmakerHandler):
 
         return None
 
+    # ============================================================
+    # Отправка ставки (без изменений)
+    # ============================================================
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
-        """Отправляет ставку через API Лиги Ставок."""
         script = f"""
         (async function() {{
             const data = {json.dumps(bet_data)};
 
-            const accountNumber = parseInt(localStorage.getItem('accountNumber')) || 0;
+            let accountNumber = parseInt(localStorage.getItem('accountNumber')) || 0;
             if (!accountNumber) {{
                 const getCookie = (name) => {{
                     const value = `; ${{document.cookie}}`;
@@ -248,9 +316,7 @@ class LigaStavokHandler(BookmakerHandler):
                 if (xUser) {{
                     try {{
                         const userObj = JSON.parse(decodeURIComponent(xUser));
-                        if (userObj.accountNumber) {{
-                            accountNumber = userObj.accountNumber;
-                        }}
+                        if (userObj.accountNumber) accountNumber = userObj.accountNumber;
                     }} catch(e) {{}}
                 }}
             }}

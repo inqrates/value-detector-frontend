@@ -1,4 +1,25 @@
 # ui/after_goal/olimp.py
+"""
+Olimp handler — мультиспорт (НТ / волейбол / баскетбол / кибербаскет).
+
+Форматы ответа:
+  1) LIVE_EVENTS_GET_SOME — массив [{operationId, id, payload}] для конкретного матча.
+  2) sports-with-competitions-with-events — агрегат для live-страницы.
+
+Внутри payload конкретного матча:
+  sportId: "40" (НТ), "10" (волей), "5" (баск), "140" (кибер)
+  comment: "(30:10, 8:18) N-я четверть" (баск) / "(21:25, 8:6) #N ..." (волей)
+  mapsScore: [ {team1, team2}, ... ] — очки по фазам
+  outcomes: [ {tableType, shortName, basketId, probability, param}, ... ]
+
+Ключ для ставки — basketId (`<match>:<pos>:<marketId>:<param>:<side>:0:0:<spid>`),
+он уходит в place_bet как market_data.
+
+Ставка (HAR 2026-09-12):
+  1) POST /api/basket/add    → hash позиции
+  2) POST /api/basket/save   → betId
+Все секреты (x-token, x-guid, user_session) читаются из браузера AdsPower.
+"""
 import json
 import logging
 import re
@@ -7,10 +28,22 @@ from .base import BookmakerHandler
 
 logger = logging.getLogger(__name__)
 
+
+_SPORT_ID_TO_KEY = {
+    "40":  "table_tennis",
+    "10":  "volleyball",
+    "5":   "basketball",
+    "140": "cyber_basketball",
+}
+
+
 class OlimpHandler(BookmakerHandler):
     _callback = None
     _page = None
 
+    # ============================================================
+    # Перехват
+    # ============================================================
     @staticmethod
     async def setup_listener(page: Page, callback):
         OlimpHandler._page = page
@@ -22,7 +55,7 @@ class OlimpHandler(BookmakerHandler):
     async def stop_listener(page: Page):
         try:
             page.remove_listener("response", OlimpHandler._on_response)
-        except:
+        except Exception:
             pass
         OlimpHandler._callback = None
         logger.info("Olimp: перехват остановлен")
@@ -30,124 +63,303 @@ class OlimpHandler(BookmakerHandler):
     @staticmethod
     async def _on_response(response: Response):
         url = response.url
-        if 'api/v4/0/live/broadcast' in url or 'api/v4/0/live/sports-with-competitions-with-events' in url:
-            try:
-                data = await response.json()
-                parsed = OlimpHandler.parse_update(data)
-                if parsed and OlimpHandler._callback:
-                    await OlimpHandler._callback(parsed)
-            except Exception as e:
-                logger.error(f"Olimp ошибка: {e}")
+        if 'api/v4/0/live/' not in url:
+            return
 
-    @staticmethod
-    def parse_update(data: dict) -> dict:
-        # Структура Olimp: data[0].payload.competitionsWithEvents[].events[]
-        if not isinstance(data, list) or not data:
-            return None
+        try:
+            data = await response.json()
+        except Exception:
+            return
 
-        first = data[0]
-        payload = first.get('payload', {})
-        competitions = payload.get('competitionsWithEvents', [])
-        for comp in competitions:
-            events = comp.get('events', [])
-            for ev in events:
-                # Проверяем sportId (40 = настольный теннис)
-                if ev.get('sportId') != 40:
-                    continue
-                match_id = ev.get('id')
-                score_str = ev.get('score', '0:0')
+        if not isinstance(data, list):
+            return
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            payload = item.get('payload')
+            if not isinstance(payload, dict):
+                continue
+
+            parsed = OlimpHandler._parse_payload(payload)
+            if parsed and OlimpHandler._callback:
                 try:
-                    score1, score2 = map(int, score_str.split(':'))
-                except:
-                    score1, score2 = 0, 0
+                    await OlimpHandler._callback(parsed)
+                except Exception as e:
+                    logger.error(f"Olimp callback error: {e}")
 
-                # Сеты из комментария
-                comment = ev.get('comment', '')
-                sub1, sub2 = 0, 0
-                if comment:
-                    sets = re.findall(r'(\d+)[:*](\d+)', comment)
-                    if sets:
-                        last = sets[-1]
-                        sub1 = int(last[0])
-                        sub2 = int(last[1])
+    # ============================================================
+    # Разбор payload — конкретный матч или агрегат
+    # ============================================================
+    @staticmethod
+    def _parse_payload(payload: dict):
+        # Вариант 1: конкретный матч (broadcast/LIVE_EVENTS_GET_SOME)
+        if 'sportId' in payload and 'outcomes' in payload:
+            return OlimpHandler._parse_event(payload)
 
-                # Коэффициенты из outcomes
-                outcomes = ev.get('outcomes', [])
-                set_markets = {}
-                outcome_ids = {}
-                # Определяем текущий сет
-                set_num = 1
-                if comment:
-                    match = re.search(r'#(\d+)', comment)
-                    if match:
-                        set_num = int(match.group(1))
-                set_key = f"set_{set_num}"
-
-                for out in outcomes:
-                    table_type = out.get('tableType', '')
-                    short_name = out.get('shortName', '')
-                    probability = float(out.get('probability', 0))
-                    param = out.get('param', '')
-                    # Для ставки нужны matchid и market_data
-                    # Их можно получить из basketId или сформировать
-                    basket_id = out.get('basketId', '')
-                    # Пример basketId: "85771965:1:22:-9999.0:1:0:0:40"
-                    if basket_id:
-                        parts = basket_id.split(':')
-                        if len(parts) >= 8:
-                            outcome_ids.setdefault(set_key, {}).setdefault('_raw', {})[short_name] = {
-                                'matchid': parts[0],
-                                'market_data': basket_id,
-                            }
-
-                    if table_type == 'RESULT' and short_name in ('П1', 'П2'):
-                        side = '1' if short_name == 'П1' else '2'
-                        set_markets.setdefault(set_key, {}).setdefault('winner', {})[side] = probability
-                    elif table_type == 'HANDICAP' and short_name in ('Фора 1', 'Фора 2'):
-                        side = '1' if short_name == 'Фора 1' else '2'
-                        line = float(param) if param else 0
-                        set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault(side, {})['line'] = line
-                        set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault(side, {})['odd'] = probability
-                    elif table_type == 'TOTAL' and short_name in ('ТотМ', 'ТотБ'):
-                        side = 'under' if short_name == 'ТотМ' else 'over'
-                        line = float(param) if param else 0
-                        set_markets.setdefault(set_key, {}).setdefault('total', {})['line'] = line
-                        set_markets.setdefault(set_key, {}).setdefault('total', {})[side] = probability
-
-                return {
-                    "match_id": match_id,
-                    "score1": score1,
-                    "score2": score2,
-                    "sub_score1": sub1,
-                    "sub_score2": sub2,
-                    "set_markets": set_markets,
-                    "outcome_ids": outcome_ids,
-                }
+        # Вариант 2: агрегат (sports-with-competitions-with-events)
+        comps = payload.get('competitionsWithEvents')
+        if isinstance(comps, list):
+            for block in comps:
+                if not isinstance(block, dict):
+                    continue
+                for event in (block.get('events') or []):
+                    if not isinstance(event, dict):
+                        continue
+                    parsed = OlimpHandler._parse_event(event)
+                    if parsed:
+                        return parsed
         return None
 
+    # ============================================================
+    # Разбор одного матча
+    # ============================================================
+    @staticmethod
+    def _parse_event(event: dict):
+        sport_id = str(event.get('sportId') or '')
+        sport_key = _SPORT_ID_TO_KEY.get(sport_id)
+        if not sport_key:
+            return None
+
+        match_id = str(event.get('id') or '')
+        if not match_id:
+            return None
+
+        player1 = event.get('team1Name', '') or ''
+        player2 = event.get('team2Name', '') or ''
+
+        # --- Общий счёт ---
+        score_str = event.get('score', '') or '0:0'
+        try:
+            score1, score2 = map(int, score_str.split(':'))
+        except Exception:
+            score1 = score2 = 0
+
+        # --- Счёт по фазам ---
+        maps = event.get('mapsScore') or []
+        pairs = []
+        for m in maps:
+            if isinstance(m, dict):
+                try:
+                    pairs.append((int(m.get('team1', 0) or 0),
+                                  int(m.get('team2', 0) or 0)))
+                except Exception:
+                    pairs.append((0, 0))
+
+        sub1 = sub2 = 0
+        if pairs:
+            sub1, sub2 = pairs[-1]
+
+        # --- Номер фазы ---
+        comment = event.get('comment', '') or ''
+        phase_num = 0
+
+        if sport_key in ('basketball', 'cyber_basketball'):
+            mm = re.search(r'(\d+)-я\s+четверть', comment)
+            if mm:
+                phase_num = int(mm.group(1))
+            else:
+                phase_num = len(pairs) if pairs else 1
+        elif sport_key == 'volleyball':
+            mm = re.search(r'#(\d+)', comment)
+            if mm:
+                phase_num = int(mm.group(1))
+            else:
+                phase_num = score1 + score2 + 1
+        else:  # НТ
+            mm = re.search(r'#(\d+)', comment)
+            if mm:
+                phase_num = int(mm.group(1))
+            else:
+                phase_num = score1 + score2 + 1
+
+        set_key = f"set_{phase_num}"
+        set_markets: dict = {}
+        outcome_ids: dict = {}
+
+        outcomes = event.get('outcomes', []) or []
+
+        # ---- НТ: старая логика (RESULT/HANDICAP/TOTAL без фазовых OTHER) ----
+        if sport_key == 'table_tennis':
+            for out in outcomes:
+                if not isinstance(out, dict):
+                    continue
+                table_type = out.get('tableType', '')
+                short_name = out.get('shortName', '')
+                basket_id = out.get('basketId', '') or ''
+                if not basket_id:
+                    continue
+                try:
+                    prob = float(str(out.get('probability', '0')).replace(',', '.'))
+                except Exception:
+                    continue
+                if prob <= 0:
+                    continue
+                try:
+                    param = float(str(out.get('param', '0')).replace(',', '.'))
+                except Exception:
+                    param = 0.0
+
+                if table_type == 'RESULT' and short_name in ('П1', 'П2'):
+                    side = '1' if short_name == 'П1' else '2'
+                    set_markets.setdefault(set_key, {}).setdefault('winner', {})[side] = prob
+                    outcome_ids.setdefault(set_key, {}).setdefault('winner', {})[side] = {
+                        'market_data': basket_id, 'kf': prob,
+                    }
+                elif table_type == 'HANDICAP' and short_name in ('Фора 1', 'Фора 2'):
+                    side = '1' if short_name == 'Фора 1' else '2'
+                    h = set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault(side, {})
+                    h['line'] = param
+                    h['odd'] = prob
+                    outcome_ids.setdefault(set_key, {}).setdefault('handicap', {}).setdefault(side, {})
+                    outcome_ids[set_key]['handicap'][side] = {
+                        'market_data': basket_id, 'kf': prob, 'line': param,
+                    }
+                elif table_type == 'TOTAL' and short_name in ('ТотМ', 'ТотБ'):
+                    side = 'under' if short_name == 'ТотМ' else 'over'
+                    t = set_markets.setdefault(set_key, {}).setdefault('total', {})
+                    t['line'] = param
+                    t[side] = prob
+                    outcome_ids.setdefault(set_key, {}).setdefault('total', {}).setdefault(side, {})
+                    outcome_ids[set_key]['total'][side] = {
+                        'market_data': basket_id, 'kf': prob, 'line': param,
+                    }
+
+        # ---- Волей / Баскет / Кибер: фазовые рынки OTHER ----
+        else:
+            for out in outcomes:
+                if not isinstance(out, dict):
+                    continue
+                if out.get('tableType') != 'OTHER':
+                    continue
+
+                short_name = (out.get('shortName') or '').strip()
+                if not short_name:
+                    continue
+
+                try:
+                    prob = float(str(out.get('probability', '0')).replace(',', '.'))
+                except Exception:
+                    continue
+                if prob <= 0:
+                    continue
+
+                try:
+                    param = float(str(out.get('param', '0')).replace(',', '.'))
+                except Exception:
+                    param = 0.0
+
+                basket_id = out.get('basketId', '') or ''
+                if not basket_id:
+                    continue
+
+                # --- Победа в фазе: Ч4П1, П2П1 ---
+                m = re.match(r'^[ЧП](\d+)П([12])$', short_name)
+                if m:
+                    n = int(m.group(1))
+                    if n != phase_num:
+                        continue
+                    side = m.group(2)
+                    set_markets.setdefault(set_key, {}).setdefault('winner', {})[side] = prob
+                    outcome_ids.setdefault(set_key, {}).setdefault('winner', {})[side] = {
+                        'market_data': basket_id, 'kf': prob,
+                    }
+                    continue
+
+                # --- Фора в фазе: Ч4Ф1К, П2Ф1К ---
+                m = re.match(r'^[ЧП](\d+)Ф([12])К$', short_name)
+                if m:
+                    n = int(m.group(1))
+                    if n != phase_num:
+                        continue
+                    side = m.group(2)
+                    h = set_markets.setdefault(set_key, {}).setdefault('handicap', {}).setdefault(side, {})
+                    # не перезаписываем (первая фора в списке = основная)
+                    if 'line' not in h:
+                        h['line'] = param
+                        h['odd'] = prob
+                        outcome_ids.setdefault(set_key, {}).setdefault('handicap', {}).setdefault(side, {})
+                        outcome_ids[set_key]['handicap'][side] = {
+                            'market_data': basket_id, 'kf': prob, 'line': param,
+                        }
+                    continue
+
+                # --- Тотал в фазе: Ч4ТотЧ4ТотМ, П2ТотП2ТотМ ---
+                m = re.match(r'^[ЧП](\d+)Тот[ЧП]\d+Тот([МБ])$', short_name)
+                if m:
+                    n = int(m.group(1))
+                    if n != phase_num:
+                        continue
+                    side = 'under' if m.group(2) == 'М' else 'over'
+                    t = set_markets.setdefault(set_key, {}).setdefault('total', {})
+                    if 'line' not in t:
+                        t['line'] = param
+                    t[side] = prob
+                    outcome_ids.setdefault(set_key, {}).setdefault('total', {}).setdefault(side, {})
+                    outcome_ids[set_key]['total'][side] = {
+                        'market_data': basket_id, 'kf': prob, 'line': param,
+                    }
+                    continue
+
+        if not set_markets:
+            return None
+
+        return {
+            "match_id": match_id,
+            "player1": player1,
+            "player2": player2,
+            "sport": sport_key,
+            "phase_num": phase_num,
+            "score1": score1,
+            "score2": score2,
+            "sub_score1": sub1,
+            "sub_score2": sub2,
+            "set_markets": set_markets,
+            "outcome_ids": outcome_ids,
+        }
+
+    # ============================================================
+    # Отправка ставки — basket/add + basket/save
+    # ============================================================
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
-        # bet_data: matchid, market_data, value, amount
+        """
+        bet_data:
+          - market_data (str)  — basketId
+          - kf          (float)
+          - amount      (float)
+        """
         script = f"""
         (async function() {{
             const data = {json.dumps(bet_data)};
-            const getCookie = (name) => {{
-                const value = `; ${{document.cookie}}`;
-                const parts = value.split(`; ${{name}}=`);
-                if (parts.length === 2) return parts.pop().split(';').shift();
-                return '';
-            }};
-            const xToken = getCookie('x-token') || localStorage.getItem('x-token') || '';
-            const xGuid = getCookie('x-guid') || localStorage.getItem('x-guid') || '';
-
             try {{
-                const addPayload = {{
-                    sid: 1,
-                    value: data.value,
-                    matchid: data.matchid,
-                    market_data: data.market_data,
-                    event_name: data.event_name || '',
+                const getCookie = (name) => {{
+                    const m = document.cookie.match(new RegExp('(^|; )' + name + '=([^;]*)'));
+                    return m ? decodeURIComponent(m[2]) : '';
                 }};
+
+                const session = getCookie('user_session');
+                if (!session) {{
+                    return {{ success: false, error: 'Olimp: cookie user_session не найден (не залогинен?)' }};
+                }}
+
+                const xToken = getCookie('x-token') || localStorage.getItem('x-token') || '';
+                const xGuid = getCookie('x-guid') || getCookie('visitor_id') || '';
+
+                const mdParts = String(data.market_data).split(':');
+                const sportId = parseInt(mdParts[mdParts.length - 1]) || 0;
+
+                // --- 1) basket/add ---
+                const coefsIds = JSON.stringify([[data.market_data, String(data.kf), 1]]);
+                const addBody = {{
+                    coefs_ids: coefsIds,
+                    sport_id: sportId,
+                    time_shift: 0,
+                    lang_id: '0',
+                    platforma: 'SITE_CUPIS',
+                    session: session
+                }};
+
                 const addResp = await fetch('https://www.olimp.bet/api/basket/add', {{
                     method: 'POST',
                     headers: {{
@@ -159,20 +371,36 @@ class OlimpHandler(BookmakerHandler):
                         'Origin': 'https://www.olimp.bet',
                         'Referer': window.location.href
                     }},
-                    body: JSON.stringify(addPayload)
+                    credentials: 'include',
+                    body: JSON.stringify(addBody)
                 }});
                 const addResult = await addResp.json();
-                if (addResult.error.err_code !== 0) throw new Error('basket/add failed');
 
-                const basketData = addResult.data || {{}};
+                if (!addResult.error || addResult.error.err_code !== 0) {{
+                    return {{ success: false, error: 'Olimp basket/add: ' + JSON.stringify(addResult) }};
+                }}
+                const stakes = addResult.data && addResult.data.stakes_list;
+                if (!stakes || Object.keys(stakes).length === 0) {{
+                    return {{ success: false, error: 'Olimp basket/add: empty stakes_list' }};
+                }}
+                const hash = Object.keys(stakes)[0];
 
-                const savePayload = {{
-                    ...basketData,
-                    amount: data.amount,
-                    sum: data.amount,
+                // --- 2) basket/save ---
+                const uniqueHash = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                    .map(b => b.toString(16).padStart(2, '0')).join('');
+
+                const saveBody = {{
+                    sum: {{ [hash]: data.amount }},
+                    bet_type: 1,
+                    any_handicap: 1,
+                    details: 1,
+                    lang_id: '0',
+                    platforma: 'SITE_CUPIS',
+                    save_any: 1,
+                    session: session,
+                    time_shift: 0,
+                    unique_bet_hash: uniqueHash
                 }};
-                delete savePayload.light;
-                delete savePayload.isVip;
 
                 const saveResp = await fetch('https://www.olimp.bet/api/basket/save', {{
                     method: 'POST',
@@ -185,14 +413,16 @@ class OlimpHandler(BookmakerHandler):
                         'Origin': 'https://www.olimp.bet',
                         'Referer': window.location.href
                     }},
-                    body: JSON.stringify(savePayload)
+                    credentials: 'include',
+                    body: JSON.stringify(saveBody)
                 }});
                 const saveResult = await saveResp.json();
-                if (saveResult.error.err_code === 0) {{
-                    return {{ success: true, betId: saveResult.ids?.[0] || null }};
-                }} else {{
-                    throw new Error('basket/save failed');
+
+                if (saveResult.error && saveResult.error.err_code === 0) {{
+                    const betId = (saveResult.ids && saveResult.ids[0]) || null;
+                    return {{ success: true, betId: betId }};
                 }}
+                return {{ success: false, error: 'Olimp basket/save: ' + JSON.stringify(saveResult) }};
             }} catch(e) {{
                 return {{ success: false, error: e.message }};
             }}

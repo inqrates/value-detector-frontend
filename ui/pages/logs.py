@@ -13,8 +13,8 @@ from PyQt5.QtGui import QTextCursor
 
 logger = logging.getLogger(__name__)
 
-MAX_ENTRIES = 400          # меньше, чтобы UI не давился
-FLUSH_INTERVAL_MS = 250    # батчинг: раз в 250 мс рендерим пачку
+MAX_ENTRIES = 400
+FLUSH_INTERVAL_MS = 250
 
 LEVEL_STYLE = {
     "info":    ("●", "#21c1de", "ИНФО"),
@@ -24,13 +24,31 @@ LEVEL_STYLE = {
     "signal":  ("●", "#ff8c42", "СИГНАЛ"),
 }
 
+# Вид спорта → (иконка, короткое имя)
+SPORT_STYLE = {
+    "table_tennis":     ("🏓", "НТ"),
+    "volleyball":       ("🏐", "Волейбол"),
+    "basketball":       ("🏀", "Баскетбол"),
+    "cyber_basketball": ("🎮", "Кибер"),
+}
+
+# Пункт фильтра → ключ вида спорта (None = без фильтра)
+SPORT_FILTER_VALUES = {
+    "Все":          None,
+    "🏓 НТ":        "table_tennis",
+    "🏐 Волейбол":  "volleyball",
+    "🏀 Баскетбол": "basketball",
+    "🎮 Кибер":     "cyber_basketball",
+}
+
 
 class LogsPage(QWidget):
     def __init__(self):
         super().__init__()
         self.entries = deque(maxlen=MAX_ENTRIES)
-        self._pending = []          # буфер для батчинга
+        self._pending = []
         self._level_filter = "Все"
+        self._sport_filter = "Все"
         self._search_text = ""
 
         layout = QVBoxLayout(self)
@@ -44,7 +62,6 @@ class LogsPage(QWidget):
         top_layout.setSpacing(12)
 
         top_layout.addWidget(QLabel("Фильтр:"))
-
         self.filter_combo = QComboBox()
         self.filter_combo.addItems([
             "Все",
@@ -58,9 +75,15 @@ class LogsPage(QWidget):
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         top_layout.addWidget(self.filter_combo)
 
-        top_layout.addSpacing(16)
-        top_layout.addWidget(QLabel("Поиск:"))
+        top_layout.addSpacing(12)
+        top_layout.addWidget(QLabel("Вид спорта:"))
+        self.sport_filter = QComboBox()
+        self.sport_filter.addItems(list(SPORT_FILTER_VALUES.keys()))
+        self.sport_filter.currentTextChanged.connect(self._on_sport_filter_changed)
+        top_layout.addWidget(self.sport_filter)
 
+        top_layout.addSpacing(12)
+        top_layout.addWidget(QLabel("Поиск:"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Найти в логах...")
         self.search_edit.textChanged.connect(self._on_search_changed)
@@ -88,7 +111,6 @@ class LogsPage(QWidget):
             }
         """)
         self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Отключаем лишние пересчёты при вставке
         self.log_view.setLineWrapMode(QTextEdit.NoWrap)
         layout.addWidget(self.log_view, 1)
 
@@ -96,7 +118,6 @@ class LogsPage(QWidget):
         self.status.setStyleSheet("color: rgba(199,214,223,0.52); font-size: 11px;")
         layout.addWidget(self.status)
 
-        # ---- Батчинг: рендерим раз в 250 мс, а не на каждое событие ----
         self._flush_timer = QTimer(self)
         self._flush_timer.setInterval(FLUSH_INTERVAL_MS)
         self._flush_timer.timeout.connect(self._flush_pending)
@@ -104,7 +125,6 @@ class LogsPage(QWidget):
 
     # ---------- Публичный API ----------
     def add_log(self, entry: dict):
-        """Кладём в очередь, реальный рендер произойдёт в _flush_pending."""
         self.entries.append(entry)
         self._pending.append(entry)
 
@@ -119,22 +139,17 @@ class LogsPage(QWidget):
         if not self._pending:
             return
 
-        # Если пользователь листает вверх — не дёргаем автоскролл,
-        # но всё равно добавляем записи (пусть копятся)
         scrollbar = self.log_view.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
 
-        # Берём пачку и очищаем очередь
         batch = self._pending
         self._pending = []
 
-        # Фильтруем по текущему фильтру/поиску
         to_append = [e for e in batch if self._matches_filter(e)]
         if not to_append:
             self._update_status()
             return
 
-        # Рендерим пачкой через один insertHtml — это в 10 раз быстрее
         html_chunk = "<br>".join(self._render_entry(e) for e in to_append) + "<br>"
 
         cursor = self.log_view.textCursor()
@@ -142,26 +157,26 @@ class LogsPage(QWidget):
         self.log_view.setTextCursor(cursor)
         self.log_view.insertHtml(html_chunk)
 
-        # Обрезаем QTextEdit, если он разросся (защита от memory leak)
         self._trim_if_needed()
 
-        # Автоскролл — только если пользователь был внизу
         if was_at_bottom:
             scrollbar.setValue(scrollbar.maximum())
 
         self._update_status()
 
     def _trim_if_needed(self):
-        """Если в QTextEdit накопилось больше MAX_ENTRIES + 100 блоков — перерендерим из self.entries."""
         doc = self.log_view.document()
         if doc.blockCount() < MAX_ENTRIES + 100:
             return
-        # Полный rerender из deque — это дешевле, чем держать гигантский QTextEdit
         self._rerender()
 
     # ---------- Фильтры ----------
     def _on_filter_changed(self, text: str):
         self._level_filter = text
+        self._rerender()
+
+    def _on_sport_filter_changed(self, text: str):
+        self._sport_filter = text
         self._rerender()
 
     def _on_search_changed(self, text: str):
@@ -183,6 +198,15 @@ class LogsPage(QWidget):
         if f == "Ставки" and entry["source"] != "Ставка":
             return False
 
+        # Вид спорта — фильтр применяется только к сигналам
+        sport_value = SPORT_FILTER_VALUES.get(self._sport_filter)
+        if sport_value is not None:
+            if entry["level"] != "signal":
+                return False
+            entry_sport = entry.get("details", {}).get("sport", "table_tennis")
+            if entry_sport != sport_value:
+                return False
+
         if self._search_text:
             haystack = (entry["message"] + " " + entry["source"]).lower()
             if self._search_text not in haystack:
@@ -191,8 +215,6 @@ class LogsPage(QWidget):
 
     # ---------- Рендер ----------
     def _rerender(self):
-        """Полный пересбор QTextEdit одним setHtml() — намного быстрее, чем цикл insertHtml."""
-        # Останавливаем приём, чтобы не пересекаться
         self._pending.clear()
 
         html_parts = []
@@ -200,7 +222,6 @@ class LogsPage(QWidget):
             if self._matches_filter(entry):
                 html_parts.append(self._render_entry(entry))
 
-        # Собираем один HTML — конвертируем <br> в блоки
         doc_html = (
             '<html><body style="color:#cfdae2; font-family:Consolas,monospace; '
             'font-size:12px; background-color:#0d1014;">'
@@ -209,7 +230,6 @@ class LogsPage(QWidget):
         )
         self.log_view.setHtml(doc_html)
 
-        # Прокрутка вниз
         scrollbar = self.log_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -234,6 +254,10 @@ class LogsPage(QWidget):
         slow_bk = d.get("slow_bk", "?")
         delay = d.get("delay", 0)
 
+        sport = d.get("sport", "table_tennis")
+        fast_phase = d.get("fast_phase", "") or ""
+        tournament = d.get("tournament", "") or ""
+
         fast_score = d.get("fast_score", [0, 0])
         fast_sub = d.get("fast_sub_score", [0, 0])
         fast_odds = d.get("fast_odds", [0, 0])
@@ -242,35 +266,52 @@ class LogsPage(QWidget):
         slow_sub = d.get("slow_sub_score", [0, 0])
         slow_odds = d.get("slow_odds", [0, 0])
 
-        fast_set = fast_score[0] + fast_score[1]
-        slow_set = slow_score[0] + slow_score[1]
-        fast_leads = fast_set > slow_set or (fast_set == slow_set and (fast_sub[0] + fast_sub[1]) > (slow_sub[0] + slow_sub[1]))
-        slow_leads = slow_set > fast_set or (slow_set == fast_set and (slow_sub[0] + slow_sub[1]) > (fast_sub[0] + fast_sub[1]))
+        # Иконка вида спорта
+        sport_icon, _ = SPORT_STYLE.get(sport, ("🏓", "НТ"))
+
+        # Лидерство: сравниваем СУММУ счёта (партии/сеты/очки).
+        # Работает для всех 4 видов спорта: НТ (партии), волейбол (сеты),
+        # баскетбол/кибер (очки). НЕ используем fast_phase здесь — он для отображения.
+        fast_sum = fast_score[0] + fast_score[1]
+        slow_sum = slow_score[0] + slow_score[1]
+        fast_leads = fast_sum > slow_sum
+        slow_leads = slow_sum > fast_sum
 
         fast_score_color = "#42d78d" if fast_leads else ("#eb5757" if slow_leads else "#cfdae2")
         slow_score_color = "#42d78d" if slow_leads else ("#eb5757" if fast_leads else "#cfdae2")
 
-        diff_sets = fast_set - slow_set
-        diff_sub = (fast_sub[0] + fast_sub[1]) - (slow_sub[0] + slow_sub[1])
-        if diff_sets != 0:
-            diff_str = f"{'+' if diff_sets > 0 else ''}{diff_sets} сет"
+        # Разница: сначала по счёту партий/очков, если равно — по sub_score
+        diff_sum = fast_sum - slow_sum
+        if diff_sum != 0:
+            diff_str = f"{'+' if diff_sum > 0 else ''}{diff_sum}"
         else:
+            diff_sub = (fast_sub[0] + fast_sub[1]) - (slow_sub[0] + slow_sub[1])
             diff_str = f"{'+' if diff_sub > 0 else ''}{diff_sub} очк"
+
+        # Фаза из payload (например «3-я четверть» / «2-я партия»)
+        phase_html = ""
+        if fast_phase:
+            phase_html = f' &nbsp;<span style="color:#8ea3b3;">· {html.escape(fast_phase)}</span>'
+        tour_html = ""
+        if tournament:
+            tour_html = f' <span style="color:#5a6b7a;">· {html.escape(tournament)}</span>'
 
         lines = []
         lines.append(f'{time_str} {level_span} {source_span}')
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#ffffff;font-weight:bold;">'
-            f'{html.escape(str(teams[0]))} vs {html.escape(str(teams[1]))}</span>'
+            f'{sport_icon} {html.escape(str(teams[0]))} vs {html.escape(str(teams[1]))}</span>'
+            f'{phase_html}'
             f' &nbsp;<span style="color:#5a6b7a;">·</span>&nbsp; '
             f'<span style="color:#f2c94c;">задержка {delay}с</span>'
+            f'{tour_html}'
         )
         lines.append(
             f'&nbsp;&nbsp;&nbsp;<span style="color:#42d78d;font-weight:bold;">⚡ {html.escape(str(fast_bk))}</span>'
             f' <span style="color:#5a6b7a;">(впереди)</span> '
             f'<span style="color:{fast_score_color};font-weight:bold;">'
             f'счёт {fast_score[0]}:{fast_score[1]}</span>'
-            f' <span style="color:#8ea3b3;">(сет {fast_sub[0]}:{fast_sub[1]})</span>'
+            f' <span style="color:#8ea3b3;">({fast_sub[0]}:{fast_sub[1]})</span>'
             f' <span style="color:#5a6b7a;">·</span> '
             f'<span style="color:#cfdae2;">П1 {float(fast_odds[0]):.2f} / П2 {float(fast_odds[1]):.2f}</span>'
         )
@@ -279,7 +320,7 @@ class LogsPage(QWidget):
             f' <span style="color:#5a6b7a;">(отстаёт)</span> '
             f'<span style="color:{slow_score_color};font-weight:bold;">'
             f'счёт {slow_score[0]}:{slow_score[1]}</span>'
-            f' <span style="color:#8ea3b3;">(сет {slow_sub[0]}:{slow_sub[1]})</span>'
+            f' <span style="color:#8ea3b3;">({slow_sub[0]}:{slow_sub[1]})</span>'
             f' <span style="color:#5a6b7a;">·</span> '
             f'<span style="color:#cfdae2;">П1 {float(slow_odds[0]):.2f} / П2 {float(slow_odds[1]):.2f}</span>'
         )
@@ -291,5 +332,4 @@ class LogsPage(QWidget):
 
     def _update_status(self):
         total = len(self.entries)
-        # Не считаем показанные на каждое обновление — дёшево
         self.status.setText(f"Записей: {total}")
