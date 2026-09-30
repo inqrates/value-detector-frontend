@@ -354,39 +354,42 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_value(self, payload):
-        import time
-        key = (payload.get('match_id'), payload.get('bk'), payload.get('outcome'))
-        if self._should_log(self._value_logged, key, time.time()):
-            log_bus.info(
-                "Валуй",
-                f"{payload.get('player1')} vs {payload.get('player2')} · "
-                f"{payload.get('bk')} · {payload.get('outcome')} @ {payload.get('odd')}"
-            )
+        # ── Скрыто из UI до реализации Value-стратегии ──
+        # import time
+        # key = (payload.get('match_id'), payload.get('bk'), payload.get('outcome'))
+        # if self._should_log(self._value_logged, key, time.time()):
+        #     log_bus.info(
+        #         "Валуй",
+        #         f"{payload.get('player1')} vs {payload.get('player2')} · "
+        #         f"{payload.get('bk')} · {payload.get('outcome')} @ {payload.get('odd')}"
+        #     )
         strategies = self.strategy_store.enabled_list()
         asyncio.create_task(self.after_goal_engine.place_value_bet(payload, strategies))
 
     def _on_arbitrage(self, payload):
-        import time
-        key = (payload.get('match_id_p1'), payload.get('bk_p1'), payload.get('bk_p2'))
-        if self._should_log(self._arbitrage_logged, key, time.time()):
-            log_bus.info(
-                "Вилка",
-                f"{payload.get('player1')} vs {payload.get('player2')} · "
-                f"{payload.get('bk_p1')} / {payload.get('bk_p2')} · "
-                f"+{payload.get('profit_percent', 0):.2f}%"
-            )
+        # ── Скрыто из UI до реализации Arbitrage-стратегии ──
+        # import time
+        # key = (payload.get('match_id_p1'), payload.get('bk_p1'), payload.get('bk_p2'))
+        # if self._should_log(self._arbitrage_logged, key, time.time()):
+        #     log_bus.info(
+        #         "Вилка",
+        #         f"{payload.get('player1')} vs {payload.get('player2')} · "
+        #         f"{payload.get('bk_p1')} / {payload.get('bk_p2')} · "
+        #         f"+{payload.get('profit_percent', 0):.2f}%"
+        #     )
         strategies = self.strategy_store.enabled_list()
         asyncio.create_task(self.after_goal_engine.place_arbitrage_bet(payload, strategies))
 
     def _on_corridor(self, payload):
-        import time
-        key = (payload.get('match_id1'), payload.get('bk1'), payload.get('bk2'))
-        if self._should_log(self._corridor_logged, key, time.time()):
-            log_bus.info(
-                "Коридор",
-                f"{payload.get('player1')} vs {payload.get('player2')} · "
-                f"{payload.get('bk1')} / {payload.get('bk2')}"
-            )
+        # ── Скрыто из UI до реализации Corridor-стратегии ──
+        # import time
+        # key = (payload.get('match_id1'), payload.get('bk1'), payload.get('bk2'))
+        # if self._should_log(self._corridor_logged, key, time.time()):
+        #     log_bus.info(
+        #         "Коридор",
+        #         f"{payload.get('player1')} vs {payload.get('player2')} · "
+        #         f"{payload.get('bk1')} / {payload.get('bk2')}"
+        #     )
         strategies = self.strategy_store.enabled_list()
         asyncio.create_task(self.after_goal_engine.place_corridor_bet(payload, strategies))
 

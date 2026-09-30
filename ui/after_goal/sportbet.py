@@ -1,32 +1,6 @@
 # ui/after_goal/sportbet.py
 """
-Sportbet handler с поддержкой мультиспорта (НТ / волейбол / баскетбол).
-
-Ключевые отличия от НТ-логики:
-  1. WS-кадр `events:update` содержит ТОЛЬКО маркеты страницы `main`
-     (матчевые рынки). Рынки фаз (сет/четверть) приходят через HTTP:
-       GET /events.markets?eventId=<id>&page=set_1
-       GET /events.markets?eventId=<id>&page=quarter_4
-  2. ID маркетов различаются по фазам:
-       main:      winner=186, total=238, handicap=237
-       set_N:     winner=202, total=310, handicap=309
-       quarter_N: свои (пока не видели)
-     Поэтому тип маркета определяется по ИМЕНИ ГРУППЫ из pages:
-       "Исход" / "Победитель" → winner
-       "Тотал"                → total
-       "Фора"                 → handicap
-  3. Страницы фаз подгружаются lazy load — нужен отдельный HTTP-запрос.
-
-Дедупликация:
-  - HTTP-запросы к page-эндпоинту throttle'ятся (не чаще 1 раза/сек на матч).
-  - Принудительный рефетч при смене фазы.
-  - Callback вызывается только если state_hash изменился.
-
-Ставка (HAR 2026-09-12):
-  POST https://bthm-server.sportbet.ru/pari.stake?lang=ru
-  Headers: content-type + idempotency-key: <UUIDv4>
-  Body:    {"outcomes": [<outcome_id>], "amount": <amount>}
-  Ответ OK: {"status":"ok","data":{"success":true},"uuid":"..."}
+Sportbet handler — instance-based.
 """
 import asyncio
 import json
@@ -34,143 +8,127 @@ import logging
 import re
 import time
 import uuid as _uuid
-from typing import Optional, Dict, Any, List
-
+from typing import Optional, Dict, Any, List, Callable
 from playwright.async_api import Page, WebSocket, Response
-
 from .base import BookmakerHandler
 
 logger = logging.getLogger(__name__)
 
-
-# ID маркетов оставлены на будущее — но основная логика определяет тип
-# по имени группы (см. _resolve_group_kind ниже).
 _WIN_IDS   = (186, 202, 219)
 _TOTAL_IDS = (238, 310, 225)
 _HCP_IDS   = (237, 309, 223)
 
 _WS_SILENCE_THRESHOLD = 8.0
 _POLL_INTERVAL = 3.0
-_MARKETS_FETCH_INTERVAL = 1.0    # сек между HTTP-запросами рынков одной фазы
+_MARKETS_FETCH_INTERVAL = 1.0
 
 
 class SportbetHandler(BookmakerHandler):
 
-    _page: Optional[Page] = None
-    _callback = None
-    _target_match_id: Optional[str] = None
-    _poll_task: Optional[asyncio.Task] = None
-    _last_ws_frame_time: float = 0.0
-    _last_sent_state: Optional[tuple] = None
+    def __init__(self, target_match_id: str = None,
+                 target_teams: List[str] = None):
+        self.target_match_id = str(target_match_id) if target_match_id else None
+        self.target_teams = list(target_teams or [])
+        self._page: Optional[Page] = None
+        self._callback: Optional[Callable] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._last_ws_frame_time: float = 0.0
+        self._last_sent_state: Optional[tuple] = None
+        self._last_fetch_time: Dict[str, float] = {}
+        self._last_phase: Dict[str, int] = {}
 
-    # match_id → время последнего HTTP-запроса рынков
-    _last_fetch_time: Dict[str, float] = {}
-    # match_id → номер текущей фазы (для принудительного рефетча при смене)
-    _last_phase: Dict[str, int] = {}
+    async def setup_listener(self, page: Page, callback,
+                             match_id=None, match_teams=None):
+        if match_id:
+            self.target_match_id = str(match_id)
+        if match_teams:
+            self.target_teams = list(match_teams)
 
-    # ============================================================
-    # Установка / снятие перехвата
-    # ============================================================
-    @staticmethod
-    async def setup_listener(page: Page, callback, match_id=None):
-        SportbetHandler._page = page
-        SportbetHandler._callback = callback
-        SportbetHandler._target_match_id = str(match_id) if match_id else None
-        SportbetHandler._last_ws_frame_time = time.time()
-        SportbetHandler._last_sent_state = None
-        SportbetHandler._last_fetch_time = {}
-        SportbetHandler._last_phase = {}
+        self._page = page
+        self._callback = callback
+        self._last_ws_frame_time = time.time()
+        self._last_sent_state = None
+        self._last_fetch_time = {}
+        self._last_phase = {}
 
-        page.on("websocket", SportbetHandler._on_websocket)
-        page.on("response", SportbetHandler._on_response)
+        page.on("websocket", self._on_websocket)
+        page.on("response", self._on_response)
 
-        logger.info(f"Sportbet: перехват установлен (match_id={match_id})")
+        logger.info(f"Sportbet: listener установлен (target={self.target_match_id})")
 
-        asyncio.create_task(SportbetHandler._fetch_snapshot_and_emit(page))
-        SportbetHandler._poll_task = asyncio.create_task(
-            SportbetHandler._poll_loop(page)
-        )
+        asyncio.create_task(self._fetch_snapshot_and_emit(page))
+        self._poll_task = asyncio.create_task(self._poll_loop(page))
 
-    @staticmethod
-    async def stop_listener(page: Page):
+    async def stop_listener(self, page: Page):
         try:
-            page.remove_listener("websocket", SportbetHandler._on_websocket)
-            page.remove_listener("response", SportbetHandler._on_response)
+            page.remove_listener("websocket", self._on_websocket)
+            page.remove_listener("response", self._on_response)
         except Exception:
             pass
+        if self._poll_task:
+            self._poll_task.cancel()
+            self._poll_task = None
+        self._callback = None
+        self.target_match_id = None
+        self._last_sent_state = None
+        logger.info("Sportbet: listener снят")
 
-        if SportbetHandler._poll_task:
-            SportbetHandler._poll_task.cancel()
-            SportbetHandler._poll_task = None
-
-        SportbetHandler._callback = None
-        SportbetHandler._target_match_id = None
-        SportbetHandler._last_sent_state = None
-        logger.info("Sportbet: перехват остановлен")
-
-    # ============================================================
-    # WS-перехват
-    # ============================================================
-    @staticmethod
-    def _on_websocket(ws: WebSocket):
+    def _on_websocket(self, ws: WebSocket):
         if "bthm-server.sportbet.ru" in ws.url:
-            ws.on("framereceived", SportbetHandler._on_ws_frame)
+            ws.on("framereceived", self._on_ws_frame)
             logger.info(f"Sportbet: WS подключён {ws.url}")
 
-    @staticmethod
-    def _on_ws_frame(payload):
+    def _on_ws_frame(self, payload):
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode("utf-8")
-
-            SportbetHandler._last_ws_frame_time = time.time()
-
-            # Socket.IO: "42[...]" — находим JSON-часть
+            self._last_ws_frame_time = time.time()
             start = payload.find("[")
             if start == -1:
                 return
             data = json.loads(payload[start:])
             if not (isinstance(data, list) and len(data) == 2):
                 return
-
-            # Принимаем оба типа: events:update и table:update
             event_type = data[0]
             if event_type not in ("events:update", "table:update"):
                 return
-
-            SportbetHandler._handle_payload(data[1])
+            self._handle_payload(data[1])
         except Exception as e:
             logger.debug(f"Sportbet WS parse error: {e}")
 
-    # ============================================================
-    # HTTP-перехват (events.table)
-    # ============================================================
-    @staticmethod
-    async def _on_response(response: Response):
+    async def _on_response(self, response: Response):
         url = response.url
+
+        # ── Баланс Sportbet ──
+        if 'nhm-account.sportbet.ru/accounts/me' in url:
+            try:
+                data = await response.json()
+                bal = (((data or {}).get('data') or {})
+                       .get('account') or {}).get('balance')
+                if bal is not None:
+                    from ui.balance_bus import balance_bus
+                    balance_bus.update('sportbet', bal, 'RUB')
+            except Exception:
+                pass
+
         if "events.table" not in url:
             return
         try:
             data = await response.json()
-            SportbetHandler._handle_payload(data)
+            self._handle_payload(data)
         except Exception as e:
-            logger.debug(f"Sportbet HTTP response parse error: {e}")
+            logger.debug(f"Sportbet HTTP parse: {e}")
 
-    # ============================================================
-    # Snapshot при старте
-    # ============================================================
-    @staticmethod
-    async def _fetch_snapshot_and_emit(page: Page):
+    async def _fetch_snapshot_and_emit(self, page: Page):
         try:
             await asyncio.sleep(0.5)
-            data = await SportbetHandler._fetch_events_table(page)
+            data = await self._fetch_events_table(page)
             if data:
-                SportbetHandler._handle_payload(data)
+                self._handle_payload(data)
         except Exception as e:
             logger.debug(f"Sportbet initial snapshot: {e}")
 
-    @staticmethod
-    async def _fetch_events_table(page: Page) -> Optional[dict]:
+    async def _fetch_events_table(self, page: Page) -> Optional[dict]:
         url = ("https://bthm-server.sportbet.ru/events.table"
                "?status=live&lang=ru&isTime=true")
         try:
@@ -179,19 +137,11 @@ class SportbetHandler(BookmakerHandler):
                 return None
             return await resp.json()
         except Exception as e:
-            logger.debug(f"Sportbet events.table error: {e}")
+            logger.debug(f"Sportbet events.table: {e}")
             return None
 
-    # ============================================================
-    # HTTP: рынки конкретной страницы матча
-    # ============================================================
-    @staticmethod
-    async def _fetch_page_markets(page: Page, event_id: str,
+    async def _fetch_page_markets(self, page: Page, event_id: str,
                                   page_key: str) -> List[dict]:
-        """
-        GET /events.markets?eventId=X&page=<page_key>&lang=ru
-        Возвращает список маркетов (raw dicts).
-        """
         if not page or page.is_closed():
             return []
         url = (f"https://bthm-server.sportbet.ru/events.markets"
@@ -211,105 +161,86 @@ class SportbetHandler(BookmakerHandler):
             logger.debug(f"Sportbet markets {page_key}: {e}")
             return []
 
-    @staticmethod
-    async def _fetch_phase_markets(page: Page, event_id: str,
+    async def _fetch_phase_markets(self, page: Page, event_id: str,
                                    pages: List[dict]) -> List[dict]:
-        """
-        Для каждой фазовой страницы (set_N / quarter_N / period_N / inning_N)
-        дёргаем HTTP и собираем все маркеты.
-        """
         result: List[dict] = []
         for p in pages:
             key = (p.get("key") or "").lower()
             if not re.match(r"^(set|quarter|period|inning)_\d+$", key):
                 continue
-            markets = await SportbetHandler._fetch_page_markets(page, event_id, key)
+            markets = await self._fetch_page_markets(page, event_id, key)
             result.extend(markets)
         return result
 
-    # ============================================================
-    # Polling WS liveness
-    # ============================================================
-    @staticmethod
-    async def _poll_loop(page: Page):
+    async def _poll_loop(self, page: Page):
         while True:
             try:
                 await asyncio.sleep(_POLL_INTERVAL)
-                silence = time.time() - SportbetHandler._last_ws_frame_time
+                silence = time.time() - self._last_ws_frame_time
                 if silence < _WS_SILENCE_THRESHOLD:
                     continue
-                data = await SportbetHandler._fetch_events_table(page)
+                data = await self._fetch_events_table(page)
                 if data:
-                    SportbetHandler._handle_payload(data)
-                    SportbetHandler._last_ws_frame_time = time.time()
+                    self._handle_payload(data)
+                    self._last_ws_frame_time = time.time()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.debug(f"Sportbet poll: {e}")
 
-    # ============================================================
-    # Универсальный обработчик payload
-    # ============================================================
-    @staticmethod
-    def _handle_payload(raw: Any):
-        events = SportbetHandler._extract_events(raw)
+    def _handle_payload(self, raw: Any):
+        events = self._extract_events(raw)
         if not events:
             return
-        target_id = SportbetHandler._target_match_id
+        target_id = self.target_match_id
         for event in events:
             ev_id = event.get("id")
             if not ev_id:
                 continue
             if target_id and str(ev_id) != target_id:
                 continue
-            # Обрабатываем асинхронно — нужен await для HTTP fetch фаз
-            asyncio.create_task(SportbetHandler._process_event(event))
+            asyncio.create_task(self._process_event(event))
 
-    @staticmethod
-    async def _process_event(event: dict):
+    async def _process_event(self, event: dict):
         match_id = str(event.get("id") or "")
         if not match_id:
             return
 
-        # --- Фаза (для триггера рефетча) ---
         match_status = (event.get("matchStatus") or "").strip()
         mm = re.search(r"(\d+)", match_status)
         phase_hint = int(mm.group(1)) if mm else 0
 
-        # --- Throttle HTTP fetch ---
         now = time.time()
-        last = SportbetHandler._last_fetch_time.get(match_id, 0.0)
-        last_phase = SportbetHandler._last_phase.get(match_id, 0)
+        last = self._last_fetch_time.get(match_id, 0.0)
+        last_phase = self._last_phase.get(match_id, 0)
         phase_changed = (phase_hint != last_phase)
         need_fetch = phase_changed or (now - last >= _MARKETS_FETCH_INTERVAL)
 
         enriched = dict(event)
-        if need_fetch and SportbetHandler._page:
+        if need_fetch and self._page:
             pages = event.get("pages") or []
-            phase_markets = await SportbetHandler._fetch_phase_markets(
-                SportbetHandler._page, match_id, pages
+            phase_markets = await self._fetch_phase_markets(
+                self._page, match_id, pages
             )
-            SportbetHandler._last_fetch_time[match_id] = now
-            SportbetHandler._last_phase[match_id] = phase_hint
-
+            self._last_fetch_time[match_id] = now
+            self._last_phase[match_id] = phase_hint
             if phase_markets:
-                # мёржим фазовые маркеты к тем, что уже пришли через WS (main)
                 enriched["markets"] = (event.get("markets") or []) + phase_markets
 
         parsed = SportbetHandler.parse_update({"events": [enriched]})
         if not parsed:
             return
 
-        state = SportbetHandler._state_hash(parsed)
-        if state == SportbetHandler._last_sent_state:
+        state = self._state_hash(parsed)
+        if state == self._last_sent_state:
             return
-        SportbetHandler._last_sent_state = state
+        self._last_sent_state = state
 
-        if SportbetHandler._callback:
+        if self._callback:
             try:
-                await SportbetHandler._callback(parsed)
+                await self._callback(parsed)
             except Exception as e:
-                logger.error(f"Sportbet callback error: {e}")
+                logger.error(f"Sportbet callback: {e}")
 
     @staticmethod
     def _extract_events(raw: Any) -> List[dict]:
@@ -353,15 +284,8 @@ class SportbetHandler(BookmakerHandler):
             t.get("line"), t.get("over"), t.get("under"),
         )
 
-    # ============================================================
-    # Парсинг события
-    # ============================================================
     @staticmethod
     def _resolve_group_kind(group_name: str) -> Optional[str]:
-        """
-        Определяет тип рынка по имени группы.
-        Работает для всех фаз и видов: main, set_1, quarter_4 и т.д.
-        """
         if not group_name:
             return None
         g = group_name.strip().lower()
@@ -390,7 +314,6 @@ class SportbetHandler(BookmakerHandler):
         if not match_id:
             return None
 
-        # --- Вид спорта: строка или dict ---
         sport_raw = event.get("sport")
         sport_slug = ""
         if isinstance(sport_raw, dict):
@@ -406,14 +329,12 @@ class SportbetHandler(BookmakerHandler):
         elif isinstance(sport_raw, str):
             sport_slug = sport_raw.strip().replace("-", "_")
 
-        # --- Общий счёт ---
         score_str = event.get("score", "0:0") or "0:0"
         try:
             score1, score2 = map(int, score_str.split(":"))
         except Exception:
             score1 = score2 = 0
 
-        # --- Sub_score (последний сет/четверть из scores) ---
         scores_str = event.get("scores", "") or ""
         parts = [p.strip() for p in scores_str.split() if p.strip()]
         sub1 = sub2 = 0
@@ -425,7 +346,6 @@ class SportbetHandler(BookmakerHandler):
                 except Exception:
                     pass
 
-        # --- Номер текущей фазы ---
         current_phase = 0
         match_status = (event.get("matchStatus") or "").strip()
         mm = re.search(r"(\d+)", match_status)
@@ -437,13 +357,8 @@ class SportbetHandler(BookmakerHandler):
             else:
                 current_phase = score1 + score2 + 1
 
-        # --- Карта groupId → (phase_num, kind) ---
-        # kind ∈ {"winner", "total", "handicap"} — по имени группы.
-        # Это устойчиво к разным ID маркетов у разных фаз.
-        # Учитываем ТОЛЬКО фазовые страницы: set_N / quarter_N / period_N / inning_N.
-        # main, half_N — игнорируем (матчевые рынки).
         pages = event.get("pages") or []
-        page_groups: Dict[int, tuple] = {}   # groupId → (phase_num, kind)
+        page_groups: Dict[int, tuple] = {}
         for p in pages:
             key = (p.get("key") or "").lower()
             mm2 = re.match(r"^(set|quarter|period|inning)_(\d+)$", key)
@@ -458,7 +373,6 @@ class SportbetHandler(BookmakerHandler):
                 if kind:
                     page_groups[gid] = (page_phase, kind)
 
-        # --- Маркеты ---
         markets = event.get("markets") or []
         set_markets: Dict[str, dict] = {}
         outcome_ids: Dict[str, dict] = {}
@@ -467,13 +381,11 @@ class SportbetHandler(BookmakerHandler):
             group_id = market.get("groupId")
             info = page_groups.get(group_id)
             if not info:
-                continue   # main, доп. рынки без фазы, чет/нечет — пропускаем
-
+                continue
             phase_num, kind = info
             set_key = f"set_{phase_num}"
             outcomes = market.get("outcomes") or []
 
-            # === Победитель фазы ===
             if kind == "winner":
                 for out in outcomes:
                     if out.get("active") is False:
@@ -489,7 +401,6 @@ class SportbetHandler(BookmakerHandler):
                         set_markets.setdefault(set_key, {}).setdefault("winner", {})["2"] = odd
                         outcome_ids.setdefault(set_key, {}).setdefault("winner", {}).setdefault("2", {})["id"] = out.get("id")
 
-            # === Тотал фазы ===
             elif kind == "total":
                 for out in outcomes:
                     if out.get("active") is False:
@@ -515,7 +426,6 @@ class SportbetHandler(BookmakerHandler):
                         set_markets[set_key]["total"]["under"] = odd
                         outcome_ids.setdefault(set_key, {}).setdefault("total", {}).setdefault("under", {})["id"] = out.get("id")
 
-            # === Фора фазы ===
             elif kind == "handicap":
                 for out in outcomes:
                     if out.get("active") is False:
@@ -553,25 +463,9 @@ class SportbetHandler(BookmakerHandler):
             "outcome_ids": outcome_ids,
         }
 
-    # ============================================================
-    # Отправка ставки
-    # ============================================================
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
-        """
-        bet_data:
-          - outcome_id (int)   — ID исхода из outcome_ids
-          - amount     (float) — сумма ставки
-
-        POST https://bthm-server.sportbet.ru/pari.stake?lang=ru
-        Headers:
-          content-type: application/json
-          idempotency-key: <UUIDv4>
-        Body:
-          {"outcomes": [<outcome_id>], "amount": <amount>}
-        """
         idem_key = str(_uuid.uuid4())
-
         script = f"""
         (async function() {{
             const data = {json.dumps(bet_data)};
@@ -595,22 +489,13 @@ class SportbetHandler(BookmakerHandler):
                         }})
                     }}
                 );
-
                 const result = await resp.json();
-
                 if (result.status === 'ok'
                     && result.data
                     && result.data.success === true) {{
-                    return {{
-                        success: true,
-                        betId: result.uuid || null
-                    }};
+                    return {{ success: true, betId: result.uuid || null }};
                 }}
-
-                return {{
-                    success: false,
-                    error: 'Sportbet: ' + JSON.stringify(result)
-                }};
+                return {{ success: false, error: 'Sportbet: ' + JSON.stringify(result) }};
             }} catch(e) {{
                 return {{ success: false, error: e.message }};
             }}

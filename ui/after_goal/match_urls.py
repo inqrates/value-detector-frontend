@@ -1,54 +1,81 @@
 # ui/after_goal/match_urls.py
-"""
-Фолбэк-конструктор URL на матч.
-Используется ТОЛЬКО если backend не прислал payload['match_url'].
-"""
 import re
 from typing import Optional
 
 
-_TRANSLIT = {
-    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z',
-    'и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r',
-    'с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'shch',
-    'ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+# Slug'и спорта для каждой БК (совпадают с core/sport_map.py)
+_SPORT_SLUGS = {
+    "winline": {
+        "table_tennis":     "nastolijnyj_tennis",
+        "volleyball":       "volejbol",
+        "basketball":       "basketbol",
+        "cyber_basketball": "basketbol",
+    },
+    "leon": {
+        "table_tennis":     "table-tennis",
+        "volleyball":       "volleyball",
+        "basketball":       "basketball",
+        "cyber_basketball": "basketball",
+    },
+    "betcity": {
+        "table_tennis":     "table-tennis",
+        "volleyball":       "volleyball",
+        "basketball":       "basketball",
+        "cyber_basketball": "basketball",
+    },
+    "zenit": {
+        "table_tennis":     "134",
+        "volleyball":       "41",
+        "basketball":       "28",
+        "cyber_basketball": "564",
+    },
+    "sportbet": {
+        "table_tennis":     "table-tennis",
+        "volleyball":       "volleyball",
+        "basketball":       "basketball",
+    },
 }
 
 
-def _slug(s: str, translit: bool = True) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-    if translit:
-        s = "".join(_TRANSLIT.get(ch, ch) for ch in s)
-    s = re.sub(r"[^\w\s-]", "", s)
-    s = re.sub(r"\s+", "-", s.strip())
-    return re.sub(r"-+", "-", s)
-
-
 def build_match_url(bk: str, payload: dict) -> Optional[str]:
-    """Возвращает URL матча или None."""
+    """
+    Fallback URL матча. Учитывает вид спорта из payload['sport'].
+    Если вид не определён — возвращает None (фронт кликает по live-списку).
+    """
     bk = (bk or "").lower()
     mid = str(payload.get('match_id') or payload.get('event_id') or "")
     if not mid:
         return None
 
-    teams = payload.get('match_teams') or []
-    p1 = payload.get('player1') or (teams[0] if len(teams) > 0 else "")
-    p2 = payload.get('player2') or (teams[1] if len(teams) > 1 else "")
-    tour = payload.get('tournament', '')
+    sport = (payload.get('sport') or 'table_tennis').lower()
+    if sport == 'cyber_basketball':
+        sport = 'cyber_basketball'
 
-    simple = {
-        "fonbet":     f"https://fon.bet/live/table-tennis/{mid}",
-        "winline":    f"https://winline.ru/live/sport/nastolijnyj_tennis/{mid}",
-        "ligastavok": f"https://www.ligastavok.ru/sports/table-tennis/x-p-id-0-service-id-27-ext-id-{mid}",
-        "leon":       f"https://leon.ru/bets/table-tennis/{mid}",
-        "olimp":      f"https://www.olimp.bet/live/nastolnyy-tennis-40/x/x-{mid}",
-        "betcity":    f"https://betcity.ru/ru/live/table-tennis/{mid}",
-        "marathon":   f"https://new.marathonbet.ru/su/betting/event/table-tennis/"
-                      f"{_slug(tour) or 'x'}/{_slug(p1)}-vs-{_slug(p2)}",
-        "zenit":      f"https://zenit.win/live/134/{mid}",
-        "sportbet":   f"https://sportbet.ru/live/table-tennis/x--x/x-vs-x--{mid}"
-                      f"?isTime=1&h=all&page=main",
-    }
-    return simple.get(bk)
+    # Для БК, которые требуют специфичных полей — None (клик)
+    if bk in ('fonbet', 'marathon', 'ligastavok', 'olimp'):
+        return None
+
+    slugs = _SPORT_SLUGS.get(bk)
+    if not slugs:
+        return None
+    sport_slug = slugs.get(sport)
+    if not sport_slug:
+        return None
+
+    if bk == "winline":
+        return f"https://winline.ru/live/sport/{sport_slug}/{mid}"
+
+    if bk == "leon":
+        return f"https://leon.ru/bets/{sport_slug}/x/x/{mid}"
+
+    if bk == "betcity":
+        return f"https://betcity.ru/ru/live/{sport_slug}/{mid}"
+
+    if bk == "zenit":
+        return f"https://zenit.win/live/{sport_slug}/{mid}"
+
+    if bk == "sportbet":
+        return (f"https://sportbet.ru/live/{sport_slug}/x--x/"
+                f"x-vs-x--{mid}?isTime=1&h=all&page=main")
+
+    return None

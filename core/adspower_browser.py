@@ -13,7 +13,7 @@ class AdsPowerBrowser:
         self,
         profile_id: str,
         api_key: str,
-        api_url: str = "http://localhost:50325",  # используем localhost
+        api_url: str = "http://localhost:50325",
         headless: bool = False
     ):
         self.profile_id = profile_id
@@ -95,6 +95,19 @@ class AdsPowerBrowser:
     @property
     def browser(self) -> Browser:
         return self._browser
+
+    async def new_page(self) -> Page:
+        """Открывает НОВУЮ вкладку в существующем контексте профиля.
+
+        Используется, чтобы каждый матч жил в своей вкладке —
+        иначе параллельные page.goto() обрывают друг друга
+        (net::ERR_ABORTED) и матчи путаются.
+        """
+        if not self._context:
+            raise RuntimeError("AdsPowerBrowser: context не инициализирован")
+        new_p = await self._context.new_page()
+        logger.debug(f"📄 Открыта новая вкладка профиля {self.profile_id}")
+        return new_p
 
     async def stop(self):
         try:

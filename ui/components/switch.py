@@ -9,14 +9,25 @@ class Switch(QPushButton):
     def __init__(self, checked=False, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
-        self.setChecked(checked)
         self.setFixedSize(46, 22)
         self.setCursor(Qt.PointingHandCursor)
+
+        # Защита от лишних эмитов при программном setChecked()
+        self._last_emitted = bool(checked)
+        self.blockSignals(True)
+        self.setChecked(bool(checked))
+        self.blockSignals(False)
+
         self.toggled.connect(self._on_toggled)
         self._apply()
 
     def _on_toggled(self, on):
         self._apply()
+        on = bool(on)
+        # Дедупликация: если фактическое состояние не изменилось — молчим
+        if self._last_emitted == on:
+            return
+        self._last_emitted = on
         self.toggled_state.emit(on)
 
     def _apply(self):

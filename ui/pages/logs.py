@@ -6,7 +6,7 @@ from collections import deque
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QLineEdit, QPushButton, QTextEdit,
-    QFrame, QSizePolicy
+    QFrame, QSizePolicy, QCheckBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QTextCursor
@@ -24,7 +24,6 @@ LEVEL_STYLE = {
     "signal":  ("●", "#ff8c42", "СИГНАЛ"),
 }
 
-# Вид спорта → (иконка, короткое имя)
 SPORT_STYLE = {
     "table_tennis":     ("🏓", "НТ"),
     "volleyball":       ("🏐", "Волейбол"),
@@ -32,13 +31,39 @@ SPORT_STYLE = {
     "cyber_basketball": ("🎮", "Кибер"),
 }
 
-# Пункт фильтра → ключ вида спорта (None = без фильтра)
 SPORT_FILTER_VALUES = {
     "Все":          None,
     "🏓 НТ":        "table_tennis",
     "🏐 Волейбол":  "volleyball",
     "🏀 Баскетбол": "basketball",
     "🎮 Кибер":     "cyber_basketball",
+}
+
+# БК — значения совпадают с bk_id парсеров/стратегий
+BK_FILTER_VALUES = {
+    "Все БК":    None,
+    "fonbet":    "fonbet",
+    "winline":   "winline",
+    "ligastavok": "ligastavok",
+    "leon":      "leon",
+    "olimp":     "olimp",
+    "betcity":   "betcity",
+    "marathon":  "marathon",
+    "zenit":     "zenit",
+    "sportbet":  "sportbet",
+}
+
+BK_LABEL = {
+    None: "—",
+    "fonbet": "Fonbet",
+    "winline": "Winline",
+    "ligastavok": "LigaStavok",
+    "leon": "Leon",
+    "olimp": "Olimp",
+    "betcity": "Betcity",
+    "marathon": "Marathon",
+    "zenit": "Zenit",
+    "sportbet": "Sportbet",
 }
 
 
@@ -49,12 +74,15 @@ class LogsPage(QWidget):
         self._pending = []
         self._level_filter = "Все"
         self._sport_filter = "Все"
+        self._bk_filter = "Все БК"
+        self._match_filter = ""
         self._search_text = ""
+        self._show_details = False
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
-        # ---- Панель управления ----
+        # ---- Панель управления (строка 1) ----
         top = QFrame()
         top.setProperty("class", "sectionCard")
         top_layout = QHBoxLayout(top)
@@ -75,26 +103,59 @@ class LogsPage(QWidget):
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         top_layout.addWidget(self.filter_combo)
 
-        top_layout.addSpacing(12)
+        top_layout.addSpacing(8)
         top_layout.addWidget(QLabel("Вид спорта:"))
         self.sport_filter = QComboBox()
         self.sport_filter.addItems(list(SPORT_FILTER_VALUES.keys()))
         self.sport_filter.currentTextChanged.connect(self._on_sport_filter_changed)
         top_layout.addWidget(self.sport_filter)
 
-        top_layout.addSpacing(12)
-        top_layout.addWidget(QLabel("Поиск:"))
+        top_layout.addSpacing(8)
+        top_layout.addWidget(QLabel("БК:"))
+        self.bk_filter = QComboBox()
+        self.bk_filter.addItems(list(BK_FILTER_VALUES.keys()))
+        self.bk_filter.currentTextChanged.connect(self._on_bk_filter_changed)
+        top_layout.addWidget(self.bk_filter)
+
+        top_layout.addSpacing(8)
+        top_layout.addWidget(QLabel("Матч:"))
+        self.match_filter = QLineEdit()
+        self.match_filter.setPlaceholderText("Игрок/матч…")
+        self.match_filter.setMaximumWidth(180)
+        self.match_filter.textChanged.connect(self._on_match_filter_changed)
+        top_layout.addWidget(self.match_filter)
+
+        top_layout.addStretch()
+
+        self.details_cb = QCheckBox("Показывать детали")
+        self.details_cb.setToolTip(
+            "Показывать служебные логи (verify_seconds, on_update, "
+            "outcome_info и т.п.). Включай для отладки."
+        )
+        self.details_cb.toggled.connect(self._on_details_toggled)
+        top_layout.addWidget(self.details_cb)
+
+        layout.addWidget(top)
+
+        # ---- Панель управления (строка 2: поиск + очистка) ----
+        top2 = QFrame()
+        top2.setProperty("class", "sectionCard")
+        top2_layout = QHBoxLayout(top2)
+        top2_layout.setContentsMargins(14, 8, 14, 8)
+        top2_layout.setSpacing(12)
+
+        top2_layout.addWidget(QLabel("Поиск:"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Найти в логах...")
         self.search_edit.textChanged.connect(self._on_search_changed)
-        top_layout.addWidget(self.search_edit, 1)
+        top2_layout.addWidget(self.search_edit, 1)
 
         clear_btn = QPushButton("🗑 Очистить")
         clear_btn.setProperty("class", "ghostBtn")
         clear_btn.clicked.connect(self.clear_logs)
-        top_layout.addWidget(clear_btn)
+        top2_layout.addWidget(clear_btn)
 
-        layout.addWidget(top)
+        layout.addWidget(top2)
 
         # ---- Окно логов ----
         self.log_view = QTextEdit()
@@ -179,8 +240,20 @@ class LogsPage(QWidget):
         self._sport_filter = text
         self._rerender()
 
+    def _on_bk_filter_changed(self, text: str):
+        self._bk_filter = text
+        self._rerender()
+
+    def _on_match_filter_changed(self, text: str):
+        self._match_filter = text.strip().lower()
+        self._rerender()
+
     def _on_search_changed(self, text: str):
         self._search_text = text.strip().lower()
+        self._rerender()
+
+    def _on_details_toggled(self, checked: bool):
+        self._show_details = checked
         self._rerender()
 
     def _matches_filter(self, entry: dict) -> bool:
@@ -198,6 +271,12 @@ class LogsPage(QWidget):
         if f == "Ставки" and entry["source"] != "Ставка":
             return False
 
+        # Фильтр по БК
+        bk_val = BK_FILTER_VALUES.get(self._bk_filter)
+        if bk_val is not None:
+            if (entry.get("bk") or "") != bk_val:
+                return False
+
         # Вид спорта — фильтр применяется только к сигналам
         sport_value = SPORT_FILTER_VALUES.get(self._sport_filter)
         if sport_value is not None:
@@ -205,6 +284,18 @@ class LogsPage(QWidget):
                 return False
             entry_sport = entry.get("details", {}).get("sport", "table_tennis")
             if entry_sport != sport_value:
+                return False
+
+        # Детальные логи
+        if entry.get("level3") and not self._show_details:
+            return False
+
+        # Фильтр по матчу (текстом)
+        if self._match_filter:
+            hay = entry.get("message", "").lower()
+            teams = entry.get("details", {}).get("teams") or []
+            hay += " " + " ".join(str(t) for t in teams).lower()
+            if self._match_filter not in hay:
                 return False
 
         if self._search_text:
@@ -239,13 +330,27 @@ class LogsPage(QWidget):
         time_str = f'<span style="color:#5a6b7a;">[{e["time"]}]</span>'
         icon, color, label = LEVEL_STYLE.get(e["level"], ("•", "#999", "?"))
         level_span = f'<span style="color:{color};font-weight:bold;">{icon} {label}</span>'
+
+        # Префикс БК для матчевых логов
+        bk = e.get("bk")
+        bk_span = ""
+        if bk:
+            bk_label = BK_LABEL.get(bk, bk.upper())
+            bk_span = (
+                f'<span style="color:#7fa1b7;font-weight:bold;">'
+                f'[{bk_label}]</span> '
+            )
+
         source_span = f'<span style="color:#7fa1b7;">[{html.escape(e["source"])}]</span>'
         msg = html.escape(e["message"])
 
         if e["level"] == "signal":
             return self._render_signal(e, time_str, level_span, source_span)
 
-        return f'{time_str} {level_span} {source_span} <span style="color:#e7eef4;">{msg}</span>'
+        return (
+            f'{time_str} {level_span} {bk_span}{source_span} '
+            f'<span style="color:#e7eef4;">{msg}</span>'
+        )
 
     def _render_signal(self, e: dict, time_str: str, level_span: str, source_span: str) -> str:
         d = e.get("details", {})
@@ -266,12 +371,8 @@ class LogsPage(QWidget):
         slow_sub = d.get("slow_sub_score", [0, 0])
         slow_odds = d.get("slow_odds", [0, 0])
 
-        # Иконка вида спорта
         sport_icon, _ = SPORT_STYLE.get(sport, ("🏓", "НТ"))
 
-        # Лидерство: сравниваем СУММУ счёта (партии/сеты/очки).
-        # Работает для всех 4 видов спорта: НТ (партии), волейбол (сеты),
-        # баскетбол/кибер (очки). НЕ используем fast_phase здесь — он для отображения.
         fast_sum = fast_score[0] + fast_score[1]
         slow_sum = slow_score[0] + slow_score[1]
         fast_leads = fast_sum > slow_sum
@@ -280,7 +381,6 @@ class LogsPage(QWidget):
         fast_score_color = "#42d78d" if fast_leads else ("#eb5757" if slow_leads else "#cfdae2")
         slow_score_color = "#42d78d" if slow_leads else ("#eb5757" if fast_leads else "#cfdae2")
 
-        # Разница: сначала по счёту партий/очков, если равно — по sub_score
         diff_sum = fast_sum - slow_sum
         if diff_sum != 0:
             diff_str = f"{'+' if diff_sum > 0 else ''}{diff_sum}"
@@ -288,7 +388,6 @@ class LogsPage(QWidget):
             diff_sub = (fast_sub[0] + fast_sub[1]) - (slow_sub[0] + slow_sub[1])
             diff_str = f"{'+' if diff_sub > 0 else ''}{diff_sub} очк"
 
-        # Фаза из payload (например «3-я четверть» / «2-я партия»)
         phase_html = ""
         if fast_phase:
             phase_html = f' &nbsp;<span style="color:#8ea3b3;">· {html.escape(fast_phase)}</span>'

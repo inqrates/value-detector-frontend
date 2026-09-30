@@ -11,8 +11,28 @@ from ui.styles import APP_STYLE, create_dark_palette
 from ui.login_window import LoginWindow
 from ui.main_window import MainWindow
 
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+)
+
+for _name in (
+    'qasync', 'qasync._windows', 'qasync._windows._EventWorker',
+    'qasync._QEventLoop',
+    'urllib3', 'asyncio', 'playwright',
+):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
+# Наши модули — подробно, пока отлаживаем
+logging.getLogger('ui.after_goal_engine').setLevel(logging.DEBUG)
+logging.getLogger('ui.after_goal.betcity').setLevel(logging.DEBUG)
+#logging.getLogger('ui.after_goal.olimp').setLevel(logging.DEBUG)
+logging.getLogger('ui.after_goal.ligastavok').setLevel(logging.DEBUG)
+
 
 def main():
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setPalette(create_dark_palette())
@@ -51,7 +71,20 @@ def main():
         main_holder["win"] = w
 
     login_win.login_success.connect(on_login_success)
-    login_win.show()
+
+    # ── Автологин через сохранённую сессию ──
+    restored = False
+    try:
+        from ui.session_store import try_restore_session
+        restored = try_restore_session()
+    except Exception as e:
+        print(f"⚠️ Ошибка восстановления сессии: {e}")
+
+    if restored:
+        print("🔓 Автовход по сохранённой сессии")
+        on_login_success()
+    else:
+        login_win.show()
 
     # ---- Основной цикл ----
     if loop is not None:

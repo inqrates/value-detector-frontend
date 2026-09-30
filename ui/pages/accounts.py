@@ -16,8 +16,10 @@ from ui.paths import get_app_data_dir
 logger = logging.getLogger(__name__)
 ADSPOWER_API_URL = "http://localhost:50325"
 
-BOOKMAKER_CHOICES = ["Fonbet", "Winline", "Liga Stavok", "Leon",
-                     "BetBoom", "Pari", "Marathon", "Sportbet", "Olimp", "Betcity", "Zenit"]
+# Убраны BetBoom и Pari — парсеров под них нет
+BOOKMAKER_CHOICES = ["Fonbet", "Pari", "Winline", "Liga Stavok", "Leon",
+                     "Marathon", "Sportbet", "Olimp", "Betcity", "Zenit"]
+
 
 class AccountStore:
     def __init__(self):
@@ -41,12 +43,10 @@ class AccountStore:
         except Exception as e:
             print(f"Не удалось сохранить аккаунты: {e}")
 
-# ... остальной код AccountsPage без изменений (он использует self.store)
-
 
 class AccountsPage(QWidget):
     accounts_changed = pyqtSignal()
-    
+
     def __init__(self):
         super().__init__()
         self.store = AccountStore()

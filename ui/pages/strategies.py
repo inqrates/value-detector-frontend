@@ -6,18 +6,19 @@ import logging
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame,
     QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox, QLineEdit,
-    QGroupBox, QFormLayout, QPushButton
+    QGroupBox, QFormLayout, QPushButton, QRadioButton,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from ui.components.switch import Switch
-from ui.strategy_store import StrategyStore, SPORT_ANY, VALID_MARKETS
+from ui.strategy_store import (
+    StrategyStore, SPORT_ANY, ALL_MARKETS,
+)
 from ui.log_bus import log_bus
 
 logger = logging.getLogger(__name__)
 
 
-# --- Вид спорта: русский ключ → английский код ---
 SPORT_CHOICES = {
     "Настольный теннис": "table_tennis",
     "Волейбол":          "volleyball",
@@ -34,39 +35,13 @@ SPORT_SHORT = {
     SPORT_ANY:          "🌐 Все виды",
 }
 
-# --- Тип стратегии: русский ключ → английский код ---
 TYPE_CHOICES = {
-    "После гола": "After-goal",
-    "Валуй":      "Value",
-    "Вилка":      "Arbitrage",
-    "Коридор":    "Corridor",
+    "Послегол": "After-goal",
 }
 TYPE_DISPLAY = {v: k for k, v in TYPE_CHOICES.items()}
-
-# --- Направление: русский ключ → английский код ---
-DIRECTION_CHOICES = {
-    "Лучший коэффициент": "best_odds",
-    "Лидер фазы":         "leader",
-    "Отстающий в фазе":   "laggard",
-    "Как на быстрой БК":  "same_as_fast",
+TYPE_DISPLAY_FULL = {
+    "After-goal": "Послегол",
 }
-DIRECTION_DISPLAY = {v: k for k, v in DIRECTION_CHOICES.items()}
-
-# --- Стороны Победителя и Фор: русский ключ → английский код ---
-SIDES_WIN_CHOICES = {
-    "Любая":     "both",
-    "Только П1": "1",
-    "Только П2": "2",
-}
-SIDES_WIN_DISPLAY = {v: k for k, v in SIDES_WIN_CHOICES.items()}
-
-# --- Стороны Тотала: русский ключ → английский код ---
-SIDES_TOTAL_CHOICES = {
-    "Любая":         "both",
-    "Только Больше": "over",
-    "Только Меньше": "under",
-}
-SIDES_TOTAL_DISPLAY = {v: k for k, v in SIDES_TOTAL_CHOICES.items()}
 
 
 def _make_field_grow(form):
@@ -104,7 +79,7 @@ class StrategyCard(QFrame):
         sport_label = SPORT_SHORT.get(sport_key, sport_key)
 
         type_raw = strategy.get('type', '') or ''
-        type_label = TYPE_DISPLAY.get(type_raw, type_raw)
+        type_label = TYPE_DISPLAY_FULL.get(type_raw, type_raw)
 
         profile_text = profile[:8] if profile else 'не выбран'
         meta = QLabel(
@@ -117,7 +92,9 @@ class StrategyCard(QFrame):
         layout.addLayout(texts, 1)
 
         self.switch = Switch(strategy.get("enabled", False))
-        self.switch.toggled_state.connect(lambda on: self.toggled.emit(self.index, on))
+        self.switch.toggled_state.connect(
+            lambda on: self.toggled.emit(self.index, on)
+        )
         layout.addWidget(self.switch)
 
     def mousePressEvent(self, event):
@@ -138,7 +115,7 @@ class StrategiesPage(QWidget):
         layout = QHBoxLayout(self)
         layout.setSpacing(16)
 
-        # ============ Левая колонка: карточки ============
+        # ============ Левая колонка ============
         left = QVBoxLayout()
         left_title = QLabel("Стратегии")
         left_title.setProperty("class", "sectionTitle")
@@ -170,13 +147,13 @@ class StrategiesPage(QWidget):
         left.addLayout(btn_row)
         layout.addLayout(left, 1)
 
-        # ============ Правая колонка: форма ============
+        # ============ Правая колонка ============
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.NoFrame)
         right_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         right_inner = QWidget()
-        right_inner.setMinimumWidth(470)
+        right_inner.setMinimumWidth(520)
         right = QVBoxLayout(right_inner)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(16)
@@ -185,7 +162,7 @@ class StrategiesPage(QWidget):
         right_title.setProperty("class", "sectionTitle")
         right.addWidget(right_title)
 
-        # ---- Группа: Основные параметры ----
+        # ---- Основные параметры ----
         main_group = QGroupBox("Основные параметры")
         main_form = QFormLayout(main_group)
         main_form.setSpacing(10)
@@ -195,7 +172,7 @@ class StrategiesPage(QWidget):
         main_form.addRow("Название:", self.name_edit)
 
         self.strategy_type = QComboBox()
-        self.strategy_type.addItems(list(TYPE_CHOICES.keys()))  # русские ключи
+        self.strategy_type.addItems(list(TYPE_CHOICES.keys()))
         main_form.addRow("Тип стратегии:", self.strategy_type)
 
         self.sport_combo = QComboBox()
@@ -211,62 +188,229 @@ class StrategiesPage(QWidget):
         self.min_delay.setSuffix(" сек")
         main_form.addRow("Мин. задержка:", self.min_delay)
 
-        self.min_score_diff = QSpinBox()
-        self.min_score_diff.setRange(1, 11)
-        self.min_score_diff.setSuffix(" очк.")
-        main_form.addRow("Мин. разница в счёте:", self.min_score_diff)
         right.addWidget(main_group)
 
-        # ---- Группа: Что ставить ----
+        # ============================================================
+        # ---- Что ставить ----
+        # ============================================================
         what_group = QGroupBox("Что ставить")
-        what_form = QFormLayout(what_group)
-        what_form.setSpacing(10)
-        _make_field_grow(what_form)
+        what_layout = QVBoxLayout(what_group)
+        what_layout.setSpacing(12)
 
-        markets_row = QHBoxLayout()
-        self.cb_winner = QCheckBox("Победитель")
-        self.cb_total = QCheckBox("Тотал")
-        self.cb_handicap = QCheckBox("Фора")
-        for cb in (self.cb_winner, self.cb_total, self.cb_handicap):
-            markets_row.addWidget(cb)
-        markets_row.addStretch()
-        what_form.addRow("Рынки:", markets_row)
+        # ── Способ выбора ──
+        mode_label = QLabel("Способ выбора рынков:")
+        mode_label.setStyleSheet(
+            "color: rgba(245,249,252,0.85); font-size: 12px; font-weight: 600;")
+        what_layout.addWidget(mode_label)
 
-        self.direction_combo = QComboBox()
-        self.direction_combo.addItems(list(DIRECTION_CHOICES.keys()))  # русские ключи
-        what_form.addRow("Направление (Победитель):", self.direction_combo)
+        self.market_mode_auto = QRadioButton(
+            "Автоматически — бот сам выберет лучший доступный рынок")
+        self.market_mode_manual = QRadioButton(
+            "Вручную — я сам отмечу, на что ставить")
+        self.market_mode_auto.setChecked(True)
 
-        self.winner_sides_combo = QComboBox()
-        self.winner_sides_combo.addItems(list(SIDES_WIN_CHOICES.keys()))
-        what_form.addRow("Стороны Победителя:", self.winner_sides_combo)
+        mode_col = QVBoxLayout()
+        mode_col.setContentsMargins(10, 0, 0, 0)
+        mode_col.setSpacing(4)
+        mode_col.addWidget(self.market_mode_auto)
+        mode_col.addWidget(self.market_mode_manual)
+        what_layout.addLayout(mode_col)
 
-        self.total_sides_combo = QComboBox()
-        self.total_sides_combo.addItems(list(SIDES_TOTAL_CHOICES.keys()))
-        what_form.addRow("Стороны Тотала:", self.total_sides_combo)
+        # ── Критерий авто ──
+        self.auto_criterion_group = QWidget()
+        auto_form = QVBoxLayout(self.auto_criterion_group)
+        auto_form.setContentsMargins(30, 6, 0, 0)
+        auto_form.setSpacing(4)
 
-        self.handicap_sides_combo = QComboBox()
-        self.handicap_sides_combo.addItems(list(SIDES_WIN_CHOICES.keys()))
-        what_form.addRow("Стороны Фор:", self.handicap_sides_combo)
+        auto_label = QLabel("Критерий выбора лучшего варианта:")
+        auto_label.setStyleSheet(
+            "color: rgba(199,214,223,0.7); font-size: 11px; font-weight: 600;")
+        auto_form.addWidget(auto_label)
 
-        hint = QLabel(
-            "💡 «Направление» применяется только к рынку Победителя. "
-            "«Лучший коэффициент» — без фильтра, выбирается самый вкусный "
-            "из подтверждённых."
+        self.crit_reliable = QRadioButton(
+            "Самый надёжный исход (победитель → тотал → фора)")
+        self.crit_max_odds = QRadioButton(
+            "Самый высокий коэффициент")
+        self.crit_all = QRadioButton(
+            "Ставить всё подтверждённое (несколько ставок за сигнал)")
+        self.crit_reliable.setChecked(True)
+
+        for w in (self.crit_reliable, self.crit_max_odds, self.crit_all):
+            auto_form.addWidget(w)
+
+        hint_auto = QLabel(
+            "«Самый надёжный» — приоритет победителю партии, потом тоталу, "
+            "потом форе.\n"
+            "«Самый высокий коэф.» — из подтверждённых исходов берётся "
+            "максимальный коэффициент.\n"
+            "«Всё подтверждённое» — отправляется несколько ставок "
+            "одновременно (агрессивно)."
         )
-        hint.setProperty("class", "hintLabel")
-        hint.setWordWrap(True)
-        what_form.addRow("", hint)
+        hint_auto.setWordWrap(True)
+        hint_auto.setStyleSheet(
+            "color: rgba(199,214,223,0.5); font-size: 10px; font-style: italic; "
+            "padding-left: 4px;")
+        auto_form.addWidget(hint_auto)
+
+        what_layout.addWidget(self.auto_criterion_group)
+
+        # ── Ручной режим ──
+        self.manual_group = QWidget()
+        manual_form = QVBoxLayout(self.manual_group)
+        manual_form.setContentsMargins(30, 6, 0, 0)
+        manual_form.setSpacing(8)
+
+        manual_hint = QLabel(
+            "Отметьте рынки, на которые ставить. "
+            "Бот будет ставить только на выбранное:")
+        manual_hint.setStyleSheet(
+            "color: rgba(199,214,223,0.7); font-size: 11px; font-weight: 600;")
+        manual_hint.setWordWrap(True)
+        manual_form.addWidget(manual_hint)
+
+        self.cb_markets = {}
+
+        def make_market_row(label, items):
+            """items: [(code, text)] — возвращает dict {code: QCheckBox}."""
+            row = QHBoxLayout()
+            row.setSpacing(10)
+
+            lbl = QLabel(label)
+            lbl.setMinimumWidth(155)
+            lbl.setStyleSheet(
+                "color: rgba(245,249,252,0.82); font-size: 12px;")
+            row.addWidget(lbl)
+
+            result = {}
+            for code, text in items:
+                cb = QCheckBox(text)
+                cb.setChecked(True)
+                row.addWidget(cb)
+                result[code] = cb
+
+            row.addStretch()
+            manual_form.addLayout(row)
+            return result
+
+        # Рынки — галочками
+        self.cb_markets.update(make_market_row(
+            "Победитель партии:",
+            [("winner_1", "П1"), ("winner_2", "П2")],
+        ))
+        self.cb_markets.update(make_market_row(
+            "Тотал партии:",
+            [("total_over", "Больше"), ("total_under", "Меньше")],
+        ))
+        self.cb_markets.update(make_market_row(
+            "Фора в партии:",
+            [("handicap_1", "Фора 1"), ("handicap_2", "Фора 2")],
+        ))
+        self.cb_markets.update(make_market_row(
+            "Индивидуальный тотал:",
+            [("it1_over", "ИТ1 Б"), ("it1_under", "ИТ1 М"),
+             ("it2_over", "ИТ2 Б"), ("it2_under", "ИТ2 М")],
+        ))
+        self.cb_markets.update(make_market_row(
+            "Дополнительно:",
+            [("odd", "Чёт/Нечёт"), ("race", "Гонка"), ("point", "Очко")],
+        ))
+
+        what_layout.addWidget(self.manual_group)
+
+        # ── Пороги отставания (общие для авто и ручного) ──
+        thresholds_sep = QFrame()
+        thresholds_sep.setFrameShape(QFrame.HLine)
+        thresholds_sep.setStyleSheet(
+            "color: rgba(255,255,255,0.08); background: rgba(255,255,255,0.08); "
+            "max-height: 1px;")
+        what_layout.addWidget(thresholds_sep)
+
+        thr_label = QLabel("Пороги отставания (очки):")
+        thr_label.setStyleSheet(
+            "color: rgba(245,249,252,0.85); font-size: 12px; font-weight: 600;")
+        what_layout.addWidget(thr_label)
+
+        thr_hint = QLabel(
+            "Минимальное отставание fast БК от slow, при котором исход "
+            "считается подтверждённым.")
+        thr_hint.setStyleSheet(
+            "color: rgba(199,214,223,0.5); font-size: 10px; font-style: italic;")
+        thr_hint.setWordWrap(True)
+        what_layout.addWidget(thr_hint)
+
+        thr_row = QHBoxLayout()
+        thr_row.setSpacing(14)
+
+        def make_threshold(label, default):
+            wrap = QWidget()
+            h = QHBoxLayout(wrap)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                "color: rgba(245,249,252,0.82); font-size: 12px;")
+            h.addWidget(lbl)
+            spin = QSpinBox()
+            spin.setRange(1, 15)
+            spin.setValue(default)
+            spin.setSuffix(" очк.")
+            spin.setFixedWidth(85)
+            h.addWidget(spin)
+            return wrap, spin
+
+        w1, self.spin_winner_thr = make_threshold("Победитель:", 2)
+        w2, self.spin_total_thr = make_threshold("Тотал:", 1)
+        w3, self.spin_handicap_thr = make_threshold("Фора:", 3)
+        thr_row.addWidget(w1)
+        thr_row.addWidget(w2)
+        thr_row.addWidget(w3)
+        thr_row.addStretch()
+        what_layout.addLayout(thr_row)
+
+        # ── RACE (гонка внутри сета) ──
+        race_sep = QFrame()
+        race_sep.setFrameShape(QFrame.HLine)
+        race_sep.setStyleSheet(
+            "color: rgba(255,255,255,0.08); background: rgba(255,255,255,0.08); "
+            "max-height: 1px;")
+        what_layout.addWidget(race_sep)
+
+        self.cb_race_enabled = QCheckBox(
+            "Учитывать гонку внутри сета (RACE)")
+        self.cb_race_enabled.setToolTip(
+            "Дополнительно ставить на рынки гонки — например,\n"
+            "«Тотал в гонке до 5 очков», «Фора в гонке до 7 очков».\n"
+            "Работает по тем же правилам, что и основной сет."
+        )
+        what_layout.addWidget(self.cb_race_enabled)
+
+        race_hint = QLabel(
+            "RACE — это отрезок внутри сета (до 3, 5, 7 или 10 очков). "
+            "Букмекер даёт по ним отдельные тоталы и форы.\n"
+            "Если включено — движок рассмотрит и основной сет, и гонку.\n"
+            "Если выключено — только основной сет (до 11 очков)."
+        )
+        race_hint.setStyleSheet(
+            "color: rgba(199,214,223,0.5); font-size: 10px; font-style: italic;")
+        race_hint.setWordWrap(True)
+        what_layout.addWidget(race_hint)
+
+        # ── Показ/скрытие блоков в зависимости от режима ──
+        def _update_market_mode():
+            is_auto = self.market_mode_auto.isChecked()
+            self.auto_criterion_group.setVisible(is_auto)
+            self.manual_group.setVisible(not is_auto)
+
+        self.market_mode_auto.toggled.connect(lambda _: _update_market_mode())
+        _update_market_mode()
+
         right.addWidget(what_group)
 
-        # ---- Группа: Банкролл ----
-        bank_group = QGroupBox("Управление банкроллом")
+        # ---- Банкролл / ставка ----
+        bank_group = QGroupBox("Ставка")
         bank_form = QFormLayout(bank_group)
         bank_form.setSpacing(10)
         _make_field_grow(bank_form)
-
-        self.bet_mode = QComboBox()
-        self.bet_mode.addItems(["Фиксированная ставка", "% от банка", "Критерий Келли"])
-        bank_form.addRow("Режим ставки:", self.bet_mode)
 
         self.bet_size = QDoubleSpinBox()
         self.bet_size.setRange(10, 100000)
@@ -284,17 +428,11 @@ class StrategiesPage(QWidget):
         bank_form.addRow("Макс. коэффициент:", self.max_odds)
         right.addWidget(bank_group)
 
-        # ---- Группа: Автоматизация ----
+        # ---- Автоматизация ----
         auto_group = QGroupBox("Автоматизация")
         auto_form = QFormLayout(auto_group)
         auto_form.setSpacing(10)
         _make_field_grow(auto_form)
-
-        self.auto_bet = QCheckBox("Автоматическая ставка")
-        auto_form.addRow(self.auto_bet)
-        self.auto_confirm = QCheckBox("Подтверждение перед ставкой")
-        self.auto_confirm.setChecked(True)
-        auto_form.addRow(self.auto_confirm)
 
         self.verify_seconds = QDoubleSpinBox()
         self.verify_seconds.setRange(0.0, 30.0)
@@ -310,15 +448,18 @@ class StrategiesPage(QWidget):
         self.max_bets_per_phase.setRange(1, 100)
         auto_form.addRow("Макс. ставок на фазу:", self.max_bets_per_phase)
 
+        self.max_bets_per_session = QSpinBox()
+        self.max_bets_per_session.setRange(0, 10000)
+        self.max_bets_per_session.setSpecialValueText("без лимита")
+        self.max_bets_per_session.setSuffix(" ставок")
+        self.max_bets_per_session.setToolTip(
+            "Остановить работу после N успешно принятых ставок за сессию.\n"
+            "0 = без лимита. Сбрасывается при перезапуске приложения."
+        )
+        auto_form.addRow("Лимит ставок за сессию:", self.max_bets_per_session)
+
         self.ignore_repeats = QCheckBox("Игнорировать повторные сигналы")
         auto_form.addRow(self.ignore_repeats)
-
-        self.stop_after_loss = QCheckBox("Стоп после серии убытков")
-        auto_form.addRow(self.stop_after_loss)
-        self.max_loss = QSpinBox()
-        self.max_loss.setRange(1, 10)
-        self.max_loss.setSuffix(" подряд")
-        auto_form.addRow("Макс. убытков:", self.max_loss)
 
         self.headless_checkbox = QCheckBox("Скрытый режим (без окна браузера)")
         self.headless_checkbox.setChecked(False)
@@ -341,7 +482,7 @@ class StrategiesPage(QWidget):
         self._rebuild_cards()
         self._load_form(0)
 
-    # ---------- Загрузка аккаунтов ----------
+    # ---------- Аккаунты ----------
     def _load_accounts(self):
         from ui.paths import get_app_data_dir
         data_dir = get_app_data_dir()
@@ -398,25 +539,38 @@ class StrategiesPage(QWidget):
         self.cards_layout.addStretch()
 
     def _on_switch(self, index, on):
+        if not (0 <= index < len(self.store.strategies)):
+            return
+        st = self.store.strategies[index]
+        current = bool(st.get('enabled', False))
+        on = bool(on)
+        if current == on:
+            return
+
         self.store.set_enabled(index, on)
         self.store.save()
         self.strategies_changed.emit()
 
-        st = self.store.strategies[index]
         name = st.get('name', '?')
         log_bus.info("Стратегия", f"'{name}' — {'включена' if on else 'выключена'}")
 
+        main = self.window()
+        if not hasattr(main, 'after_goal_engine'):
+            return
+
+        engine = main.after_goal_engine
+        profile_id = st.get('profile_id')
+
         if on:
-            main = self.window()
-            if hasattr(main, 'after_goal_engine'):
-                if st.get('profile_id'):
-                    asyncio.create_task(
-                        main.after_goal_engine.activate_strategy(st)
-                    )
-                    logger.info(f"Стратегия '{name}' включена, запускаем AdsPower")
-                else:
-                    logger.warning(f"Стратегия '{name}' без profile_id")
-                    log_bus.warning("Стратегия", f"'{name}' — не указан profile_id")
+            if profile_id:
+                asyncio.create_task(engine.activate_strategy(st))
+        else:
+            if profile_id:
+                asyncio.create_task(engine.deactivate_profile(profile_id, name))
+                logger.info(f"Стратегия '{name}' выключена, закрываем профиль")
+            else:
+                logger.warning(f"Стратегия '{name}' без profile_id")
+                log_bus.warning("Стратегия", f"'{name}' — не указан profile_id")
 
     def _on_add(self):
         idx = self.store.add()
@@ -439,17 +593,14 @@ class StrategiesPage(QWidget):
             return
         self.selected = index
         st = self.store.strategies[index]
+
+        # основные
         self.name_edit.setText(st.get("name", ""))
-
-        # ---- Тип стратегии ----
         type_raw = st.get("type", "After-goal")
-        self.strategy_type.setCurrentText(TYPE_DISPLAY.get(type_raw, "После гола"))
-
-        # ---- Вид спорта ----
+        self.strategy_type.setCurrentText(TYPE_DISPLAY.get(type_raw, "Послегол"))
         sport_key = st.get("sport") or SPORT_ANY
         self.sport_combo.setCurrentText(SPORT_DISPLAY.get(sport_key, "Все виды"))
 
-        # ---- Аккаунт ----
         profile_id = st.get('profile_id', '')
         if profile_id:
             for i, acc in enumerate(self.accounts):
@@ -462,72 +613,71 @@ class StrategiesPage(QWidget):
             self.account_combo.setCurrentIndex(0)
 
         self.min_delay.setValue(st.get("min_delay", 2.0))
-        self.min_score_diff.setValue(st.get("min_score_diff", 2))
 
-        # ---- Рынки ----
-        markets = st.get("markets_enabled") or ["winner", "total", "handicap"]
-        self.cb_winner.setChecked("winner" in markets)
-        self.cb_total.setChecked("total" in markets)
-        self.cb_handicap.setChecked("handicap" in markets)
+        # ── Режим рынков ──
+        mode = st.get("market_mode", "auto")
+        if mode == "manual":
+            self.market_mode_manual.setChecked(True)
+        else:
+            self.market_mode_auto.setChecked(True)
 
-        # ---- Направление ----
-        direction = st.get("bet_direction", "best_odds")
-        self.direction_combo.setCurrentText(
-            DIRECTION_DISPLAY.get(direction, "Лучший коэффициент"))
+        criterion = st.get("auto_criterion", "reliable")
+        if criterion == "max_odds":
+            self.crit_max_odds.setChecked(True)
+        elif criterion == "all_confirmed":
+            self.crit_all.setChecked(True)
+        else:
+            self.crit_reliable.setChecked(True)
 
-        # ---- Стороны ----
-        self.winner_sides_combo.setCurrentText(
-            SIDES_WIN_DISPLAY.get(st.get("winner_sides", "both"), "Любая"))
-        self.total_sides_combo.setCurrentText(
-            SIDES_TOTAL_DISPLAY.get(st.get("total_sides", "both"), "Любая"))
-        self.handicap_sides_combo.setCurrentText(
-            SIDES_WIN_DISPLAY.get(st.get("handicap_sides", "both"), "Любая"))
+        manual = st.get("manual_markets") or []
+        for code, cb in self.cb_markets.items():
+            cb.setChecked(code in manual)
 
-        # ---- Банкролл ----
-        self.bet_mode.setCurrentText(st.get("bet_mode", "Фиксированная ставка"))
+        # ── RACE (гонка внутри сета) ──
+        self.cb_race_enabled.setChecked(
+            bool(st.get("race_enabled", False))
+        )
+
+        # пороги
+        thresholds = st.get("market_thresholds") or {}
+        self.spin_winner_thr.setValue(int(thresholds.get("winner", 2)))
+        self.spin_total_thr.setValue(int(thresholds.get("total", 1)))
+        self.spin_handicap_thr.setValue(int(thresholds.get("handicap", 3)))
+
+        # ставка
         self.bet_size.setValue(st.get("bet_size", 100))
         self.min_odds.setValue(st.get("min_odds", 1.30))
         self.max_odds.setValue(st.get("max_odds", 5.0))
 
-        # ---- Автоматизация ----
-        self.auto_bet.setChecked(st.get("auto_bet", False))
-        self.auto_confirm.setChecked(st.get("auto_confirm", True))
+        # автоматизация
         self.verify_seconds.setValue(st.get("verify_seconds", 3.0))
         self.max_bets_per_match.setValue(st.get("max_bets_per_match", 1))
         self.max_bets_per_phase.setValue(st.get("max_bets_per_phase", 1))
+        self.max_bets_per_session.setValue(st.get("max_bets_per_session", 0))
         self.ignore_repeats.setChecked(st.get("ignore_repeats", False))
-        self.stop_after_loss.setChecked(st.get("stop_after_loss", False))
-        self.max_loss.setValue(st.get("max_loss", 3))
         self.headless_checkbox.setChecked(st.get("headless", False))
 
     def _on_save(self):
         if not (0 <= self.selected < len(self.store.strategies)):
             return
 
-        # ---- Рынки: минимум один ----
-        markets = []
-        if self.cb_winner.isChecked():
-            markets.append("winner")
-        if self.cb_total.isChecked():
-            markets.append("total")
-        if self.cb_handicap.isChecked():
-            markets.append("handicap")
-        if not markets:
-            log_bus.warning("Стратегия", "Нужно выбрать хотя бы один рынок")
-            return
+        # Валидация: в ручном режиме нужен хотя бы один рынок
+        if self.market_mode_manual.isChecked():
+            manual_check = [
+                code for code, cb in self.cb_markets.items() if cb.isChecked()
+            ]
+            if not manual_check:
+                log_bus.warning(
+                    "Стратегия",
+                    "В ручном режиме нужно выбрать хотя бы один рынок",
+                )
+                return
 
         st = self.store.strategies[self.selected]
         st["name"] = self.name_edit.text().strip() or st["name"]
+        st["type"] = TYPE_CHOICES.get(self.strategy_type.currentText(), "After-goal")
+        st["sport"] = SPORT_CHOICES.get(self.sport_combo.currentText(), SPORT_ANY)
 
-        # ---- Тип стратегии: русский ключ → английский код ----
-        st["type"] = TYPE_CHOICES.get(
-            self.strategy_type.currentText(), "After-goal")
-
-        # ---- Вид спорта ----
-        st["sport"] = SPORT_CHOICES.get(
-            self.sport_combo.currentText(), SPORT_ANY)
-
-        # ---- Аккаунт ----
         acc = self._get_account_by_index(self.account_combo.currentIndex())
         if acc:
             st["profile_id"] = acc.get("ads_power_id", "")
@@ -537,38 +687,51 @@ class StrategiesPage(QWidget):
             st["bk"] = ""
 
         st["min_delay"] = self.min_delay.value()
-        st["min_score_diff"] = self.min_score_diff.value()
 
-        # ---- Что ставить: русский ключ → английский код ----
-        st["markets_enabled"] = markets
-        st["bet_direction"] = DIRECTION_CHOICES.get(
-            self.direction_combo.currentText(), "best_odds")
-        st["winner_sides"] = SIDES_WIN_CHOICES.get(
-            self.winner_sides_combo.currentText(), "both")
-        st["total_sides"] = SIDES_TOTAL_CHOICES.get(
-            self.total_sides_combo.currentText(), "both")
-        st["handicap_sides"] = SIDES_WIN_CHOICES.get(
-            self.handicap_sides_combo.currentText(), "both")
+        st["market_thresholds"] = {
+            "winner":   self.spin_winner_thr.value(),
+            "total":    self.spin_total_thr.value(),
+            "handicap": self.spin_handicap_thr.value(),
+            "it":       int(st.get("market_thresholds", {}).get("it", 2)),
+        }
+        st["min_score_diff"] = min(
+            st["market_thresholds"]["winner"],
+            st["market_thresholds"]["total"],
+            st["market_thresholds"]["handicap"],
+        )
 
-        # ---- Банкролл ----
-        st["bet_mode"] = self.bet_mode.currentText()
+        # ── Рынки ──
+        st["market_mode"] = (
+            "manual" if self.market_mode_manual.isChecked() else "auto"
+        )
+
+        if self.crit_max_odds.isChecked():
+            st["auto_criterion"] = "max_odds"
+        elif self.crit_all.isChecked():
+            st["auto_criterion"] = "all_confirmed"
+        else:
+            st["auto_criterion"] = "reliable"
+
+        manual = [code for code, cb in self.cb_markets.items() if cb.isChecked()]
+        if not manual:
+            manual = ["winner_1", "winner_2"]
+        st["manual_markets"] = manual
+
+        # ── RACE (гонка внутри сета) ──
+        st["race_enabled"] = self.cb_race_enabled.isChecked()
+
+        # ставка
         st["bet_size"] = self.bet_size.value()
         st["min_odds"] = self.min_odds.value()
         st["max_odds"] = self.max_odds.value()
 
-        # ---- Автоматизация ----
-        st["auto_bet"] = self.auto_bet.isChecked()
-        st["auto_confirm"] = self.auto_confirm.isChecked()
+        # автоматизация
         st["verify_seconds"] = self.verify_seconds.value()
         st["max_bets_per_match"] = self.max_bets_per_match.value()
         st["max_bets_per_phase"] = self.max_bets_per_phase.value()
+        st["max_bets_per_session"] = self.max_bets_per_session.value()
         st["ignore_repeats"] = self.ignore_repeats.isChecked()
-        st["stop_after_loss"] = self.stop_after_loss.isChecked()
-        st["max_loss"] = self.max_loss.value()
         st["headless"] = self.headless_checkbox.isChecked()
-
-        if "market_type" in st:
-            del st["market_type"]
 
         self.store.save()
         self.strategies_changed.emit()

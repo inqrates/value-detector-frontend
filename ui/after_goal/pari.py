@@ -1,4 +1,19 @@
-# ui/after_goal/fonbet.py
+# ui/after_goal/pari.py
+"""
+Pari handler — instance-based. Полный клон Fonbet по структуре API.
+
+Различия от Fonbet:
+  - Домен:    clientsapi-lb01-w.pb06e2-resources.com
+              (Fonbet: clientsapi-lb61-w.bk6bba-resources.com)
+  - CDI:      942 (у Fonbet 518)
+  - mirror:   https://pari.ru (у Fonbet https://fon.bet)
+  - Live-API: /events/list, /events/listLight
+              (у Fonbet: /ma/events/list, /ma/events/event)
+
+Логика разбора ответов идентична (факторы 921/923/927/928/930/931,
+eventMiscs score1/score2/comment, customFactors) — код скопирован из
+fonbet.py без логических изменений.
+"""
 import json
 import logging
 import re
@@ -9,7 +24,7 @@ from .base import BookmakerHandler
 logger = logging.getLogger(__name__)
 
 
-class FonbetHandler(BookmakerHandler):
+class PariHandler(BookmakerHandler):
     def __init__(self, target_match_id: str = None,
                  target_teams: List[str] = None):
         self.target_match_id = str(target_match_id) if target_match_id else None
@@ -32,7 +47,8 @@ class FonbetHandler(BookmakerHandler):
             self.target_teams = list(match_teams)
 
         if not self.target_match_id:
-            m = re.search(r'/event/(\d+)', page.url)
+            m = re.search(r'/event/(\d+)', page.url) or \
+                re.search(r'-(\d+)(?:-|$)', page.url)
             if m:
                 self.target_match_id = m.group(1)
 
@@ -44,7 +60,7 @@ class FonbetHandler(BookmakerHandler):
 
         self._listener = on_response
         page.on("response", on_response)
-        logger.info(f"Fonbet: listener установлен (target={self.target_match_id})")
+        logger.info(f"Pari: listener установлен (target={self.target_match_id})")
 
     async def stop_listener(self, page: Page):
         if self._listener:
@@ -54,43 +70,40 @@ class FonbetHandler(BookmakerHandler):
                 pass
             self._listener = None
         self._callback = None
-        logger.info(f"Fonbet: listener снят (target={self.target_match_id})")
+        logger.info(f"Pari: listener снят (target={self.target_match_id})")
 
     async def _handle_response(self, response: Response):
         url = response.url
 
-        # ── Баланс Fonbet ──
+        # ── Баланс Pari ──
         if '/session/info' in url:
             try:
                 data = await response.json()
                 saldo = data.get('saldo')
                 if saldo is not None:
                     from ui.balance_bus import balance_bus
-                    balance_bus.update('fonbet', saldo, 'RUB')
+                    balance_bus.update('pari', saldo, 'RUB')
             except Exception:
                 pass
             return
 
         # ── Live-парсинг ──
-        if not ('/events/event' in url
-                or '/ma/events/event' in url
-                or '/ma/line/liveEvents' in url
-                or '/ma/events/list' in url):
+        if not ('/events/list' in url or '/events/listLight' in url):
             return
 
         try:
             data = await response.json()
         except Exception:
             return
-        parsed = FonbetHandler.parse_update(data, self.target_match_id)
+        parsed = PariHandler.parse_update(data, self.target_match_id)
         if parsed and self._callback:
             try:
                 await self._callback(parsed)
             except Exception as e:
-                logger.error(f"Fonbet callback: {e}", exc_info=True)
+                logger.error(f"Pari callback: {e}", exc_info=True)
 
     # ============================================================
-    # Определение активной фазы
+    # Определение активной фазы (КОПИЯ из Fonbet)
     # ============================================================
     @staticmethod
     def _resolve_active_phase(data: dict, root_id: str):
@@ -144,14 +157,14 @@ class FonbetHandler(BookmakerHandler):
             hk = set_markets.setdefault(set_key, {}).setdefault('handicap', {})
             o = outcome_ids.setdefault(set_key, {}).setdefault('handicap', {})
             if h1:
-                line1 = FonbetHandler._extract_line(h1)
+                line1 = PariHandler._extract_line(h1)
                 hk.setdefault('1', {})['line'] = line1
                 hk['1']['odd'] = h1.get('v')
                 o.setdefault('1', {})['id'] = 910
                 o['1']['kf'] = h1.get('v')
                 o['1']['line'] = line1
             if h2:
-                line2 = FonbetHandler._extract_line(h2)
+                line2 = PariHandler._extract_line(h2)
                 hk.setdefault('2', {})['line'] = line2
                 hk['2']['odd'] = h2.get('v')
                 o.setdefault('2', {})['id'] = 912
@@ -166,7 +179,7 @@ class FonbetHandler(BookmakerHandler):
             to = next((f for f in factors if f.get('f') == over_code), None)
             tu = next((f for f in factors if f.get('f') == under_code), None)
             if to and tu:
-                line = FonbetHandler._extract_line(to)
+                line = PariHandler._extract_line(to)
                 t = set_markets.setdefault(set_key, {}).setdefault('total', {})
                 if 'line' not in t:
                     t['line'] = line
@@ -202,7 +215,8 @@ class FonbetHandler(BookmakerHandler):
         if not event:
             return None
 
-        phase_num, phase_event_id, phase_name = FonbetHandler._resolve_active_phase(data, match_id)
+        phase_num, phase_event_id, phase_name = \
+            PariHandler._resolve_active_phase(data, match_id)
 
         misc = None
         for m in data.get('eventMiscs', []) or []:
@@ -235,7 +249,9 @@ class FonbetHandler(BookmakerHandler):
             for block in data.get('customFactors', []) or []:
                 if str(block.get('e')) == str(phase_event_id):
                     factors = block.get('factors', []) or []
-                    FonbetHandler._parse_phase_factors(factors, set_key, set_markets, outcome_ids)
+                    PariHandler._parse_phase_factors(
+                        factors, set_key, set_markets, outcome_ids
+                    )
                     break
 
         return {
@@ -253,11 +269,25 @@ class FonbetHandler(BookmakerHandler):
 
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
+        """
+        Ставка через Pari. Схема идентична Fonbet:
+          1. POST /coupon/betSlipInfo
+          2. POST /coupon/betRequestId
+          3. POST /coupon/bet
+          4. Если betDelay — POST /coupon/betResult
+
+        Различия от Fonbet:
+          - Домен: clientsapi-lb01-w.pb06e2-resources.com
+          - mirror: https://pari.ru
+          - CDI: 942 (у Fonbet 518)
+        """
+        score = bet_data.get('score', '0:0')
+
         script = f"""
         (async function() {{
             const data = {json.dumps(bet_data)};
             try {{
-                const slipInfo = await fetch('https://clientsapi-lb61-w.bk6bba-resources.com/coupon/betSlipInfo', {{
+                const slipInfo = await fetch('https://clientsapi-lb01-w.pb06e2-resources.com/coupon/betSlipInfo', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'text/plain;charset=UTF-8' }},
                     body: JSON.stringify({{
@@ -275,19 +305,19 @@ class FonbetHandler(BookmakerHandler):
                 const clientId = parseInt(localStorage.getItem('clientId')) || 0;
                 const deviceId = localStorage.getItem('deviceId') || '';
 
-                const reqIdResp = await fetch('https://clientsapi-lb61-w.bk6bba-resources.com/coupon/betRequestId', {{
+                const reqIdResp = await fetch('https://clientsapi-lb01-w.pb06e2-resources.com/coupon/betRequestId', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'text/plain;charset=UTF-8' }},
                     body: JSON.stringify({{
                         lang: 'ru', fsid: fsid, sysId: 21, clientId: clientId,
-                        CDI: 518, deviceId: deviceId
+                        CDI: 942, deviceId: deviceId
                     }})
                 }});
                 const reqData = await reqIdResp.json();
                 if (reqData.result !== 'requestId') throw new Error('requestId failed');
                 const requestId = reqData.requestId;
 
-                const betResp = await fetch('https://clientsapi-lb61-w.bk6bba-resources.com/coupon/bet', {{
+                const betResp = await fetch('https://clientsapi-lb01-w.pb06e2-resources.com/coupon/bet', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'text/plain;charset=UTF-8' }},
                     body: JSON.stringify({{
@@ -296,18 +326,18 @@ class FonbetHandler(BookmakerHandler):
                         coupon: {{
                             amount: data.amount,
                             flexBet: 'any', flexParam: false,
-                            mirror: 'https://fon.bet',
+                            mirror: 'https://pari.ru',
                             bets: [{{
                                 num: 1, event: data.event_id,
                                 factor: data.factor_id, value: data.value,
-                                score: '0:0', zone: 'sp'
+                                score: {json.dumps(score)}, zone: 'sp'
                             }}]
                         }}
                     }})
                 }});
                 const betResult = await betResp.json();
                 if (betResult.result === 'betDelay') {{
-                    const resultResp = await fetch('https://clientsapi-lb54-w.bk6bba-resources.com/coupon/betResult', {{
+                    const resultResp = await fetch('https://clientsapi-lb01-w.pb06e2-resources.com/coupon/betResult', {{
                         method: 'POST',
                         headers: {{ 'Content-Type': 'text/plain;charset=UTF-8' }},
                         body: JSON.stringify({{
@@ -320,7 +350,10 @@ class FonbetHandler(BookmakerHandler):
                         return {{ success: true, betId: final.coupon.regId }};
                     }}
                 }}
-                throw new Error('bet failed');
+                if (betResult.result === 'couponResult' && betResult.coupon.resultCode === 0) {{
+                    return {{ success: true, betId: betResult.coupon.regId }};
+                }}
+                throw new Error('bet failed: ' + JSON.stringify(betResult).slice(0, 200));
             }} catch(e) {{
                 return {{ success: false, error: e.message }};
             }}

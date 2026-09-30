@@ -6,7 +6,7 @@ import requests
 import wmi
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QFrame
+    QPushButton, QFrame, QCheckBox
 )
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 
@@ -44,7 +44,7 @@ class LoginWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Value Detector Pro – Вход")
-        self.setFixedSize(420, 580)
+        self.setFixedSize(420, 620)
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setStyleSheet(APP_STYLE)
 
@@ -155,6 +155,20 @@ class LoginWindow(QWidget):
 
         main_layout.addSpacing(8)
 
+        # ---- Запомнить меня ----
+        self.remember_cb = QCheckBox("Запомнить меня")
+        self.remember_cb.setChecked(True)
+        self.remember_cb.setStyleSheet("""
+            QCheckBox {
+                color: rgba(245,249,252,0.8);
+                font-size: 13px;
+                spacing: 8px;
+            }
+        """)
+        main_layout.addWidget(self.remember_cb)
+
+        main_layout.addSpacing(4)
+
         # ---- Кнопка входа ----
         self.login_btn = QPushButton("Войти")
         self.login_btn.setFixedHeight(46)
@@ -244,8 +258,23 @@ class LoginWindow(QWidget):
                 user_session.set_user(
                     login=user_data.get("login", login),
                     tariff=user_data.get("tariff", "Trial"),
-                    days_left=user_data.get("days_left", 30)
+                    days_left=user_data.get("days_left", 30),
+                    days_total=user_data.get("days_total", 30),
                 )
+
+                # ── Сохраняем сессию если «Запомнить меня» ──
+                if self.remember_cb.isChecked():
+                    try:
+                        from ui.session_store import save_session
+                        save_session(
+                            login=user_session.login,
+                            tariff=user_session.tariff,
+                            days_left=user_session.days_left,
+                            days_total=user_session.days_total,
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Не удалось сохранить сессию: {e}")
+
                 self.error_label.hide()
                 self.login_success.emit()
                 self.close()

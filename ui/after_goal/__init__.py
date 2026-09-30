@@ -5,7 +5,7 @@ from .winline import WinlineHandler
 from .ligastavok import LigaStavokHandler
 from .leon import LeonHandler
 from .olimp import OlimpHandler
-from .baltbet import BaltbetHandler
+from .pari import PariHandler
 from .betcity import BetcityHandler
 from .marathon import MarathonHandler
 from .zenit import ZenitHandler
@@ -18,9 +18,9 @@ __all__ = [
     "LigaStavokHandler",
     "LeonHandler",
     "OlimpHandler",
-    "BaltbetHandler",
     "BetcityHandler",
     "MarathonHandler",
     "ZenitHandler",
     "SportbetHandler",
+    "PariHandler",
 ]
