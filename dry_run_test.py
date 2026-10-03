@@ -8,12 +8,13 @@ DRY-RUN тест ставок без реальной отправки.
 - Всё, что «БЫЛО БЫ отправлено», пишется в консоль и в dry_run.log
 - AdsPower API-ключ — глобальный (env или хардкод), не нужен в accounts.json
 - Ленивая активация профилей: открываются только при первом сигнале
+- Профили БК ЗАХАРДКОЖЕНЫ (HARDCODED_PROFILES), accounts.json НЕ читается
 
 Запуск:
     python dry_run_test.py                          # стратегии из strategies.json (только enabled)
     python dry_run_test.py --force-all              # все стратегии, даже выключенные
-    python dry_run_test.py --all-bks                # авто-стратегии для ВСЕХ БК из accounts.json
-    python dry_run_test.py --bks pari,ligastavok    # только эти БК (мок + фильтр стратегий)
+    python dry_run_test.py --all-bks                # авто-стратегии для ВСЕХ БК из HARDCODED_PROFILES
+    python dry_run_test.py --bks fonbet,ligastavok  # только эти БК
     python dry_run_test.py --ws ws://localhost:8000/ws
     python dry_run_test.py --api-key XXX            # AdsPower API-ключ вручную
 
@@ -56,70 +57,42 @@ logger = logging.getLogger("dry_run")
 
 
 # ────────────────────────────────────────────────────────────
-# Маппинг "человеческое имя БК" из accounts.json → bk_id для движка
+# ЗАХАРДКОЖЕННЫЕ ПРОФИЛИ AdsPower (accounts.json НЕ читается)
 # ────────────────────────────────────────────────────────────
-BK_NAME_MAP = {
-    "fonbet":       "fonbet",
-    "pari":         "pari",
-    "winline":      "winline",
-    "liga stavok":  "ligastavok",
-    "ligastavok":   "ligastavok",
-    "leon":         "leon",
-    "olimp":        "olimp",
-    "betcity":      "betcity",
-    "marathon":     "marathon",
-    "zenit":        "zenit",
-    "sportbet":     "sportbet",
+# bk_id → ads_power_id
+HARDCODED_PROFILES = {
+    "fonbet":     "k1h5id2p",
+    "winline":    "k1h5krm4",
+    "zenit":      "k1h5id2u",
+    "sportbet":   "k1h5id2r",
+    "leon":       "k1h5id2q",
+    "ligastavok": "k1h5cqob",
+    "marathon":   "k1gy7l7u",
+    "olimp":      "k1gy7l7s",
+    "betcity":    "k1gy7jru",
+    # "pari":     "",   # ← закомментировано, нет профиля в AdsPower
 }
-
-
-def _normalize_bk_name(name: str) -> str:
-    return (name or "").strip().lower()
 
 
 def build_strategies_from_accounts() -> list:
     """
-    Читает accounts.json и создаёт по одной временной стратегии на каждую БК.
-    Берём profile_id из каждого аккаунта. enabled=True в памяти.
+    Создаёт по одной временной стратегии на каждую БК
+    из HARDCODED_PROFILES (НЕ читает accounts.json).
+    enabled=True в памяти.
     """
-    try:
-        from ui.paths import get_app_data_dir
-    except Exception as e:
-        logger.error(f"Не могу импортировать get_app_data_dir: {e}")
-        return []
-
-    path = os.path.join(get_app_data_dir(), "accounts.json")
-    if not os.path.exists(path):
-        logger.error(f"accounts.json не найден: {path}")
-        return []
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            accounts = json.load(f)
-    except Exception as e:
-        logger.error(f"Ошибка чтения accounts.json: {e}")
-        return []
-
     strategies = []
-    for acc in accounts:
-        raw_bk = _normalize_bk_name(acc.get("bk"))
-        bk_id = BK_NAME_MAP.get(raw_bk)
-        if not bk_id:
-            logger.warning(
-                f"⚠️ Пропускаю '{acc.get('bk')}' — не знаю маппинг на bk_id"
-            )
-            continue
-        profile_id = acc.get("ads_power_id")
+
+    for bk_id, profile_id in HARDCODED_PROFILES.items():
         if not profile_id:
             logger.warning(
-                f"⚠️ Пропускаю '{acc.get('bk')}' — нет ads_power_id"
+                f"⚠️ Пропускаю {bk_id} — profile_id не задан в HARDCODED_PROFILES"
             )
             continue
 
         strategies.append({
             "name": f"DRY_{bk_id}",
             "type": "After-goal",
-            "enabled": True,                    # в памяти — форсим True
+            "enabled": True,
             "profile_id": profile_id,
             "bk": bk_id,
             "sport": "any",
@@ -129,20 +102,37 @@ def build_strategies_from_accounts() -> list:
             "max_bets_per_match": 1,
             "max_bets_per_phase": 1,
             "ignore_repeats": False,
-            "markets_enabled": ["winner", "total", "handicap"],
-            "bet_direction": "best_odds",
-            "winner_sides": "both",
-            "total_sides": "both",
-            "handicap_sides": "both",
+
+            # ── Рынки (все доступные, авто-режим) ──
+            "market_mode": "auto",
+            "auto_criterion": "reliable",
+            "manual_markets": [
+                "winner_1", "winner_2",
+                "total_over", "total_under",
+                "handicap_1", "handicap_2",
+                "it1_over", "it1_under",
+                "it2_over", "it2_under",
+                "odd", "point",
+                "race",   # только у Лиги; у остальных игнорируется
+            ],
+
+            # ── Пороги по рынкам (для теста — низкие) ──
+            "market_thresholds": {
+                "winner":   1,
+                "total":    1,
+                "handicap": 1,
+                "it":       1,
+            },
+
+            # ── Ставка ──
             "bet_size": 50,
             "min_odds": 1.1,
             "max_odds": 10.0,
-            "headless": False,
-            "market_thresholds": {
-                "winner": 2, "total": 1, "handicap": 3, "it": 2,
-            },
+
+            # ── Автоматизация ──
             "max_bets_per_session": 0,
-            "race_enabled": True,   # ← тест с RACE (можно убрать)
+            "headless": False,
+            "race_enabled": True,
         })
 
     return strategies
@@ -318,8 +308,6 @@ class DryRunWsClient:
         )
 
         # ── ЛЕНИВАЯ АКТИВАЦИЯ ПРОФИЛЯ ──
-        # Профиль не открывается заранее (иначе 9 AdsPower-окон висят).
-        # Открываем его при первом сигнале по этой БК.
         try:
             wrapper = await self.engine._get_existing_browser(profile_id)
             if not wrapper:
@@ -347,7 +335,6 @@ async def main_async(args):
     from ui.config_loader import load_config
 
     # ── 0. Глобальный AdsPower API-ключ ──
-    # Приоритет: --api-key CLI → env ADSPOWER_API_KEY → хардкод дефолт.
     global_api_key = (
         args.api_key
         or os.getenv("ADSPOWER_API_KEY", "").strip()
@@ -366,9 +353,7 @@ async def main_async(args):
     # ── 2. Загружаем стратегии ──
     store = StrategyStore()
 
-    # ── Фильтр по --bks (если задан) ──
-    # --bks ограничивает и мок place_bet, и список стратегий,
-    # иначе при --all-bks откроются ВСЕ профили из accounts.json.
+    # ── Фильтр по --bks ──
     wanted_bks = None
     if args.bks:
         wanted_bks = {b.strip().lower() for b in args.bks.split(",") if b.strip()}
@@ -378,7 +363,8 @@ async def main_async(args):
     if args.all_bks:
         in_mem = build_strategies_from_accounts()
         if not in_mem:
-            logger.error("❌ Не удалось создать ни одной стратегии из accounts.json")
+            logger.error("❌ Не удалось создать ни одной стратегии "
+                         "из HARDCODED_PROFILES")
             return
 
         if wanted_bks is not None:
@@ -394,14 +380,15 @@ async def main_async(args):
             if not in_mem:
                 logger.error(
                     "❌ После фильтра --bks не осталось ни одной стратегии. "
-                    "Проверь accounts.json."
+                    "Проверь HARDCODED_PROFILES."
                 )
                 return
 
         store.strategies = in_mem
         enabled = in_mem
         logger.warning(
-            f"⚡ --all-bks: создал {len(enabled)} стратегий из accounts.json"
+            f"⚡ --all-bks: создал {len(enabled)} стратегий "
+            f"(HARDCODED_PROFILES)"
         )
 
     elif args.force_all:
@@ -450,8 +437,7 @@ async def main_async(args):
     if not enabled:
         logger.warning("⚠️ Нет активных стратегий — скрипт будет молчать")
 
-    # ── Если задан --bks — выкидываем чужие стратегии из store,
-    #    чтобы is_signal_relevant/get_matching_strategy их не видели ──
+    # ── Если задан --bks — срезаем чужие стратегии из store ──
     if wanted_bks is not None:
         before = len(store.strategies)
         store.strategies = [
@@ -509,7 +495,7 @@ def main():
     ap.add_argument(
         "--bks",
         help="Замокать и оставить только эти БК через запятую "
-             "(например, pari,ligastavok)",
+             "(например, fonbet,ligastavok)",
         default=None,
     )
     ap.add_argument(
@@ -520,7 +506,7 @@ def main():
     ap.add_argument(
         "--all-bks",
         action="store_true",
-        help="Создать временные стратегии для ВСЕХ БК из accounts.json",
+        help="Создать временные стратегии для ВСЕХ БК из HARDCODED_PROFILES",
     )
     args = ap.parse_args()
 

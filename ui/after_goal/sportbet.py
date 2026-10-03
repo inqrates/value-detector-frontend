@@ -1,6 +1,28 @@
-# ui/after_goal/sportbet.py
 """
 Sportbet handler — instance-based.
+
+Архитектура парсинга (после рефакторинга):
+  1. События приходят через WebSocket (bthm-server.sportbet.ru) или HTTP
+     events.table. В событии ЕСТЬ счёт и фаза (matchStatus), но НЕТ
+     фазовых маркетов (pages всегда пустой).
+  2. Фазовые маркеты запрашиваются отдельно через:
+        GET /events.markets?eventId={id}&page={ключ}
+     где ключ строится из вида спорта и номера фазы:
+        table_tennis / volleyball  →  set_{N}
+        basketball                 →  quarter_{N}
+  3. Маркеты классифицируются ПО ИМЕНИ (groupName в ответе отсутствует):
+        "...Победитель" / "...Исход"      → winner
+        "...Чет/Нечет"                    → odd
+        "...Фора очков" / "...Фора"       → handicap
+        "...Тотал очков" / "...Тотал"     → total
+        "...{Игрок} Тотал"                → it (инд. тотал)
+        "...N-е очко" / "...N очко"       → point
+        "...Гонка до..." / "...Разница..." → пропускаем
+
+Особенности по видам:
+  - Баскетбол: победитель называется "Исход" (есть "Ничья" — игнорируем).
+  - Волейбол: индивидуальные тоталы ОТСУТСТВУЮТ.
+  - Очки: у НТ/баскета номер в исходе, у волейбола — в имени маркета.
 """
 import asyncio
 import json
@@ -9,14 +31,11 @@ import re
 import time
 import uuid as _uuid
 from typing import Optional, Dict, Any, List, Callable
+
 from playwright.async_api import Page, WebSocket, Response
 from .base import BookmakerHandler
 
 logger = logging.getLogger(__name__)
-
-_WIN_IDS   = (186, 202, 219)
-_TOTAL_IDS = (238, 310, 225)
-_HCP_IDS   = (237, 309, 223)
 
 _WS_SILENCE_THRESHOLD = 8.0
 _POLL_INTERVAL = 3.0
@@ -37,6 +56,9 @@ class SportbetHandler(BookmakerHandler):
         self._last_fetch_time: Dict[str, float] = {}
         self._last_phase: Dict[str, int] = {}
 
+    # ============================================================
+    # Подключение / отключение
+    # ============================================================
     async def setup_listener(self, page: Page, callback,
                              match_id=None, match_teams=None):
         if match_id:
@@ -53,7 +75,6 @@ class SportbetHandler(BookmakerHandler):
 
         page.on("websocket", self._on_websocket)
         page.on("response", self._on_response)
-
         logger.info(f"Sportbet: listener установлен (target={self.target_match_id})")
 
         asyncio.create_task(self._fetch_snapshot_and_emit(page))
@@ -73,6 +94,9 @@ class SportbetHandler(BookmakerHandler):
         self._last_sent_state = None
         logger.info("Sportbet: listener снят")
 
+    # ============================================================
+    # WebSocket + HTTP
+    # ============================================================
     def _on_websocket(self, ws: WebSocket):
         if "bthm-server.sportbet.ru" in ws.url:
             ws.on("framereceived", self._on_ws_frame)
@@ -119,6 +143,9 @@ class SportbetHandler(BookmakerHandler):
         except Exception as e:
             logger.debug(f"Sportbet HTTP parse: {e}")
 
+    # ============================================================
+    # Снапшот и поллинг (запасной канал при тишине WS)
+    # ============================================================
     async def _fetch_snapshot_and_emit(self, page: Page):
         try:
             await asyncio.sleep(0.5)
@@ -161,17 +188,6 @@ class SportbetHandler(BookmakerHandler):
             logger.debug(f"Sportbet markets {page_key}: {e}")
             return []
 
-    async def _fetch_phase_markets(self, page: Page, event_id: str,
-                                   pages: List[dict]) -> List[dict]:
-        result: List[dict] = []
-        for p in pages:
-            key = (p.get("key") or "").lower()
-            if not re.match(r"^(set|quarter|period|inning)_\d+$", key):
-                continue
-            markets = await self._fetch_page_markets(page, event_id, key)
-            result.extend(markets)
-        return result
-
     async def _poll_loop(self, page: Page):
         while True:
             try:
@@ -188,6 +204,9 @@ class SportbetHandler(BookmakerHandler):
             except Exception as e:
                 logger.debug(f"Sportbet poll: {e}")
 
+    # ============================================================
+    # Обработка событий
+    # ============================================================
     def _handle_payload(self, raw: Any):
         events = self._extract_events(raw)
         if not events:
@@ -206,30 +225,62 @@ class SportbetHandler(BookmakerHandler):
         if not match_id:
             return
 
+        # ── Спорт ──
+        sport_slug = SportbetHandler._resolve_sport_slug(event)
+
+        # ── Фаза из matchStatus ──
         match_status = (event.get("matchStatus") or "").strip()
         mm = re.search(r"(\d+)", match_status)
-        phase_hint = int(mm.group(1)) if mm else 0
+        phase_num = int(mm.group(1)) if mm else 0
+        if not phase_num:
+            phase_num = 1
 
+        # ── Счёт ──
+        score1, score2, sub1, sub2 = SportbetHandler._parse_scores(event)
+
+        # ── Нужно ли запрашивать маркеты ──
         now = time.time()
         last = self._last_fetch_time.get(match_id, 0.0)
         last_phase = self._last_phase.get(match_id, 0)
-        phase_changed = (phase_hint != last_phase)
+        phase_changed = (phase_num != last_phase)
         need_fetch = phase_changed or (now - last >= _MARKETS_FETCH_INTERVAL)
 
-        enriched = dict(event)
+        set_markets: Dict[str, dict] = {}
+        outcome_ids: Dict[str, dict] = {}
+
         if need_fetch and self._page:
-            pages = event.get("pages") or []
-            phase_markets = await self._fetch_phase_markets(
-                self._page, match_id, pages
+            page_key = SportbetHandler._build_page_key(sport_slug, phase_num)
+            markets = await self._fetch_page_markets(
+                self._page, match_id, page_key
             )
             self._last_fetch_time[match_id] = now
-            self._last_phase[match_id] = phase_hint
-            if phase_markets:
-                enriched["markets"] = (event.get("markets") or []) + phase_markets
+            self._last_phase[match_id] = phase_num
 
-        parsed = SportbetHandler.parse_update({"events": [enriched]})
-        if not parsed:
-            return
+            if markets:
+                teams = event.get("teams") or {}
+                t1 = ((teams.get("team1") or {}).get("name") or "").strip()
+                t2 = ((teams.get("team2") or {}).get("name") or "").strip()
+                set_key = f"set_{phase_num}"
+                SportbetHandler._parse_phase_markets(
+                    markets, set_key, t1, t2, set_markets, outcome_ids
+                )
+                # ближайшее доступное очко → 'point' (аналог 2393/2394)
+                SportbetHandler._pick_next_point(
+                    set_key, sub1, sub2, set_markets, outcome_ids
+                )
+
+        parsed = {
+            "match_id":    match_id,
+            "sport":       sport_slug,
+            "phase_num":   phase_num,
+            "phase_name":  match_status,
+            "score1":      score1,
+            "score2":      score2,
+            "sub_score1":  sub1,
+            "sub_score2":  sub2,
+            "set_markets": set_markets,
+            "outcome_ids": outcome_ids,
+        }
 
         state = self._state_hash(parsed)
         if state == self._last_sent_state:
@@ -242,6 +293,9 @@ class SportbetHandler(BookmakerHandler):
             except Exception as e:
                 logger.error(f"Sportbet callback: {e}")
 
+    # ============================================================
+    # Извлечение списка событий из сырых данных
+    # ============================================================
     @staticmethod
     def _extract_events(raw: Any) -> List[dict]:
         if not isinstance(raw, dict):
@@ -268,6 +322,343 @@ class SportbetHandler(BookmakerHandler):
             return [raw]
         return []
 
+    # ============================================================
+    # Вспомогательные: спорт / страница / счёт
+    # ============================================================
+    @staticmethod
+    def _resolve_sport_slug(event: dict) -> str:
+        sport_raw = event.get("sport")
+        if isinstance(sport_raw, dict):
+            slug = (sport_raw.get("slug") or "").strip().replace("-", "_")
+            if slug:
+                return slug
+            sid = sport_raw.get("id")
+            return {20: "table_tennis", 23: "volleyball",
+                    2: "basketball"}.get(sid, "")
+        if isinstance(sport_raw, str):
+            return sport_raw.strip().replace("-", "_")
+        return ""
+
+    @staticmethod
+    def _build_page_key(sport_slug: str, phase_num: int) -> str:
+        if sport_slug in ("basketball", "cyber_basketball"):
+            return f"quarter_{phase_num}"
+        if sport_slug == "hockey":
+            return f"period_{phase_num}"
+        # table_tennis / volleyball / beach_volleyball / tennis → set
+        return f"set_{phase_num}"
+
+    @staticmethod
+    def _parse_scores(event: dict):
+        score_str = event.get("score", "0:0") or "0:0"
+        try:
+            score1, score2 = map(int, score_str.split(":"))
+        except Exception:
+            score1 = score2 = 0
+        sub1 = sub2 = 0
+        scores_str = event.get("scores", "") or ""
+        parts = [p.strip() for p in scores_str.split() if p.strip()]
+        if parts and ":" in parts[-1]:
+            try:
+                sub1, sub2 = map(int, parts[-1].split(":"))
+            except Exception:
+                pass
+        return score1, score2, sub1, sub2
+
+    @staticmethod
+    def _extract_total_line(out: dict) -> float:
+        # 1) из specifiers: "total=17.5" или "total=8.5|gamenr=3"
+        spec = out.get("specifiers") or ""
+        if isinstance(spec, str) and "total=" in spec:
+            try:
+                val = spec.split("total=", 1)[1]
+                val = re.split(r"[|&;]", val, 1)[0]
+                return float(val)
+            except (ValueError, IndexError):
+                pass
+        # 2) из имени исхода
+        text = out.get("fullName") or out.get("name") or ""
+        m = re.search(r"(\d+\.?\d*)", text)
+        return float(m.group(1)) if m else 0.0
+
+    # ============================================================
+    # Классификация и парсинг маркетов (по имени)
+    # ============================================================
+    @staticmethod
+    def _parse_phase_markets(markets: list, set_key: str,
+                             team1: str, team2: str,
+                             set_markets: dict, outcome_ids: dict):
+        t1l = (team1 or "").lower()
+        t2l = (team2 or "").lower()
+
+        for market in markets:
+            if market.get("status") != "active":
+                continue
+            name = (market.get("name") or "").strip()
+            nl = name.lower()
+            outcomes = market.get("outcomes") or []
+            if not outcomes:
+                continue
+
+            # ── ПОРЯДОК КРИТИЧЕН ──
+            # 1) Победитель: "Победитель" (НТ/волей) ИЛИ "Исход" (баскет)
+            if "победитель" in nl or "исход" in nl:
+                SportbetHandler._parse_winner(outcomes, set_key,
+                                              set_markets, outcome_ids)
+            # 2) Чёт/Нечёт
+            elif "чет/нечет" in nl or "чёт/нечёт" in nl:
+                SportbetHandler._parse_odd_even(outcomes, set_key,
+                                                set_markets, outcome_ids)
+            # 3) Фора
+            elif "фора" in nl:
+                SportbetHandler._parse_handicap(outcomes, set_key,
+                                                set_markets, outcome_ids)
+            # 4) Гонка/Разница — пропускаем (до проверок "очко"/"тотал")
+            elif "гонка" in nl or "разниц" in nl:
+                continue
+            # 5) ТОТАЛ раньше "очко" ("Тотал очков" содержит "очко")
+            elif "тотал" in nl:
+                if t1l and t1l in nl:
+                    SportbetHandler._parse_it(outcomes, set_key, "1",
+                                              set_markets, outcome_ids)
+                elif t2l and t2l in nl:
+                    SportbetHandler._parse_it(outcomes, set_key, "2",
+                                              set_markets, outcome_ids)
+                else:
+                    SportbetHandler._parse_total(outcomes, set_key,
+                                                 set_markets, outcome_ids)
+            # 6) Очко (гонка и тотал уже исключены)
+            elif "очко" in nl:
+                SportbetHandler._parse_point(outcomes, set_key, name,
+                                             t1l, t2l,
+                                             set_markets, outcome_ids)
+
+    @staticmethod
+    def _parse_winner(outcomes, set_key, set_markets, outcome_ids):
+        w = set_markets.setdefault(set_key, {}).setdefault("winner", {})
+        o = outcome_ids.setdefault(set_key, {}).setdefault("winner", {})
+        for out in outcomes:
+            if out.get("active") is False:
+                continue
+            odd = out.get("odd")
+            if not odd:
+                continue
+            oname = (out.get("name") or "").strip()
+            oid = out.get("id")
+            # "Ничья" (баскетбол) игнорируется — только Поб1/Поб2
+            if oname == "Поб 1":
+                w["1"] = odd
+                o["1"] = {"id": oid, "kf": odd}
+            elif oname == "Поб 2":
+                w["2"] = odd
+                o["2"] = {"id": oid, "kf": odd}
+
+    @staticmethod
+    def _parse_odd_even(outcomes, set_key, set_markets, outcome_ids):
+        om = set_markets.setdefault(set_key, {}).setdefault("odd", {})
+        o = outcome_ids.setdefault(set_key, {}).setdefault("odd", {})
+        for out in outcomes:
+            if out.get("active") is False:
+                continue
+            odd = out.get("odd")
+            if not odd:
+                continue
+            oname = (out.get("name") or "").strip()
+            oid = out.get("id")
+            if oname in ("Чет", "Чёт"):
+                om["even"] = odd
+                o["even"] = {"id": oid, "kf": odd}
+            elif oname in ("Нечет", "Нечёт"):
+                om["odd"] = odd
+                o["odd"] = {"id": oid, "kf": odd}
+
+    @staticmethod
+    def _collect_lines(outcomes):
+        """Группирует исходы по линии: {line: {'over': out, 'under': out}}"""
+        lines = {}
+        for out in outcomes:
+            if out.get("active") is False:
+                continue
+            odd = out.get("odd")
+            if not odd:
+                continue
+            oname = (out.get("name") or "").strip()
+            ofull = out.get("fullName") or ""
+            line = SportbetHandler._extract_total_line(out)
+            if not line:
+                continue
+            is_over = oname.startswith("ТБ") or "Больше" in ofull
+            is_under = oname.startswith("ТМ") or "Меньше" in ofull
+            if not (is_over or is_under):
+                continue
+            lines.setdefault(line, {})
+            lines[line]["over" if is_over else "under"] = out
+        return lines
+
+    @staticmethod
+    def _parse_total(outcomes, set_key, set_markets, outcome_ids):
+        t = set_markets.setdefault(set_key, {}).setdefault("total", {})
+        o = outcome_ids.setdefault(set_key, {}).setdefault("total", {})
+        if "line" in t:
+            return
+        for line, pair in sorted(SportbetHandler._collect_lines(outcomes).items()):
+            if "over" in pair and "under" in pair:
+                t["line"] = line
+                t["over"] = pair["over"].get("odd")
+                t["under"] = pair["under"].get("odd")
+                o["over"] = {"id": pair["over"].get("id"),
+                             "kf": pair["over"].get("odd"), "line": line}
+                o["under"] = {"id": pair["under"].get("id"),
+                              "kf": pair["under"].get("odd"), "line": line}
+                break
+
+    @staticmethod
+    def _parse_it(outcomes, set_key, player, set_markets, outcome_ids):
+        it = (set_markets.setdefault(set_key, {})
+              .setdefault("it", {}).setdefault(player, {}))
+        o = (outcome_ids.setdefault(set_key, {})
+             .setdefault("it", {}).setdefault(player, {}))
+        if "line" in it:
+            return
+        for line, pair in sorted(SportbetHandler._collect_lines(outcomes).items()):
+            if "over" in pair and "under" in pair:
+                it["line"] = line
+                it["over"] = pair["over"].get("odd")
+                it["under"] = pair["under"].get("odd")
+                o["over"] = {"id": pair["over"].get("id"),
+                             "kf": pair["over"].get("odd"), "line": line}
+                o["under"] = {"id": pair["under"].get("id"),
+                              "kf": pair["under"].get("odd"), "line": line}
+                break
+
+    @staticmethod
+    def _parse_handicap(outcomes, set_key, set_markets, outcome_ids):
+        hk = set_markets.setdefault(set_key, {}).setdefault("handicap", {})
+        o = outcome_ids.setdefault(set_key, {}).setdefault("handicap", {})
+        if hk:
+            return
+        cand = {}  # abs(line) -> {'1': (out,line), '2': (out,line)}
+        for out in outcomes:
+            if out.get("active") is False:
+                continue
+            odd = out.get("odd")
+            if not odd:
+                continue
+            oname = (out.get("name") or "").strip()
+            m = re.search(r"\(([+-]?\d+\.?\d*)\)", oname)
+            if not m:
+                continue
+            line = float(m.group(1))
+            if "Фора 1" in oname:
+                cand.setdefault(abs(line), {})["1"] = (out, line)
+            elif "Фора 2" in oname:
+                cand.setdefault(abs(line), {})["2"] = (out, line)
+        for key in sorted(cand.keys()):
+            pair = cand[key]
+            if "1" in pair and "2" in pair:
+                out1, line1 = pair["1"]
+                out2, line2 = pair["2"]
+                hk.setdefault("1", {})["line"] = line1
+                hk["1"]["odd"] = out1.get("odd")
+                hk.setdefault("2", {})["line"] = line2
+                hk["2"]["odd"] = out2.get("odd")
+                o.setdefault("1", {})["id"] = out1.get("id")
+                o["1"]["kf"] = out1.get("odd")
+                o["1"]["line"] = line1
+                o.setdefault("2", {})["id"] = out2.get("id")
+                o["2"]["kf"] = out2.get("odd")
+                o["2"]["line"] = line2
+                break
+
+    @staticmethod
+    def _parse_point(outcomes, set_key, market_name, t1l, t2l,
+                     set_markets, outcome_ids):
+        """
+        Унифицированно под НТ/волейбол/баскетбол:
+          НТ:       маркет "N-е очко",  исходы "11-е - Игрок"
+          Волейбол: маркет "30-е очко", исходы "Команда"
+          Баскет:   маркет "N очко",    исходы "Команда - 25 очко"
+        """
+        # номер может быть в имени маркета (волейбол: "30-е очко")
+        market_n = None
+        m = re.search(r"(\d+)\s*-?\s*е?\s*очк", market_name)
+        if m:
+            market_n = int(m.group(1))
+
+        points = {}  # N -> {'1': out, '2': out}
+        for out in outcomes:
+            if out.get("active") is False:
+                continue
+            odd = out.get("odd")
+            if not odd:
+                continue
+            oname = (out.get("name") or "").strip()
+            ofull = out.get("fullName") or ""
+
+            # номер: из исхода, иначе из имени маркета
+            n = market_n
+            mm = re.search(r"(\d+)\s*-?\s*е", oname)
+            if mm:
+                n = int(mm.group(1))
+            else:
+                mm = re.search(r"(\d+)\s*очк", oname)
+                if mm:
+                    n = int(mm.group(1))
+            if n is None:
+                continue
+
+            # игрок: по имени команды в исходе
+            onl = oname.lower()
+            ofl = ofull.lower()
+            player = None
+            if t1l and (t1l in onl or t1l in ofl):
+                player = "1"
+            elif t2l and (t2l in onl or t2l in ofl):
+                player = "2"
+            if player is None:
+                continue
+
+            points.setdefault(n, {})[player] = out
+
+        pm = set_markets.setdefault(set_key, {}).setdefault("points", {})
+        om = outcome_ids.setdefault(set_key, {}).setdefault("points", {})
+        for n, pair in points.items():
+            if "1" in pair and "2" in pair:
+                pm[str(n)] = {"1": pair["1"].get("odd"),
+                              "2": pair["2"].get("odd")}
+                om[str(n)] = {
+                    "1": {"id": pair["1"].get("id"), "kf": pair["1"].get("odd")},
+                    "2": {"id": pair["2"].get("id"), "kf": pair["2"].get("odd")},
+                }
+
+    @staticmethod
+    def _pick_next_point(set_key, sub1, sub2, set_markets, outcome_ids):
+        """Заполняет 'point' ближайшим доступным очком (аналог 2393/2394)."""
+        pm = set_markets.get(set_key, {}).get("points") or {}
+        om = outcome_ids.get(set_key, {}).get("points") or {}
+        if not pm:
+            return
+        target = sub1 + sub2 + 1
+        nums = sorted(int(k) for k in pm.keys())
+        chosen = None
+        if str(target) in pm:
+            chosen = target
+        else:
+            for n in nums:
+                if n >= target:
+                    chosen = n
+                    break
+            if chosen is None and nums:
+                chosen = nums[0]
+        if chosen is None:
+            return
+        ck = str(chosen)
+        set_markets[set_key]["point"] = pm[ck]
+        outcome_ids[set_key]["point"] = om[ck]
+
+    # ============================================================
+    # Хэш состояния (для дедупликации колбэков)
+    # ============================================================
     @staticmethod
     def _state_hash(parsed: dict) -> tuple:
         sm = parsed.get("set_markets") or {}
@@ -276,193 +667,25 @@ class SportbetHandler(BookmakerHandler):
         markets = sm.get(set_key, {}) if set_key else {}
         w = markets.get("winner") or {}
         t = markets.get("total") or {}
+        hk = markets.get("handicap") or {}
+        od = markets.get("odd") or {}
+        it = markets.get("it") or {}
+        pt = markets.get("point") or {}
         return (
             phase,
             parsed.get("score1"), parsed.get("score2"),
             parsed.get("sub_score1"), parsed.get("sub_score2"),
             w.get("1"), w.get("2"),
             t.get("line"), t.get("over"), t.get("under"),
+            hk.get("1", {}).get("odd"), hk.get("2", {}).get("odd"),
+            od.get("even"), od.get("odd"),
+            it.get("1", {}).get("over"), it.get("2", {}).get("over"),
+            pt.get("1"), pt.get("2"),
         )
 
-    @staticmethod
-    def _resolve_group_kind(group_name: str) -> Optional[str]:
-        if not group_name:
-            return None
-        g = group_name.strip().lower()
-        if "исход" in g or "побед" in g:
-            return "winner"
-        if "тотал" in g:
-            return "total"
-        if "фора" in g:
-            return "handicap"
-        return None
-
-    @staticmethod
-    def parse_update(data: dict) -> Optional[dict]:
-        if not isinstance(data, dict):
-            return None
-
-        event = None
-        if "events" in data and isinstance(data["events"], list) and data["events"]:
-            event = data["events"][0]
-        elif "id" in data and "teams" in data:
-            event = data
-        else:
-            return None
-
-        match_id = event.get("id")
-        if not match_id:
-            return None
-
-        sport_raw = event.get("sport")
-        sport_slug = ""
-        if isinstance(sport_raw, dict):
-            sport_slug = (sport_raw.get("slug") or "").strip()
-            if not sport_slug:
-                sid = sport_raw.get("id")
-                if sid == 20:
-                    sport_slug = "table_tennis"
-                elif sid == 23:
-                    sport_slug = "volleyball"
-                elif sid == 2:
-                    sport_slug = "basketball"
-        elif isinstance(sport_raw, str):
-            sport_slug = sport_raw.strip().replace("-", "_")
-
-        score_str = event.get("score", "0:0") or "0:0"
-        try:
-            score1, score2 = map(int, score_str.split(":"))
-        except Exception:
-            score1 = score2 = 0
-
-        scores_str = event.get("scores", "") or ""
-        parts = [p.strip() for p in scores_str.split() if p.strip()]
-        sub1 = sub2 = 0
-        if parts:
-            last = parts[-1]
-            if ":" in last:
-                try:
-                    sub1, sub2 = map(int, last.split(":"))
-                except Exception:
-                    pass
-
-        current_phase = 0
-        match_status = (event.get("matchStatus") or "").strip()
-        mm = re.search(r"(\d+)", match_status)
-        if mm:
-            current_phase = int(mm.group(1))
-        if not current_phase:
-            if sport_slug == "basketball":
-                current_phase = len(parts) if parts else 1
-            else:
-                current_phase = score1 + score2 + 1
-
-        pages = event.get("pages") or []
-        page_groups: Dict[int, tuple] = {}
-        for p in pages:
-            key = (p.get("key") or "").lower()
-            mm2 = re.match(r"^(set|quarter|period|inning)_(\d+)$", key)
-            if not mm2:
-                continue
-            page_phase = int(mm2.group(2))
-            for g in p.get("groups") or []:
-                gid = g.get("id")
-                if gid is None:
-                    continue
-                kind = SportbetHandler._resolve_group_kind(g.get("name") or "")
-                if kind:
-                    page_groups[gid] = (page_phase, kind)
-
-        markets = event.get("markets") or []
-        set_markets: Dict[str, dict] = {}
-        outcome_ids: Dict[str, dict] = {}
-
-        for market in markets:
-            group_id = market.get("groupId")
-            info = page_groups.get(group_id)
-            if not info:
-                continue
-            phase_num, kind = info
-            set_key = f"set_{phase_num}"
-            outcomes = market.get("outcomes") or []
-
-            if kind == "winner":
-                for out in outcomes:
-                    if out.get("active") is False:
-                        continue
-                    name = out.get("name", "")
-                    odd = out.get("odd")
-                    if not odd:
-                        continue
-                    if name == "Поб 1":
-                        set_markets.setdefault(set_key, {}).setdefault("winner", {})["1"] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault("winner", {}).setdefault("1", {})["id"] = out.get("id")
-                    elif name == "Поб 2":
-                        set_markets.setdefault(set_key, {}).setdefault("winner", {})["2"] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault("winner", {}).setdefault("2", {})["id"] = out.get("id")
-
-            elif kind == "total":
-                for out in outcomes:
-                    if out.get("active") is False:
-                        continue
-                    name = out.get("name", "") or ""
-                    full_name = out.get("fullName", "") or ""
-                    mm3 = re.search(r"(\d+\.?\d*)", full_name or name)
-                    if not mm3:
-                        continue
-                    try:
-                        line = float(mm3.group(1))
-                    except ValueError:
-                        continue
-                    odd = out.get("odd")
-                    if not odd:
-                        continue
-                    if "Больше" in full_name or name.startswith("ТБ"):
-                        set_markets.setdefault(set_key, {}).setdefault("total", {})["line"] = line
-                        set_markets[set_key]["total"]["over"] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault("total", {}).setdefault("over", {})["id"] = out.get("id")
-                    elif "Меньше" in full_name or name.startswith("ТМ"):
-                        set_markets.setdefault(set_key, {}).setdefault("total", {})["line"] = line
-                        set_markets[set_key]["total"]["under"] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault("total", {}).setdefault("under", {})["id"] = out.get("id")
-
-            elif kind == "handicap":
-                for out in outcomes:
-                    if out.get("active") is False:
-                        continue
-                    name = out.get("name", "") or ""
-                    full_name = out.get("fullName", "") or ""
-                    mm4 = re.search(r"\(([+-]?\d+\.?\d*)\)", full_name)
-                    if not mm4:
-                        continue
-                    try:
-                        line = float(mm4.group(1))
-                    except ValueError:
-                        continue
-                    odd = out.get("odd")
-                    if not odd:
-                        continue
-                    if "Фора 1" in name:
-                        set_markets.setdefault(set_key, {}).setdefault("handicap", {}).setdefault("1", {})["line"] = line
-                        set_markets[set_key]["handicap"]["1"]["odd"] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault("handicap", {}).setdefault("1", {})["id"] = out.get("id")
-                    elif "Фора 2" in name:
-                        set_markets.setdefault(set_key, {}).setdefault("handicap", {}).setdefault("2", {})["line"] = line
-                        set_markets[set_key]["handicap"]["2"]["odd"] = odd
-                        outcome_ids.setdefault(set_key, {}).setdefault("handicap", {}).setdefault("2", {})["id"] = out.get("id")
-
-        return {
-            "match_id":    match_id,
-            "sport":       sport_slug,
-            "phase_num":   current_phase,
-            "score1":      score1,
-            "score2":      score2,
-            "sub_score1":  sub1,
-            "sub_score2":  sub2,
-            "set_markets": set_markets,
-            "outcome_ids": outcome_ids,
-        }
-
+    # ============================================================
+    # Размещение ставки
+    # ============================================================
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
         idem_key = str(_uuid.uuid4())

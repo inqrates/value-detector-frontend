@@ -14,6 +14,11 @@ Betcity handler — instance-based.
     Матчевые рынки в `main`, туда не попадают.
   - `_parse_phase_markets` — только `rows` с `num_per` (номер сета).
     Матчевые тоталы без num_per отсеиваются.
+
+РЫНКИ В mid=35 (Исходы по партиям):
+  - block W:   победитель партии (P1, P2)
+  - block T1..T5: тоталы партии (5 линий: Tm=меньше, Tot=линия, Tb=больше)
+  - block TEO: чёт/нечёт партии (E=Even=Чёт, O=Odd=Нечёт)
 """
 import json
 import logging
@@ -216,7 +221,7 @@ class BetcityHandler(BookmakerHandler):
         if not set_markets:
             return None
 
-                # phase_num = номер текущей партии/четверти.
+        # phase_num = номер текущей партии/четверти.
         # Приоритет — длина sc_inter (сыгранные партии).
         # Fallback — арифметика score для НТ/волейбола.
         phase_num = 0
@@ -225,8 +230,6 @@ class BetcityHandler(BookmakerHandler):
         elif sport_key == "volleyball":
             phase_num = score1 + score2 + 1
         elif sport_key == "basketball":
-            # В баскете sc_inter = "22:20,25:23,..." — количество партий
-            # до запятой = сыгранные четверти. Текущая = сыгранные + 1.
             phase_num = (len(sc_inter.split(',')) if sc_inter else 0) or 1
         else:
             phase_num = max(1, len(sc_inter.split(',')) if sc_inter else 1)
@@ -236,7 +239,7 @@ class BetcityHandler(BookmakerHandler):
             "player1": player1,
             "player2": player2,
             "sport": sport_key,
-            "phase_num": phase_num,    # ← добавили
+            "phase_num": phase_num,
             "score1": score1,
             "score2": score2,
             "sub_score1": sub1,
@@ -246,7 +249,7 @@ class BetcityHandler(BookmakerHandler):
         }
 
     # ============================================================
-    # НТ-маркеты
+    # НТ-маркеты (mid=35, mid=905, mid=913)
     # ============================================================
     @staticmethod
     def _parse_nt_markets(match_id: str, ev_data: dict,
@@ -271,7 +274,10 @@ class BetcityHandler(BookmakerHandler):
                 for block_key, block in data_block.items():
                     blocks = block.get('blocks') or {}
 
+                    # ── mid=35: Исходы по партиям ──
+                    # Содержит W (winner), T1..T5 (тоталы), TEO (чёт/нечёт)
                     if market_id == _NT_WINNER:
+                        # ── W: победитель партии ──
                         w = blocks.get('W') or {}
                         for side, key in (('1', 'P1'), ('2', 'P2')):
                             if key in w:
@@ -286,6 +292,64 @@ class BetcityHandler(BookmakerHandler):
                                             'id': match_id, 'pos': ps, 'kf': odd,
                                         }
 
+                        # ── T1: тотал партии (первая линия) ──
+                        t1 = blocks.get('T1') or {}
+                        if t1:
+                            try:
+                                line = float(t1.get('Tot', 0) or 0)
+                            except (ValueError, TypeError):
+                                line = 0.0
+                            tm_info = t1.get('Tm') or {}
+                            tb_info = t1.get('Tb') or {}
+                            odd_under = float(tm_info.get('kf', 0) or 0)
+                            odd_over  = float(tb_info.get('kf', 0) or 0)
+                            if line > 0 and (odd_over > 0 or odd_under > 0):
+                                t = set_markets.setdefault(set_key, {}) \
+                                    .setdefault('total', {})
+                                t['line']  = line
+                                t['over']  = odd_over
+                                t['under'] = odd_under
+                                o = outcome_ids.setdefault(set_key, {}) \
+                                    .setdefault('total', {})
+                                o['over'] = {
+                                    'id': match_id,
+                                    'pos': tb_info.get('ps'),
+                                    'kf': odd_over,
+                                    'lv': tb_info.get('lv', line),
+                                }
+                                o['under'] = {
+                                    'id': match_id,
+                                    'pos': tm_info.get('ps'),
+                                    'kf': odd_under,
+                                    'lv': tm_info.get('lv', line),
+                                }
+
+                        # ── TEO: чёт/нечёт партии (E=Even=Чёт, O=Odd=Нечёт) ──
+                        teo = blocks.get('TEO') or {}
+                        if teo:
+                            e_info = teo.get('E') or {}
+                            o_info = teo.get('O') or {}
+                            odd_even = float(e_info.get('kf', 0) or 0)
+                            odd_odd  = float(o_info.get('kf', 0) or 0)
+                            if odd_even > 0 and odd_odd > 0:
+                                om = set_markets.setdefault(set_key, {}) \
+                                    .setdefault('odd', {})
+                                om['even'] = odd_even
+                                om['odd']  = odd_odd
+                                oi = outcome_ids.setdefault(set_key, {}) \
+                                    .setdefault('odd', {})
+                                oi['even'] = {
+                                    'id': match_id,
+                                    'pos': e_info.get('ps'),
+                                    'kf': odd_even,
+                                }
+                                oi['odd'] = {
+                                    'id': match_id,
+                                    'pos': o_info.get('ps'),
+                                    'kf': odd_odd,
+                                }
+
+                    # ── mid=905: форы партии (4 линии) ──
                     elif market_id == _NT_HANDICAP:
                         for f_key, f_block in blocks.items():
                             if not f_key.startswith('F'):
@@ -313,6 +377,7 @@ class BetcityHandler(BookmakerHandler):
                                             'kf': odd, 'lv': lv,
                                         }
 
+                    # ── mid=913: ИТ партии (IT1, IT2 для игроков 1/2) ──
                     elif market_id == _NT_IT:
                         for it_key, it_block in blocks.items():
                             if 'Tm' not in it_block or 'Tb' not in it_block:
@@ -340,7 +405,7 @@ class BetcityHandler(BookmakerHandler):
                                     }
 
     # ============================================================
-    # Волейбол / баскетбол / кибер
+    # Волейбол / баскетбол / кибер (ext rows с num_per)
     # ============================================================
     @staticmethod
     def _parse_phase_markets(match_id: str, ev_data: dict,

@@ -94,6 +94,12 @@ class FonbetHandler(BookmakerHandler):
     # ============================================================
     @staticmethod
     def _resolve_active_phase(data: dict, root_id: str):
+        """
+        Приоритет 1: liveEventInfos.subscores с ненулевым счётом
+        Приоритет 2 (fallback): ПЕРВАЯ партия среди children.
+            Когда liveEventInfos ещё пуст (SPA не разослала subscores
+            для только что стартовавших матчей) — активна первая партия.
+        """
         for info in data.get('liveEventInfos', []) or []:
             if str(info.get('eventId')) != str(root_id):
                 continue
@@ -111,16 +117,18 @@ class FonbetHandler(BookmakerHandler):
                     if str(ev.get('parentId')) == str(root_id)]
         if children:
             children.sort(key=lambda e: e.get('sortOrder', ''))
-            last = children[-1]
-            name = last.get('name', '')
+            # ── Fallback: ПЕРВАЯ партия (а не последняя) ──
+            first = children[0]
+            name = first.get('name', '')
             m = re.search(r'(\d+)', name)
             if m:
-                return int(m.group(1)), str(last.get('id')), name
+                return int(m.group(1)), str(first.get('id')), name
         return 0, None, ''
 
     @staticmethod
     def _parse_phase_factors(factors: list, set_key: str,
                              set_markets: dict, outcome_ids: dict):
+        # ── WINNER ──
         p1 = next((f for f in factors if f.get('f') == 921), None)
         p2 = next((f for f in factors if f.get('f') == 923), None)
         if p1 or p2:
@@ -133,6 +141,7 @@ class FonbetHandler(BookmakerHandler):
                 w['2'] = p2.get('v')
                 o['2'] = {'id': 923, 'kf': p2.get('v')}
 
+        # ── HANDICAP ──
         h1 = next((f for f in factors if f.get('f') == 910), None)
         h2 = next((f for f in factors if f.get('f') == 912), None)
         if not h1:
@@ -158,9 +167,12 @@ class FonbetHandler(BookmakerHandler):
                 o['2']['kf'] = h2.get('v')
                 o['2']['line'] = line2
 
+        # ── TOTAL партии ──
+        # ВАЖНО: 974/976 и 978/980 — это ИТ игроков, а НЕ тотал партии.
+        # Их из этого списка убрали, парсим отдельно ниже.
         total_codes = [
             (1696, 1697), (1848, 1849), (3024, 3025), (3030, 3031),
-            (930, 931), (974, 976), (978, 980),
+            (930, 931), (1727, 1728), (1730, 1731), (1733, 1734),
         ]
         for over_code, under_code in total_codes:
             to = next((f for f in factors if f.get('f') == over_code), None)
@@ -176,6 +188,64 @@ class FonbetHandler(BookmakerHandler):
                     o['over'] = {'id': over_code, 'kf': to.get('v'), 'line': line}
                     o['under'] = {'id': under_code, 'kf': tu.get('v'), 'line': line}
                 break
+
+        # ── Чёт/Нечёт партии (698=Чёт, 699=Нечёт) ──
+        odd_yes = next((f for f in factors if f.get('f') == 698), None)
+        odd_no  = next((f for f in factors if f.get('f') == 699), None)
+        if odd_yes and odd_no:
+            om = set_markets.setdefault(set_key, {}).setdefault('odd', {})
+            om['even'] = odd_yes.get('v')
+            om['odd']  = odd_no.get('v')
+            o = outcome_ids.setdefault(set_key, {}).setdefault('odd', {})
+            o['even'] = {'id': 698, 'kf': odd_yes.get('v')}
+            o['odd']  = {'id': 699, 'kf': odd_no.get('v')}
+
+        # ── Индивидуальные тоталы игроков ──
+        # f=974/976 = ИТ1 Больше/Меньше
+        # f=978/980 = ИТ2 Больше/Меньше
+        it1_over  = next((f for f in factors if f.get('f') == 974), None)
+        it1_under = next((f for f in factors if f.get('f') == 976), None)
+        it2_over  = next((f for f in factors if f.get('f') == 978), None)
+        it2_under = next((f for f in factors if f.get('f') == 980), None)
+
+        for player, f_over, f_under in (
+            ('1', it1_over,  it1_under),
+            ('2', it2_over,  it2_under),
+        ):
+            if not (f_over and f_under):
+                continue
+            try:
+                line = float(str(f_over.get('pt') or 0))
+            except (ValueError, TypeError):
+                continue
+            if line <= 0:
+                continue
+            it = set_markets.setdefault(set_key, {}).setdefault('it', {}).setdefault(player, {})
+            it['line']  = line
+            it['over']  = f_over.get('v')
+            it['under'] = f_under.get('v')
+            o = outcome_ids.setdefault(set_key, {}).setdefault('it', {}).setdefault(player, {})
+            o['over'] = {
+                'id': 974 if player == '1' else 978,
+                'kf': f_over.get('v'),
+                'line': line,
+            }
+            o['under'] = {
+                'id': 976 if player == '1' else 980,
+                'kf': f_under.get('v'),
+                'line': line,
+            }
+
+        # ── Следующее очко (f=2393=П1, f=2394=П2) ──
+        pt1 = next((f for f in factors if f.get('f') == 2393), None)
+        pt2 = next((f for f in factors if f.get('f') == 2394), None)
+        if pt1 and pt2:
+            pm = set_markets.setdefault(set_key, {}).setdefault('point', {})
+            pm['1'] = pt1.get('v')
+            pm['2'] = pt2.get('v')
+            o = outcome_ids.setdefault(set_key, {}).setdefault('point', {})
+            o['1'] = {'id': 2393, 'kf': pt1.get('v')}
+            o['2'] = {'id': 2394, 'kf': pt2.get('v')}
 
     @staticmethod
     def _extract_line(factor: dict) -> float:

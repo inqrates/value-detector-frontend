@@ -14,7 +14,15 @@ X-GUID = cookie visitor_id.
 ВАЖНО ПРО ПАРСИНГ:
   Olimp для НТ/волейбола/баскета отдаёт:
     - матчевые рынки: tableType=RESULT/HANDICAP/TOTAL (П1/П2, Фора 1/2, ТотБ/ТотМ)
-    - фазовые рынки:  tableType=OTHER (Ч4П1, П2Ф1К, Ч4ТотЧ4ТотМ)
+    - фазовые рынки:  tableType=OTHER
+      Форматы shortName для НТ (проверено по дампу 2026-09-30):
+        С5П1, С5П2                 — winner партии (С = сет)
+        С5Ф1К, С5Ф2К               — фора партии
+        С5ТотС5ТотМ, С5ТотС5ТотБ   — тотал партии
+        5СТотЧет, 5СТотНечет       — чёт/нечёт партии
+        С5ТотК1С5ТотК1М/Б          — ИТ1 партии
+        С5ТотК2С5ТотК2М/Б          — ИТ2 партии
+      Также бывают варианты с префиксом Ч (четверть) для баскета.
   В set_markets кладём ТОЛЬКО фазовые (OTHER). Матчевые пропускаем целиком —
   иначе ловим матчевый тотал (84.5) как тотал партии и проигрываем.
 
@@ -23,7 +31,7 @@ X-GUID = cookie visitor_id.
   Все вкладки одного AdsPower-профиля работают в одной сессии → одна корзина.
   Если clear не сделать ПЕРЕД add — остатки от предыдущего неудачного
   захода превратят одиночную ставку в экспресс с чужими исходами.
-  
+
   Поэтому place_bet делает СИНХРОННЫЙ clear перед add:
     - clear не удался (2 попытки) → ставку НЕ отправляем
     - clear ок → add → save (можно ретраить из _execute_bet,
@@ -51,6 +59,12 @@ _SPORT_ID_TO_KEY = {
 # ── Секрет из бандла Olimp (обфусцирован ASCII-2) ──
 _SECRET_RAW = ";4f;94;3/44:g/63:f/;c47/c639hchc82g;"
 _SECRET_CUPIS = "".join(chr(ord(c) - 2) for c in _SECRET_RAW)
+
+# Регулярка префикса фазы в shortName: С / Ч / П / C / Q / P
+#   С5П1    — С (сет) + 5 (номер) + П1
+#   Ч4П1    — Ч (четверть) + 4 + П1
+#   П2П1    — вариант
+_P = r'[СЧПCQPсчпcqp]'
 
 
 def _fmt_num(v) -> str:
@@ -286,8 +300,8 @@ class OlimpHandler(BookmakerHandler):
                 continue
             out_id = out.get('originalId') or out.get('id')
 
-            # ── Победа в сете: Ч4П1 / П2П1 ──
-            m = re.match(r'^[ЧП](\d+)П([12])$', short_name)
+            # ── Победа в сете: С5П1 / Ч4П1 / П2П1 ──
+            m = re.match(rf'^{_P}(\d+)П([12])$', short_name)
             if m:
                 n = int(m.group(1))
                 if n != phase_num:
@@ -299,8 +313,8 @@ class OlimpHandler(BookmakerHandler):
                 }
                 continue
 
-            # ── Фора в сете: Ч4Ф1К / П2Ф1К ──
-            m = re.match(r'^[ЧП](\d+)Ф([12])К$', short_name)
+            # ── Фора в сете: С5Ф1К / Ч4Ф1К ──
+            m = re.match(rf'^{_P}(\d+)Ф([12])К$', short_name)
             if m:
                 n = int(m.group(1))
                 if n != phase_num:
@@ -317,8 +331,8 @@ class OlimpHandler(BookmakerHandler):
                     }
                 continue
 
-            # ── Тотал сета: Ч4ТотЧ4ТотМ / П2ТотП2ТотМ ──
-            m = re.match(r'^[ЧП](\d+)Тот[ЧП]\d+Тот([МБ])$', short_name)
+            # ── Тотал сета: С5ТотС5ТотМ / Ч4ТотЧ4ТотМ ──
+            m = re.match(rf'^{_P}(\d+)Тот{_P}\d+Тот([МБ])$', short_name)
             if m:
                 n = int(m.group(1))
                 if n != phase_num:
@@ -329,12 +343,39 @@ class OlimpHandler(BookmakerHandler):
                     t['line'] = param
                 t[side] = prob
                 outcome_ids.setdefault(set_key, {}).setdefault('total', {})[side] = {
-                    'market_data': basket_id, 'kf': prob, 'line': param, 'id': out_id,
+                    'market_data': basket_id, 'kf': prob,
+                    'line': param, 'id': out_id,
                 }
                 continue
 
-            # ── ИТ игрока в сете: Ч4ИТ1Б / П2ИТ1М / Ч4ИТ2Б / П2ИТ2М ──
-            m = re.match(r'^[ЧП](\d+)ИТ([12])([БМ])$', short_name)
+            # ── Чёт сета: 5СТотЧет ──
+            m = re.match(rf'^(?:{_P})?(\d+)(?:{_P})?ТотЧет$', short_name)
+            if m:
+                n = int(m.group(1))
+                if n != phase_num:
+                    continue
+                o = set_markets.setdefault(set_key, {}).setdefault('odd', {})
+                o['even'] = prob
+                outcome_ids.setdefault(set_key, {}).setdefault('odd', {})['even'] = {
+                    'market_data': basket_id, 'kf': prob, 'id': out_id,
+                }
+                continue
+
+            # ── Нечёт сета: 5СТотНечет ──
+            m = re.match(rf'^(?:{_P})?(\d+)(?:{_P})?ТотНечет$', short_name)
+            if m:
+                n = int(m.group(1))
+                if n != phase_num:
+                    continue
+                o = set_markets.setdefault(set_key, {}).setdefault('odd', {})
+                o['odd'] = prob
+                outcome_ids.setdefault(set_key, {}).setdefault('odd', {})['odd'] = {
+                    'market_data': basket_id, 'kf': prob, 'id': out_id,
+                }
+                continue
+
+            # ── ИТ игрока в сете (старый формат): Ч4ИТ1Б / Ч4ИТ2М ──
+            m = re.match(rf'^{_P}(\d+)ИТ([12])([БМ])$', short_name)
             if m:
                 n = int(m.group(1))
                 if n != phase_num:
@@ -349,7 +390,32 @@ class OlimpHandler(BookmakerHandler):
                 outcome_ids.setdefault(set_key, {}).setdefault('it', {}) \
                     .setdefault(player, {}).setdefault(side, {})
                 outcome_ids[set_key]['it'][player][side] = {
-                    'market_data': basket_id, 'kf': prob, 'line': param, 'id': out_id,
+                    'market_data': basket_id, 'kf': prob,
+                    'line': param, 'id': out_id,
+                }
+                continue
+
+            # ── ИТ игрока в сете (новый формат): С5ТотК1С5ТотК1М ──
+            m = re.match(
+                rf'^{_P}(\d+)ТотК([12]){_P}\d+ТотК\2([МБ])$',
+                short_name,
+            )
+            if m:
+                n = int(m.group(1))
+                if n != phase_num:
+                    continue
+                player = m.group(2)
+                side = 'over' if m.group(3) == 'Б' else 'under'
+                it = set_markets.setdefault(set_key, {}).setdefault('it', {}) \
+                    .setdefault(player, {})
+                if 'line' not in it:
+                    it['line'] = param
+                it[side] = prob
+                outcome_ids.setdefault(set_key, {}).setdefault('it', {}) \
+                    .setdefault(player, {}).setdefault(side, {})
+                outcome_ids[set_key]['it'][player][side] = {
+                    'market_data': basket_id, 'kf': prob,
+                    'line': param, 'id': out_id,
                 }
                 continue
 
@@ -510,8 +576,6 @@ class OlimpHandler(BookmakerHandler):
             return {"success": False, "error": "Olimp: no user_session"}
 
         # ── СИНХРОННЫЙ CLEAR ПЕРЕД ADD ──
-        # Не убирать и не делать асинхронным. Гарантия чистоты корзины —
-        # единственная защита от превращения ставки в экспресс.
         cleared = await self._clear_basket(page, ukey, x_guid)
         if not cleared:
             return {

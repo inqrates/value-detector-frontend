@@ -6,6 +6,13 @@ Winline handler — instance-based через route_web_socket.
   - Каждый матч = свой экземпляр WinlineHandler со своим WS-route
   - Линии и events кэшируются в self._lines / self._live_events
   - place_bet идёт через перехваченный WS (server.send)
+
+Рынки (mid'ы проверены по дампу 2026-09-30 на НТ):
+  - mid=931, type=151, coeff='N'   — WINNER сета N
+  - mid=932, type=61,  coeff='N/H' — HANDICAP сета N, линия H
+  - mid=933, type=71,  coeff='N/H' — TOTAL сета N, линия H
+  - mid=934, type=16,  coeff='N'   — Чёт/Нечёт сета N (values=[Нечёт, Чёт])
+  - mid=952, type=16,  coeff='N/M' — N-е очко сета M (values=[П1, П2])
 """
 import asyncio
 import base64
@@ -32,8 +39,21 @@ MARKET_TYPE_TOTAL    = 71
 MARKET_TYPE_HANDICAP = 61
 MARKET_TYPE_WINNER_2WAY = 151
 
+# ── Хардкод mid'ов Winline для НТ (по дампу 2026-09-30) ──
+MID_ODD_NT   = 934   # type=16, name='Нечет', coeff=N (сет)
+MID_POINT_NT = 952   # type=16, name='1',     coeff=N/M (сет/очко)
+
 
 def _parse_coefficient(coeff: str) -> Tuple[Optional[int], Optional[float]]:
+    """
+    coeff бывает нескольких форм:
+      '1'        → (1, None)              [фаза=1]
+      '1/-2.5'   → (1, -2.5)              [фаза=1, линия=-2.5]
+      '1/1'      → (1, 1.0)               [фаза=1, значение=1]
+      ''         → (None, None)           [без фазы]
+      '0.5'      → (None, 0.5)? — сейчас интерпретируется как фаза=0.5
+                    (см. проверку значения ниже)
+    """
     if not coeff:
         return None, None
     if '/' in coeff:
@@ -324,7 +344,7 @@ class WinlineHandler(BookmakerHandler):
                 continue
             if market_id not in menu:
                 continue
-            mtype, _ = menu[market_id]
+            mtype, mname = menu[market_id]
 
             phase, line_val = _parse_coefficient(coeff)
             if phase is None:
@@ -359,17 +379,40 @@ class WinlineHandler(BookmakerHandler):
                     t["over"] = values[0]
                     t["under"] = values[1]
                     o = outcome_ids.setdefault(set_key, {}).setdefault("total", {})
-                    o["over"] = {"id": line_id, "kf": values[0], "line": line_val}
+                    o["over"]  = {"id": line_id, "kf": values[0], "line": line_val}
                     o["under"] = {"id": line_id, "kf": values[1], "line": line_val}
 
             elif mtype == MARKET_TYPE_HANDICAP and len(values) >= 2 and line_val is not None:
                 h = set_markets.setdefault(set_key, {}).setdefault("handicap", {})
                 if "1" not in h:
-                    h["1"] = {"line": line_val, "odd": values[0]}
+                    h["1"] = {"line": line_val,  "odd": values[0]}
                     h["2"] = {"line": -line_val, "odd": values[1]}
                     o = outcome_ids.setdefault(set_key, {}).setdefault("handicap", {})
                     o["1"] = {"id": line_id, "kf": values[0], "line": line_val}
                     o["2"] = {"id": line_id, "kf": values[1], "line": -line_val}
+
+            # ── Чёт/Нечёт сета (mid=934) ──
+            # coeff='N' (одно число) = номер сета
+            # values=[Нечёт, Чёт]  (проверено по DOM: Нечёт=2.50, Чёт=1.42)
+            elif market_id == MID_ODD_NT and len(values) >= 2:
+                om = set_markets.setdefault(set_key, {}).setdefault("odd", {})
+                om["odd"]  = values[0]
+                om["even"] = values[1]
+                oi = outcome_ids.setdefault(set_key, {}).setdefault("odd", {})
+                oi["odd"]  = {"id": line_id, "kf": values[0]}
+                oi["even"] = {"id": line_id, "kf": values[1]}
+
+            # ── N-е очко сета (mid=952) ──
+            # coeff='N/M' (сет/номер очка) — _parse_coefficient вернёт (N, M)
+            # values=[П1, П2]
+            elif market_id == MID_POINT_NT and len(values) >= 2:
+                pm = set_markets.setdefault(set_key, {}).setdefault("point", {})
+                pm["1"] = values[0]
+                pm["2"] = values[1]
+                pm["line"] = int(line_val) if line_val is not None else 0
+                oi = outcome_ids.setdefault(set_key, {}).setdefault("point", {})
+                oi["1"] = {"id": line_id, "kf": values[0], "line": pm["line"]}
+                oi["2"] = {"id": line_id, "kf": values[1], "line": pm["line"]}
 
         return set_markets, outcome_ids
 
@@ -385,7 +428,8 @@ class WinlineHandler(BookmakerHandler):
         amount = float(bet_data.get("amount") or 0)
 
         if kf <= 1.01 or amount <= 0:
-            return {"success": False, "error": f"Winline: невалидные kf={kf} amount={amount}"}
+            return {"success": False,
+                    "error": f"Winline: невалидные kf={kf} amount={amount}"}
 
         packet = _build_bet_packet(id_line, kf, amount)
         self._bet_ack = None
