@@ -1,18 +1,30 @@
 # ui/after_goal/marathon.py
 """
 Marathon handler — instance-based.
+Транспорт: SSE через EventSource (JS-хук цепляется ДО page.goto).
 
-Использует SSE через page.expose_function + add_init_script:
-  - prepare_page() вызывается ДО page.goto — вешает JS-хук на EventSource
-  - setup_listener() регистрирует callback и парсит кадры
-  - _handle_sse_from_browser вызывается из JS-контекста при каждом SSE-кадре
+Рынки по model суффиксу (проверено по дампу 2026-10-04 на НТ):
+  MTCH_R{N}      → winner (победитель N-й партии)
+  MTCH_HB{N}     → handicap (фора по очкам, N-я партия)
+  MTCH_TTLG{N}   → total (тотал очков N-й партии)
+  MTCH_T1TTLG{N} → it.1 (ИТ игрока 1, N-я партия)
+  MTCH_T2TTLG{N} → it.2 (ИТ игрока 2, N-я партия)
+  MTCH_TTLGOE{N} → odd (чёт/нечёт тотала N-й партии)
+
+Матчевые модели (MTCH_R, MTCH_HB, MTCH_HBP, MTCH_TTLP, MTCH_TTLPOE,
+MTCH_CS) игнорируются.
+
+У Marathon в лайв-ленте НТ НЕТ рынка «N-е очко» и НЕТ RACE.
+Ветка MTCH_POINT/NP оставлена на случай, если когда-нибудь появится.
 """
 import asyncio
 import json
 import logging
 import re
-from typing import Optional, List, Callable
+from typing import Optional, Dict, List, Callable
+
 from playwright.async_api import Page, Response
+
 from .base import BookmakerHandler
 
 logger = logging.getLogger(__name__)
@@ -54,17 +66,23 @@ MARATHON_SSE_HOOK = r"""
 
 
 class MarathonHandler(BookmakerHandler):
+
     def __init__(self, target_match_id: str = None,
                  target_teams: List[str] = None):
         self.target_match_id = str(target_match_id) if target_match_id else None
         self.target_teams = list(target_teams or [])
         self._page: Optional[Page] = None
         self._callback: Optional[Callable] = None
+        self._warned_missing = set()      # рынки, о которых уже предупредили
+        self._warned_phase = None         # для какой фазы актуальны предупреждения
+        self._snapshot: Optional[dict] = None  # кэш последнего полного снапшота
 
+    # ============================================================
+    # prepare_page
+    # ============================================================
     async def prepare_page(self, page: Page):
         """Регистрирует Python-bridge и вешает JS-хук. Вызывать ДО page.goto()."""
         try:
-            # Привязываем bound-метод экземпляра, чтобы callback был свой
             await page.expose_function(
                 "__marathon_on_sse",
                 self._handle_sse_from_browser,
@@ -78,6 +96,9 @@ class MarathonHandler(BookmakerHandler):
         except Exception as e:
             logger.error(f"Marathon prepare_page: {e}")
 
+    # ============================================================
+    # setup / stop
+    # ============================================================
     async def setup_listener(self, page: Page, callback,
                              match_id=None, match_teams=None):
         if match_id:
@@ -87,8 +108,11 @@ class MarathonHandler(BookmakerHandler):
 
         self._page = page
         self._callback = callback
+        self._warned_missing = set()
+        self._warned_phase = None
+        self._snapshot = None
 
-        # ── Listener для баланса ──
+        # ── Баланс ──
         async def on_resp_balance(response: Response):
             url = response.url
             if '/client-gate/heartbeat' not in url:
@@ -107,30 +131,37 @@ class MarathonHandler(BookmakerHandler):
                 pass
 
         page.on("response", lambda r: asyncio.create_task(on_resp_balance(r)))
-
         logger.info(f"Marathon: listener готов (target={self.target_match_id})")
 
     async def stop_listener(self, page: Page):
         self._callback = None
+        self._warned_missing = set()
+        self._warned_phase = None
+        self._snapshot = None
         logger.info(f"Marathon: listener снят (target={self.target_match_id})")
 
+    # ============================================================
+    # SSE: разбор кадров
+    # ============================================================
     async def _handle_sse_from_browser(self, event_type: str, raw: str):
-        """Вызывается из браузера при каждом SSE-кадре."""
         try:
             if not raw or not raw.startswith(("{", "[")):
                 return
             data = json.loads(raw)
 
-            # Вариант А: snapshot одного события
+            # ── A: полный снапшот одного события ──
             if isinstance(data, dict) and "treeId" in data and "markets" in data:
-                if self.target_match_id and str(data.get("treeId")) != self.target_match_id:
+                if (self.target_match_id
+                        and str(data.get("treeId")) != self.target_match_id):
                     return
+                self._snapshot = data
                 parsed = self.parse_update(data)
                 if parsed and self._callback:
+                    self._check_missing_markets(parsed)
                     await self._callback(parsed)
                 return
 
-            # Вариант Б: snapshot общего фида (itemMap)
+            # ── Б: снапшот общего фида (itemMap) ──
             if isinstance(data, dict) and "itemMap" in data:
                 for _, t in (data.get("itemMap") or {}).items():
                     for event in (t.get("liveEvents") or []):
@@ -139,32 +170,98 @@ class MarathonHandler(BookmakerHandler):
                         if (self.target_match_id
                                 and str(event.get("treeId")) != self.target_match_id):
                             continue
+                        self._snapshot = event
                         parsed = self.parse_update(event)
                         if parsed and self._callback:
+                            self._check_missing_markets(parsed)
                             await self._callback(parsed)
                 return
 
-            # Вариант В: update — список изменений
+            # ── В: список изменений ──
+            # Тут приходят как полные снапшоты, так и diff-кадры
+            # вида [{"path":[{"inObj":"matchScore"}],"value":{...}}].
             if isinstance(data, list):
+                score_changed = False
                 for change in data:
                     if not isinstance(change, dict):
                         continue
+
+                    path = change.get("path") or []
                     value = change.get("value")
-                    if not isinstance(value, dict):
-                        continue
-                    if "treeId" in value and "markets" in value:
+
+                    # В.1 — полный снапшот внутри списка
+                    if (isinstance(value, dict)
+                            and "treeId" in value and "markets" in value):
                         if (self.target_match_id
                                 and str(value.get("treeId")) != self.target_match_id):
                             continue
+                        self._snapshot = value
                         parsed = self.parse_update(value)
                         if parsed and self._callback:
+                            self._check_missing_markets(parsed)
                             await self._callback(parsed)
+                        continue
+
+                    # В.2 — diff только по счёту:
+                    # обновляем matchScore в кэше, полный снапшот рынков
+                    # переиспользуем (линии не менялись)
+                    if (isinstance(path, list) and path
+                            and isinstance(path[0], dict)
+                            and path[0].get("inObj") == "matchScore"
+                            and isinstance(value, dict)
+                            and self._snapshot is not None):
+                        self._snapshot["matchScore"] = value
+                        score_changed = True
+
+                # После сбора всех диффов — один колбэк со свежим счётом
+                if score_changed and self._snapshot is not None:
+                    parsed = self.parse_update(self._snapshot)
+                    if parsed and self._callback:
+                        await self._callback(parsed)
                 return
+
         except json.JSONDecodeError:
             return
         except Exception as e:
             logger.debug(f"Marathon SSE hook: {e}")
 
+    # ============================================================
+    # Диагностика отсутствующих рынков
+    # ============================================================
+    def _check_missing_markets(self, parsed: dict):
+        """
+        Логирует отсутствие ожидаемых рынков в текущей фазе.
+        Предупреждения сбрасываются при смене фазы.
+        """
+        sm = parsed.get("set_markets") or {}
+        phase = parsed.get("phase_num")
+        set_key = f"set_{phase}" if phase else None
+        if not set_key:
+            return
+
+        # Сброс при смене фазы
+        if phase != self._warned_phase:
+            self._warned_missing = set()
+            self._warned_phase = phase
+
+        markets = sm.get(set_key, {})
+
+        expected = ["winner", "total", "handicap", "odd", "it", "point"]
+        missing = [k for k in expected if k not in markets]
+
+        if missing:
+            new_missing = set(missing) - self._warned_missing
+            if new_missing:
+                logger.warning(
+                    f"Marathon: отсутствуют рынки для фазы {phase}: "
+                    f"{', '.join(sorted(new_missing))}. "
+                    f"У Marathon может не быть этих рынков в стриме."
+                )
+                self._warned_missing.update(new_missing)
+
+    # ============================================================
+    # Парсер снапшота
+    # ============================================================
     @staticmethod
     def parse_update(data: dict) -> Optional[dict]:
         try:
@@ -173,8 +270,8 @@ class MarathonHandler(BookmakerHandler):
             if not tree_id or not event_id:
                 return None
 
-            player1 = ""
-            player2 = ""
+            # ── Игроки ──
+            player1, player2 = "", ""
             try:
                 ht = data.get("homeTeam", {}).get("members", [])
                 at = data.get("awayTeam", {}).get("members", [])
@@ -184,6 +281,7 @@ class MarathonHandler(BookmakerHandler):
                     player2 = at[0].get("name", "")
             except Exception:
                 pass
+
             if not player1:
                 nm = data.get("name", "")
                 if " - " in nm:
@@ -191,6 +289,7 @@ class MarathonHandler(BookmakerHandler):
                     player1 = player1.strip()
                     player2 = player2.strip()
 
+            # ── Счёт ──
             ms = data.get("matchScore", {}) or {}
             main = ms.get("main", {}) or {}
             try:
@@ -201,9 +300,9 @@ class MarathonHandler(BookmakerHandler):
 
             phase = data.get("phase", {}) or {}
             set_num = int(phase.get("partNumber") or 1)
-
             parts = ms.get("parts", []) or []
-            sub1 = sub2 = 0
+
+            sub1, sub2 = 0, 0
             if parts and len(parts) >= set_num:
                 p = parts[set_num - 1] or {}
                 try:
@@ -212,12 +311,13 @@ class MarathonHandler(BookmakerHandler):
                 except Exception:
                     pass
 
+            # ── Рынки ──
             markets = data.get("markets", {}) or {}
-            set_markets = {}
-            outcome_ids = {}
+            set_markets: Dict[str, dict] = {}
+            outcome_ids: Dict[str, dict] = {}
             num_re = re.compile(r"([+-]?\d+\.?\d*)")
 
-            for m_id, market in markets.items():
+            for form_id, market in markets.items():
                 if not isinstance(market, dict):
                     continue
                 if market.get("state") not in (None, "ACTIVE"):
@@ -228,21 +328,57 @@ class MarathonHandler(BookmakerHandler):
 
                 kind = None
                 m_set = None
+                player = None
 
+                # WINNER: MTCH_R{N}
                 mm = re.match(r"^MTCH_R(\d+)$", model)
                 if mm:
                     kind = "winner"
                     m_set = int(mm.group(1))
+
+                # TOTAL: MTCH_TTLG{N}
                 elif re.match(r"^MTCH_TTLG\d+$", model):
                     mm2 = re.search(r"MTCH_TTLG(\d+)", model)
                     if mm2:
                         kind = "total"
                         m_set = int(mm2.group(1))
+
+                # HANDICAP: MTCH_HB{N}
                 elif re.match(r"^MTCH_HB\d+$", model):
                     mm3 = re.search(r"MTCH_HB(\d+)", model)
                     if mm3:
                         kind = "handicap"
                         m_set = int(mm3.group(1))
+
+                # IT1: MTCH_T1TTLG{N}
+                elif re.match(r"^MTCH_T1TTLG\d+$", model):
+                    mm4 = re.search(r"MTCH_T1TTLG(\d+)", model)
+                    if mm4:
+                        kind = "it"
+                        player = "1"
+                        m_set = int(mm4.group(1))
+
+                # IT2: MTCH_T2TTLG{N}
+                elif re.match(r"^MTCH_T2TTLG\d+$", model):
+                    mm5 = re.search(r"MTCH_T2TTLG(\d+)", model)
+                    if mm5:
+                        kind = "it"
+                        player = "2"
+                        m_set = int(mm5.group(1))
+
+                # ODD/EVEN: MTCH_TTLGOE{N}
+                elif re.match(r"^MTCH_TTLGOE\d+$", model):
+                    mm6 = re.search(r"MTCH_TTLGOE(\d+)", model)
+                    if mm6:
+                        kind = "odd"
+                        m_set = int(mm6.group(1))
+
+                # POINT: MTCH_POINT{N} или MTCH_NP{N} — на НТ обычно нет
+                elif re.match(r"^MTCH_(POINT|NP)\d+$", model):
+                    mm7 = re.search(r"MTCH_(?:POINT|NP)(\d+)", model)
+                    if mm7:
+                        kind = "point"
+                        m_set = int(mm7.group(1))
 
                 if not kind or not m_set:
                     continue
@@ -252,6 +388,7 @@ class MarathonHandler(BookmakerHandler):
                 for sel_id, sel in selections.items():
                     if not isinstance(sel, dict):
                         continue
+
                     coeff = sel.get("coeff", {}) or {}
                     coeff_id = coeff.get("id")
                     price = coeff.get("price", {}) or {}
@@ -259,6 +396,7 @@ class MarathonHandler(BookmakerHandler):
                     d = price.get("d", 1)
                     if not coeff_id or not d:
                         continue
+
                     try:
                         odds = (float(n) + float(d)) / float(d)
                     except Exception:
@@ -273,6 +411,7 @@ class MarathonHandler(BookmakerHandler):
                         "odds":           odds,
                     }
 
+                    # ── WINNER ──
                     if kind == "winner":
                         side = None
                         if player1 and sel_name == player1:
@@ -285,9 +424,12 @@ class MarathonHandler(BookmakerHandler):
                             elif player2 and player2.lower() in sel_name.lower():
                                 side = "2"
                         if side:
-                            set_markets.setdefault(set_key, {}).setdefault("winner", {})[side] = odds
-                            outcome_ids.setdefault(set_key, {}).setdefault("winner", {})[side] = outcome
+                            set_markets.setdefault(set_key, {}) \
+                                .setdefault("winner", {})[side] = odds
+                            outcome_ids.setdefault(set_key, {}) \
+                                .setdefault("winner", {})[side] = outcome
 
+                    # ── TOTAL ──
                     elif kind == "total":
                         lower = sel_name.lower()
                         side = None
@@ -298,12 +440,17 @@ class MarathonHandler(BookmakerHandler):
                         if side:
                             mline = num_re.search(sel_name)
                             line = float(mline.group(1)) if mline else 0.0
-                            set_markets.setdefault(set_key, {}).setdefault("total", {})["line"] = line
-                            set_markets[set_key]["total"][side] = odds
-                            outcome_ids.setdefault(set_key, {}).setdefault("total", {})[side] = {
-                                **outcome, "line": line,
-                            }
+                            t = set_markets.setdefault(set_key, {}) \
+                                .setdefault("total", {})
+                            if "line" not in t:
+                                t["line"] = line
+                            t[side] = odds
+                            outcome_ids.setdefault(set_key, {}) \
+                                .setdefault("total", {})[side] = {
+                                    **outcome, "line": line,
+                                }
 
+                    # ── HANDICAP ──
                     elif kind == "handicap":
                         mline = num_re.search(sel_name)
                         if not mline:
@@ -318,22 +465,80 @@ class MarathonHandler(BookmakerHandler):
                         elif player2 and player2 in sel_name:
                             side = "2"
                         if side:
-                            set_markets.setdefault(set_key, {}).setdefault("handicap", {}).setdefault(side, {})
-                            set_markets[set_key]["handicap"][side]["line"] = line
-                            set_markets[set_key]["handicap"][side]["odd"] = odds
-                            outcome_ids.setdefault(set_key, {}).setdefault("handicap", {})[side] = {
-                                **outcome, "line": line,
-                            }
+                            hk = (set_markets.setdefault(set_key, {})
+                                  .setdefault("handicap", {})
+                                  .setdefault(side, {}))
+                            hk["line"] = line
+                            hk["odd"] = odds
+                            outcome_ids.setdefault(set_key, {}) \
+                                .setdefault("handicap", {})[side] = {
+                                    **outcome, "line": line,
+                                }
+
+                    # ── IT (индивидуальный тотал игрока) ──
+                    elif kind == "it" and player:
+                        lower = sel_name.lower()
+                        side = None
+                        if "больше" in lower:
+                            side = "over"
+                        elif "меньше" in lower:
+                            side = "under"
+                        if side:
+                            mline = num_re.search(sel_name)
+                            line = float(mline.group(1)) if mline else 0.0
+                            it = (set_markets.setdefault(set_key, {})
+                                  .setdefault("it", {})
+                                  .setdefault(player, {}))
+                            if "line" not in it:
+                                it["line"] = line
+                            it[side] = odds
+                            outcome_ids.setdefault(set_key, {}) \
+                                .setdefault("it", {}) \
+                                .setdefault(player, {})[side] = {
+                                    **outcome, "line": line,
+                                }
+
+                    # ── Чёт / Нечёт ──
+                    elif kind == "odd":
+                        lower = sel_name.lower()
+                        om = set_markets.setdefault(set_key, {}) \
+                            .setdefault("odd", {})
+                        oi = outcome_ids.setdefault(set_key, {}) \
+                            .setdefault("odd", {})
+                        # «нечет» проверяем РАНЬШЕ «чет» — иначе "нечет"
+                        # матчится и на "чет". Поддержка "ё" и без.
+                        if "нечет" in lower or "нечёт" in lower:
+                            om["odd"] = odds
+                            oi["odd"] = outcome
+                        elif "чет" in lower or "чёт" in lower:
+                            om["even"] = odds
+                            oi["even"] = outcome
+
+                    # ── POINT (следующее очко) — у НТ Marathon обычно нет ──
+                    elif kind == "point":
+                        side = None
+                        if player1 and player1 in sel_name:
+                            side = "1"
+                        elif player2 and player2 in sel_name:
+                            side = "2"
+                        if side:
+                            pm = set_markets.setdefault(set_key, {}) \
+                                .setdefault("point", {})
+                            pm[side] = odds
+                            outcome_ids.setdefault(set_key, {}) \
+                                .setdefault("point", {})[side] = outcome
 
             if not set_markets:
                 return None
 
             return {
-                "match_id":   tree_id,
+                "match_id":   str(tree_id),
                 "event_id":   event_id,
                 "player1":    player1,
                 "player2":    player2,
-                "phase_num":  set_num,     # ← добавили
+                "sport":      "any",
+                "phase_num":  set_num,
+                "phase_name": phase.get("partName", f"{set_num}-я партия"),
                 "score1":     score1,
                 "score2":     score2,
                 "sub_score1": sub1,
@@ -341,19 +546,28 @@ class MarathonHandler(BookmakerHandler):
                 "set_markets": set_markets,
                 "outcome_ids": outcome_ids,
             }
+
         except Exception as e:
             logger.error(f"Marathon parse_update: {e}", exc_info=True)
             return None
 
+    # ============================================================
+    # Размещение ставки
+    # ============================================================
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
-        """POST /client-gate/betting/place-bets + (если LIVE_DELAY) complete-bet-ticket."""
+        """
+        POST /client-gate/betting/place-bets
+        + при статусе LIVE_DELAY — /client-gate/betting/complete-bet-ticket
+        """
         script = f"""
         (async function() {{
             const d = {json.dumps(bet_data)};
 
             const getCookie = (n) => {{
-                const m = document.cookie.match(new RegExp('(^|; )' + n + '=([^;]*)'));
+                const m = document.cookie.match(
+                    new RegExp('(^|; )' + n + '=([^;]*)')
+                );
                 return m ? decodeURIComponent(m[2]) : '';
             }};
 
@@ -390,11 +604,20 @@ class MarathonHandler(BookmakerHandler):
             try {{
                 const placeResp = await fetch(
                     'https://new.marathonbet.ru/client-gate/betting/place-bets',
-                    {{ method: 'POST', headers, credentials: 'include', body: JSON.stringify(placeBody) }}
+                    {{
+                        method: 'POST',
+                        headers,
+                        credentials: 'include',
+                        body: JSON.stringify(placeBody)
+                    }}
                 );
                 const placeJson = await placeResp.json();
+
                 if (placeJson.status !== 'OK') {{
-                    return {{ success: false, error: 'place-bets: ' + JSON.stringify(placeJson).slice(0,400) }};
+                    return {{
+                        success: false,
+                        error: 'place-bets: ' + JSON.stringify(placeJson).slice(0, 400)
+                    }};
                 }}
 
                 const payload = placeJson.payload || {{}};
@@ -407,9 +630,12 @@ class MarathonHandler(BookmakerHandler):
                     if (results.length > 0) {{
                         const r = results[0];
                         if (r.status === 'OK' || r.status === 'ACCEPTED') {{
-                            return {{ success: true, betId: r.betId || r.ticketId || code || null }};
+                            return {{
+                                success: true,
+                                betId: r.betId || r.ticketId || code || null
+                            }};
                         }}
-                        return {{ success: false, error: JSON.stringify(r).slice(0,400) }};
+                        return {{ success: false, error: JSON.stringify(r).slice(0, 400) }};
                     }}
                     return {{ success: false, error: 'unknown status: ' + status }};
                 }}
@@ -422,7 +648,12 @@ class MarathonHandler(BookmakerHandler):
 
                 const confirmResp = await fetch(
                     'https://new.marathonbet.ru/client-gate/betting/complete-bet-ticket',
-                    {{ method: 'POST', headers, credentials: 'include', body: JSON.stringify({{ code }}) }}
+                    {{
+                        method: 'POST',
+                        headers,
+                        credentials: 'include',
+                        body: JSON.stringify({{ code }})
+                    }}
                 );
                 const confirmJson = await confirmResp.json();
                 const cPayload = confirmJson.payload || {{}};
@@ -433,12 +664,21 @@ class MarathonHandler(BookmakerHandler):
                     if (r.status === 'OK' || r.status === 'ACCEPTED') {{
                         return {{ success: true, betId: r.betId || r.ticketId || code }};
                     }}
-                    return {{ success: false, error: 'confirm: ' + JSON.stringify(r).slice(0,400) }};
+                    return {{
+                        success: false,
+                        error: 'confirm: ' + JSON.stringify(r).slice(0, 400)
+                    }};
                 }}
+
                 if (cPayload.status === 'OK' || cPayload.status === 'ACCEPTED') {{
                     return {{ success: true, betId: code }};
                 }}
-                return {{ success: false, error: 'confirm unknown: ' + JSON.stringify(confirmJson).slice(0,400) }};
+
+                return {{
+                    success: false,
+                    error: 'confirm unknown: ' + JSON.stringify(confirmJson).slice(0, 400)
+                }};
+
             }} catch(e) {{
                 return {{ success: false, error: e.message }};
             }}

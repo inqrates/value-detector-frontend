@@ -33,8 +33,128 @@ DEAD_FIELDS = (
 )
 
 
+# ── Capability: какие рынки реально даёт каждая БК в лайв-ленте ──
+# Используется ТОЛЬКО для предупреждений в UI, не блокирует сохранение.
+# Ключ — нормализованный bk (без пробелов, дефисов, нижний регистр).
+BK_MARKET_CAPABILITIES = {
+    "fonbet": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd", "point",
+    },
+    "pari": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd", "point",
+    },
+    "betcity": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd",
+    },
+    "olimp": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd",
+    },
+    "sportbet": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd", "point",
+    },
+    "ligastavok": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd", "race",
+    },
+    "marathon": {
+        # По дампу 2026-10-04: нет «N-го очка» и RACE.
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd",
+    },
+    "winline": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "odd", "point",
+    },
+    "zenit": {
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd", "point",
+    },
+    "leon": {
+        # Leon пока парсит только winner.
+        "winner_1", "winner_2",
+    },
+}
+
+
+# ── Рекомендуемые пороги по видам спорта ──
+RECOMMENDED_THRESHOLDS = {
+    "table_tennis":     {"winner": 2, "total": 1, "handicap": 3, "it": 2},
+    "volleyball":       {"winner": 3, "total": 2, "handicap": 4, "it": 2},
+    "basketball":       {"winner": 8, "total": 5, "handicap": 8, "it": 6},
+    "cyber_basketball": {"winner": 8, "total": 5, "handicap": 8, "it": 6},
+}
+
+
 def _normalize_bk(name: str) -> str:
     return (name or "").lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def bk_capabilities(bk: str) -> set:
+    """Возвращает множество доступных рынков для БК или пустое, если неизвестна."""
+    return BK_MARKET_CAPABILITIES.get(_normalize_bk(bk), set())
+
+
+def missing_markets_for_strategy(strategy: dict) -> list:
+    """
+    Рынки, выбранные в стратегии, но недоступные у её БК.
+
+    Возвращает список кодов (winner_1, total_over, it2_under, ...).
+    Пустой список = всё ок / нечего проверять.
+    Только для market_mode='manual'.
+    """
+    bk = _normalize_bk(strategy.get("bk"))
+    if not bk:
+        return []
+    caps = BK_MARKET_CAPABILITIES.get(bk)
+    if caps is None:
+        return []  # БК неизвестна — не пугаем пользователя
+    if (strategy.get("market_mode") or "auto") != "manual":
+        return []
+
+    selected = set(strategy.get("manual_markets") or [])
+    # 'race' — это префикс (race_winner_1), его нет в capability.
+    # Он регулируется отдельным флагом race_enabled.
+    selected.discard("race")
+    return sorted(selected - caps)
+
+
+def recommended_thresholds_for_sport(sport: str) -> dict:
+    """Рекомендуемые пороги для вида спорта (копия)."""
+    return dict(RECOMMENDED_THRESHOLDS.get(
+        (sport or "table_tennis").lower(),
+        RECOMMENDED_THRESHOLDS["table_tennis"],
+    ))
 
 
 def _default(name, stype, enabled, profile_id="", bk="", sport="table_tennis"):
@@ -62,9 +182,6 @@ def _default(name, stype, enabled, profile_id="", bk="", sport="table_tennis"):
         "manual_markets": list(ALL_MARKETS),
 
         # ── RACE (гонка внутри сета) ──
-        # Если True — движок рассмотрит также рынки гонки
-        # (Тотал в гонке до 5/7/10 очков, Фора в гонке и т.п.),
-        # которые приходят отдельным partId `SET_N-RACE`.
         "race_enabled": False,
 
         # ── Ставка ──
@@ -180,8 +297,6 @@ class StrategyStore:
             if 'headless' not in s:
                 s['headless'] = False
 
-            # ── RACE (гонка внутри сета) ──
-            # По умолчанию — выключено (обратная совместимость).
             if 'race_enabled' not in s:
                 s['race_enabled'] = False
             else:
@@ -208,12 +323,10 @@ class StrategyStore:
             )
             if not is_new_format:
                 s['manual_markets'] = _migrate_old_markets(s)
-                s['market_mode'] = 'manual'   # показываем их прежние настройки галочками
-                # criterion — дефолт
+                s['market_mode'] = 'manual'
                 old_dir = s.get('bet_direction', 'same_as_fast')
                 s['auto_criterion'] = 'max_odds' if old_dir == 'best_odds' else 'reliable'
             else:
-                # валидация
                 if s['market_mode'] not in VALID_MARKET_MODES:
                     s['market_mode'] = 'auto'
                 if s.get('auto_criterion') not in VALID_AUTO_CRITERIA:

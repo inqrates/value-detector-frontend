@@ -186,6 +186,21 @@ LIVE_URLS = {
 }
 
 
+# ── Маппинг код manual_markets → базовый рынок (для порогов) ──
+_MARKET_CODE_TO_BASE = {
+    "winner_1": "winner",
+    "winner_2": "winner",
+    "total_over": "total",
+    "total_under": "total",
+    "handicap_1": "handicap",
+    "handicap_2": "handicap",
+    "it1_over": "it",
+    "it1_under": "it",
+    "it2_over": "it",
+    "it2_under": "it",
+}
+
+
 class AfterGoalEngine:
     PROFILE_LAUNCH_COOLDOWN = 30.0
     PREOPEN_COOLDOWN = 15.0
@@ -262,6 +277,22 @@ class AfterGoalEngine:
                                     f"Не удалось перейти на лайв-раздел {bk}: {e}")
             else:
                 logger.warning(f"⚠️ Неизвестная БК {bk}, пропускаем переход")
+
+        # ── Проверка рынков стратегии против возможностей БК ──
+        try:
+            from ui.strategy_store import missing_markets_for_strategy
+            missing = missing_markets_for_strategy(strategy)
+            if missing:
+                pretty = ", ".join(sorted(missing))
+                msg = (
+                    f"Стратегия «{strategy.get('name') or bk}» использует "
+                    f"рынки, которых нет у {bk}: {pretty}. "
+                    f"Сигналы по ним будут молча игнорироваться."
+                )
+                logger.warning(f"⚠️ {msg}")
+                log_bus.warning("Стратегия", msg)
+        except Exception as e:
+            logger.debug(f"capability check: {e}")
 
         logger.info(f"✅ Профиль {profile_id} активирован (headless={headless})")
         log_bus.info("Стратегия",
@@ -445,10 +476,78 @@ class AfterGoalEngine:
             return 2
 
     def _get_min_threshold(self, strategy: dict) -> int:
-        markets = strategy.get('markets_enabled') or ["winner", "total", "handicap"]
-        if not markets:
-            return 2
-        return min(self._get_market_threshold(strategy, m) for m in markets)
+        """
+        Минимальный порог по всем рынкам, которые стратегия реально использует.
+
+        manual — берём пороги только по рынкам, отмеченным в manual_markets.
+        auto   — минимум по всем четырём базовым рынкам.
+        """
+        thresholds = strategy.get('market_thresholds') or {}
+        default = strategy.get('min_score_diff', 2)
+
+        def _safe_int(v, d):
+            try:
+                return max(1, int(v))
+            except Exception:
+                return d
+
+        mode = strategy.get('market_mode', 'auto')
+
+        if mode == 'manual':
+            manual = strategy.get('manual_markets') or []
+            base_markets = set()
+            for code in manual:
+                m = _MARKET_CODE_TO_BASE.get(code)
+                if m:
+                    base_markets.add(m)
+            if not base_markets:
+                return _safe_int(default, 2)
+            values = [_safe_int(thresholds.get(m, default), default)
+                      for m in base_markets]
+            return min(values)
+
+        values = []
+        for m in ('winner', 'total', 'handicap', 'it'):
+            values.append(_safe_int(thresholds.get(m, default), default))
+        return min(values) if values else _safe_int(default, 2)
+
+    # ============================================================
+    # Рынки manual_markets ↔ внутренний формат
+    # ============================================================
+    @staticmethod
+    def _market_code(market: str, side: str) -> Optional[str]:
+        """(market, side) → код в manual_markets."""
+        if market == 'winner':
+            return f'winner_{side}'            # winner_1 / winner_2
+        if market == 'total':
+            return f'total_{side}'             # total_over / total_under
+        if market == 'handicap':
+            return f'handicap_{side}'          # handicap_1 / handicap_2
+        if market == 'it':
+            # side = '1_over' / '2_under' → it1_over / it2_under
+            if '_' in side:
+                player, dirn = side.split('_', 1)
+                return f'it{player}_{dirn}'
+            return None
+        if market == 'odd':
+            return 'odd'                        # одна галочка
+        if market == 'point':
+            return 'point'                      # одна галочка
+        return None
+
+    def _is_market_allowed(self, market: str, side: str,
+                           manual: set) -> bool:
+        """Разрешён ли исход по настройкам manual_markets."""
+        is_race = market.startswith('race_')
+        base = market[5:] if is_race else market
+
+        if is_race and 'race' not in manual:
+            return False
+
+        code = self._market_code(base, side)
+        if not code:
+            return False
+        return code in manual
 
     # ============================================================
     # RE-CHECK задержки прямо сейчас
@@ -1601,16 +1700,6 @@ class AfterGoalEngine:
 
     def _is_set_done(self, sport: str, a: int, b: int, set_number: int,
                      fast_phase: int) -> bool:
-        """
-        Завершена ли партия по данным fast.
-
-        Для НТ/волейбола — по счёту очков (11:5, 25:20, 15:13).
-        Для баскета — по номеру четверти (fast уже в следующей).
-
-        Если True — fast знает ВСЁ в этой партии: итог, победителя,
-        маржу. Значит можно ставить under, фору на отстающего,
-        winner и т.д. — они уже «случились» по fast.
-        """
         if sport in ('basketball', 'cyber_basketball'):
             return fast_phase > set_number
         if sport == 'table_tennis':
@@ -1620,16 +1709,8 @@ class AfterGoalEngine:
             return (a >= thr and a - b >= 2) or (b >= thr and b - a >= 2)
         return False
 
-    # ============================================================
-    # Точное определение номера партии
-    # ============================================================
     @staticmethod
     def _parse_phase_num(phase_name: str) -> int:
-        """
-        «3-я партия» → 3, «2-й сет» → 2, «1-я четверть» → 1,
-        «ОТ1» → 1 (для баскета — если овертайм, номер не важен для нас),
-        0 — если распознать не удалось.
-        """
         if not phase_name:
             return 0
         m = re.search(r'(\d+)', str(phase_name))
@@ -1644,24 +1725,11 @@ class AfterGoalEngine:
                                 data: dict, set_markets: dict,
                                 fast_score: List[int],
                                 slow_score: List[int]) -> Tuple[int, int]:
-        """
-        Возвращает (fast_phase_num, slow_phase_num) — номера партий/сетов.
-
-        FAST:
-          Приоритет — payload['fast_phase'] из raw_time fast (backend).
-          Fallback для НТ/волейбола — арифметика fast_score.
-
-        SLOW:
-          Приоритет — data['phase_num'] (все хендлеры выставляют).
-          Fallback — арифметика от slow_score / ключи set_markets.
-        """
-        # ── FAST ──
         fast_phase_num = self._parse_phase_num(payload.get('fast_phase', ''))
 
         if not fast_phase_num and sport in PHASE_END_BY_SCORE:
             fast_phase_num = fast_score[0] + fast_score[1] + 1
 
-        # ── SLOW ──
         slow_phase_num = int(data.get('phase_num') or 0)
 
         if not slow_phase_num:
@@ -1679,35 +1747,17 @@ class AfterGoalEngine:
 
         return fast_phase_num, slow_phase_num
 
-    # ============================================================
-    # Sanity-проверка линий (по правилам спорта, НЕ хардкод)
-    # ============================================================
     def _max_phase_total(self, sport: str, set_number: int) -> int:
-        """
-        Максимально возможный тотал партии ПО ПРАВИЛАМ спорта.
-
-        Обоснование:
-          НТ:       партия до 11 очков, максимально затянутая 21:19 = 40
-          Волейбол: сет до 25 (сеты 1-4), до 15 (сет 5),
-                    максимально ~27:25 = 52 (для 5-го ~17:15 = 32)
-          Баскет:   четверть ~10 мин, максимум с овертаймами ~80 очков
-
-        Если линия выше — это матчевый тотал, утёкший из парсера.
-        """
         if sport == 'table_tennis':
             return 40
         if sport in ('volleyball', 'beach_volleyball'):
             return 32 if set_number >= 5 else 52
         if sport in ('basketball', 'cyber_basketball'):
             return 80
-        return 100  # неизвестный спорт — широкий лимит
+        return 100
 
     def _is_phase_line_sane(self, sport: str, market: str,
                             line: float, set_number: int) -> bool:
-        """
-        Проверка что линия похожа на партийную, а не матчевую.
-        Использует лимиты из правил спорта (см. _max_phase_total).
-        """
         if line is None:
             return False
         try:
@@ -1718,7 +1768,6 @@ class AfterGoalEngine:
         if market == 'total':
             max_line = self._max_phase_total(sport, set_number)
         elif market in ('handicap', 'it'):
-            # Фора и ИТ ограничены половиной тотала
             max_line = self._max_phase_total(sport, set_number) // 2
         else:
             return True
@@ -1758,20 +1807,6 @@ class AfterGoalEngine:
     # ============================================================
     def _collect_confirmed_bets(self, sport, payload, markets, set_number,
                                  fast_sub, fast_score, slow_score):
-        """
-        Собираем исходы, которые fast УЖЕ зафиксировал в этой партии.
-
-        Вызывающий код (_choose_best_bet) уже гарантировал, что
-        fast_phase_num == slow_phase_num == set_number. Значит fast_sub
-        относится именно к этой партии.
-
-        Два режима:
-          1) ПАРТИЯ ИДЁТ — только OVER тотала и ИТ OVER
-          2) ПАРТИЯ ЗАВЕРШЕНА — плюс UNDER, WINNER, ФОРА обе стороны
-
-        Sanity-проверка линии отсеивает матчевые рынки, утёкшие
-        из парсера (например, Betcity main).
-        """
         confirmed = []
         a = fast_sub[0] if fast_sub else 0
         b = fast_sub[1] if fast_sub else 0
@@ -1880,16 +1915,6 @@ class AfterGoalEngine:
 
     def _collect_prev_phase_bets(self, sport, payload, set_markets,
                                   fast_prev_sub: List[int], prev_phase_name: str):
-        """
-        Ставки по ЗАВЕРШЁННОЙ предыдущей фазе.
-
-        Когда fast перешла на новую партию, а slow ещё держит рынки
-        прошлой — там всё решено, фаза завершена 100%. Генерим ВСЕ
-        исходы этой фазы: over/under тотала, winner, фору обе стороны,
-        ИТ over/under.
-
-        Sanity-проверка линии — как в _collect_confirmed_bets.
-        """
         if not prev_phase_name:
             return []
         m = re.search(r'(\d+)', prev_phase_name)
@@ -1910,7 +1935,6 @@ class AfterGoalEngine:
         confirmed = []
         prev_total = prev_s1 + prev_s2
 
-        # ── ТОТАЛ ──
         total = markets.get('total', {}) or {}
         line = total.get('line', 0) or 0
         if line > 0 and self._is_phase_line_sane(sport, 'total', line, prev_num):
@@ -1931,7 +1955,6 @@ class AfterGoalEngine:
                         prev_num,
                     ))
 
-        # ── ИТ игроков ──
         it_markets = markets.get('it', {}) or {}
         for player in ('1', '2'):
             p_market = it_markets.get(player, {}) or {}
@@ -1960,7 +1983,6 @@ class AfterGoalEngine:
                         prev_num,
                     ))
 
-        # ── WINNER ──
         winner_side = None
         if prev_s1 > prev_s2:
             winner_side = '1'
@@ -1977,7 +1999,6 @@ class AfterGoalEngine:
                     prev_num,
                 ))
 
-        # ── ФОРА ──
         margin1 = prev_s1 - prev_s2
         margin2 = prev_s2 - prev_s1
         h = markets.get('handicap', {}) or {}
@@ -1999,50 +2020,34 @@ class AfterGoalEngine:
         return confirmed
 
     def _filter_confirmed_by_strategy(self, confirmed, strategy, payload):
-        markets_enabled = strategy.get('markets_enabled') or ["winner", "total", "handicap"]
-        if isinstance(markets_enabled, str):
-            markets_enabled = [markets_enabled]
+        """
+        Фильтрация подтверждённых исходов по настройкам стратегии.
 
-        # After-goal по смыслу = ставить туда же, куда смотрит fast.
-        # best_odds (макс. кэф) в after-goal опасен: выбирает мусор.
-        bet_direction = strategy.get('bet_direction', 'same_as_fast')
-        winner_sides = strategy.get('winner_sides', 'both')
-        total_sides = strategy.get('total_sides', 'both')
-        handicap_sides = strategy.get('handicap_sides', 'both')
+        market_mode='manual' — оставляем только рынки, отмеченные в manual_markets.
+        market_mode='auto'   — не фильтруем здесь (пороги и odds уже отфильтрованы).
 
-        fast_sub = payload.get('fast_sub_score', [0, 0]) or [0, 0]
-        if fast_sub[0] > fast_sub[1]:
-            fast_leader = '1'
-            fast_laggard = '2'
-        elif fast_sub[1] > fast_sub[0]:
-            fast_leader = '2'
-            fast_laggard = '1'
-        else:
-            fast_leader = fast_laggard = None
+        Legacy-поля (markets_enabled, bet_direction, winner_sides и т.п.)
+        больше не используются — они удалены из стратегии.
+        """
+        mode = strategy.get('market_mode', 'auto')
+        if mode != 'manual':
+            return confirmed
+
+        manual = set(strategy.get('manual_markets') or [])
+        if not manual:
+            return confirmed
 
         result = []
         for c in confirmed:
             market, side, odd, reason, set_number = c
-            # RACE-префикс срезаем для проверок
-            base_market = market.replace("race_", "", 1) if market.startswith("race_") else market
-            if base_market not in markets_enabled:
-                continue
-            if base_market == 'winner':
-                if winner_sides != 'both' and side != winner_sides:
-                    continue
-                if bet_direction == 'leader' and side != fast_leader:
-                    continue
-                if bet_direction == 'laggard' and side != fast_laggard:
-                    continue
-                if bet_direction == 'same_as_fast' and side != fast_leader:
-                    continue
-            elif base_market == 'total':
-                if total_sides != 'both' and side != total_sides:
-                    continue
-            elif base_market == 'handicap':
-                if handicap_sides != 'both' and side != handicap_sides:
-                    continue
-            result.append(c)
+            if self._is_market_allowed(market, side, manual):
+                result.append(c)
+
+        if not result:
+            logger.debug(
+                f"_filter_confirmed_by_strategy: все исходы отсеяны "
+                f"manual_markets={sorted(manual)}"
+            )
         return result
 
     def _choose_best_bet(self, data, strategy, payload,
@@ -2051,20 +2056,6 @@ class AfterGoalEngine:
                          prev_phase_name: str,
                          fast_score: List[int],
                          slow_score: List[int]):
-        """
-        Выбор лучшего исхода.
-
-        Ключевое: точно определяем, в какой партии играет fast
-        и в какой slow. Матч смотрим только когда их фазы
-        согласованы:
-          • fast == slow → играем ТЕКУЩУЮ партию (fast_sub)
-          • fast == slow + 1 → играем ЗАВЕРШЁННУЮ партию (fast_prev_sub)
-          • иначе → расхождение, пропуск
-
-        RACE: если в стратегии включено `race_enabled`, то к основному
-        сету добавляются исходы из парта SET_N-RACE (с префиксом `race_`
-        в названии рынка).
-        """
         set_markets = data.get('set_markets', {})
         race_set_markets = data.get('race_set_markets') or {}
         race_enabled = bool(strategy.get('race_enabled', False))
@@ -2074,7 +2065,6 @@ class AfterGoalEngine:
 
         sport = payload.get('sport', 'table_tennis')
 
-        # ── ТОЧНОЕ ОПРЕДЕЛЕНИЕ ФАЗ ──
         fast_phase_num, slow_phase_num = self._resolve_phase_context(
             sport, payload, data, set_markets, fast_score, slow_score
         )
@@ -2088,7 +2078,6 @@ class AfterGoalEngine:
         confirmed = []
 
         if fast_phase_num == slow_phase_num:
-            # ── СЛУЧАЙ 1: обе БК в одной партии → играем ТЕКУЩУЮ ──
             set_key = f"set_{slow_phase_num}"
             current_markets = set_markets.get(set_key, {})
 
@@ -2096,14 +2085,12 @@ class AfterGoalEngine:
                 f"best_bet: фазы совпадают, играем set_{slow_phase_num}"
             )
 
-            # Основной сет
             if current_markets:
                 confirmed += self._collect_confirmed_bets(
                     sport, payload, current_markets, slow_phase_num,
                     fast_sub, fast_score, slow_score
                 )
 
-            # ── RACE внутри сета (если включён в стратегии) ──
             if race_enabled:
                 race_markets = race_set_markets.get(set_key, {})
                 if race_markets:
@@ -2123,7 +2110,6 @@ class AfterGoalEngine:
                     )
 
         elif fast_phase_num == slow_phase_num + 1:
-            # ── СЛУЧАЙ 2: fast на партию впереди → играем ЗАВЕРШЁННУЮ ──
             set_key = f"set_{slow_phase_num}"
             if set_key not in set_markets:
                 logger.debug(f"best_bet: нет рынков {set_key} для prev")
@@ -2149,7 +2135,6 @@ class AfterGoalEngine:
             )
 
         else:
-            # ── СЛУЧАЙ 3: расхождение недопустимое ──
             logger.info(
                 f"best_bet: расхождение фаз "
                 f"(fast={fast_phase_num}, slow={slow_phase_num}) — пропуск"
@@ -2181,6 +2166,8 @@ class AfterGoalEngine:
             return None
 
         confirmed = confirmed_filtered
+
+        # ── Фильтр по manual_markets / auto_criterion ──
         confirmed = self._filter_confirmed_by_strategy(confirmed, strategy, payload)
         if not confirmed:
             return None
@@ -2191,12 +2178,6 @@ class AfterGoalEngine:
         if not valid:
             return None
 
-        # ── Приоритет рынков ──
-        # winner — самый чистый after-goal
-        # total — over (партия идёт) или over/under (партия завершена)
-        # handicap — сложнее, фаза должна быть завершена
-        # it — редкий, слабый сигнал
-        # RACE-исходы чуть ниже основных (минус 0.5)
         PRIORITY = {'winner': 3, 'total': 2, 'handicap': 1, 'it': 0}
 
         def _priority(market_name: str) -> float:
@@ -2204,7 +2185,14 @@ class AfterGoalEngine:
             race_penalty = 0.5 if market_name.startswith("race_") else 0
             return PRIORITY.get(base, 0) - race_penalty
 
-        valid.sort(key=lambda c: (_priority(c[0]), c[2]), reverse=True)
+        criterion = strategy.get('auto_criterion', 'reliable')
+        if criterion == 'max_odds':
+            # Самый высокий кэф; при равенстве — приоритет рынка
+            valid.sort(key=lambda c: (c[2], _priority(c[0])), reverse=True)
+        else:
+            # 'reliable' и 'all_confirmed' (пока fallback) — приоритет рынка
+            valid.sort(key=lambda c: (_priority(c[0]), c[2]), reverse=True)
+
         best = valid[0]
         market, side, odd, reason, set_number = best
 
@@ -2424,10 +2412,10 @@ class AfterGoalEngine:
             if bk == 'fonbet':
                 bet_data['event_id'] = data.get('match_id')
                 bet_data['factor_id'] = outcome_info.get('id')
-            elif bk == 'pari':                    # ← добавил
+            elif bk == 'pari':
                 bet_data['event_id'] = data.get('match_id')
                 bet_data['factor_id'] = outcome_info.get('id')
-                bet_data['score'] = f"{data.get('score1', 0)}:{data.get('score2', 0)}"    
+                bet_data['score'] = f"{data.get('score1', 0)}:{data.get('score2', 0)}"
             elif bk == 'sportbet':
                 bet_data['outcome_id'] = outcome_info.get('id')
             elif bk == 'betcity':

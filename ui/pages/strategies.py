@@ -13,6 +13,8 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from ui.components.switch import Switch
 from ui.strategy_store import (
     StrategyStore, SPORT_ANY, ALL_MARKETS,
+    missing_markets_for_strategy,
+    recommended_thresholds_for_sport,
 )
 from ui.log_bus import log_bus
 
@@ -41,6 +43,23 @@ TYPE_CHOICES = {
 TYPE_DISPLAY = {v: k for k, v in TYPE_CHOICES.items()}
 TYPE_DISPLAY_FULL = {
     "After-goal": "Послегол",
+}
+
+# Понятные названия для рынков — для warning'ов
+MARKET_DISPLAY = {
+    "winner_1": "Победитель партии П1",
+    "winner_2": "Победитель партии П2",
+    "total_over": "Тотал партии Больше",
+    "total_under": "Тотал партии Меньше",
+    "handicap_1": "Фора партии 1",
+    "handicap_2": "Фора партии 2",
+    "it1_over": "ИТ1 Больше",
+    "it1_under": "ИТ1 Меньше",
+    "it2_over": "ИТ2 Больше",
+    "it2_under": "ИТ2 Меньше",
+    "odd": "Чёт/Нечёт",
+    "race": "Гонка внутри сета",
+    "point": "Следующее очко",
 }
 
 
@@ -177,6 +196,7 @@ class StrategiesPage(QWidget):
 
         self.sport_combo = QComboBox()
         self.sport_combo.addItems(list(SPORT_CHOICES.keys()))
+        self.sport_combo.currentTextChanged.connect(self._update_threshold_hint)
         main_form.addRow("Вид спорта:", self.sport_combo)
 
         self.account_combo = QComboBox()
@@ -243,8 +263,8 @@ class StrategiesPage(QWidget):
             "потом форе.\n"
             "«Самый высокий коэф.» — из подтверждённых исходов берётся "
             "максимальный коэффициент.\n"
-            "«Всё подтверждённое» — отправляется несколько ставок "
-            "одновременно (агрессивно)."
+            "«Всё подтверждённое» — пока работает как «надёжный» (одна "
+            "ставка за сигнал). Мульти-ставки — в следующем обновлении."
         )
         hint_auto.setWordWrap(True)
         hint_auto.setStyleSheet(
@@ -271,7 +291,6 @@ class StrategiesPage(QWidget):
         self.cb_markets = {}
 
         def make_market_row(label, items):
-            """items: [(code, text)] — возвращает dict {code: QCheckBox}."""
             row = QHBoxLayout()
             row.setSpacing(10)
 
@@ -292,7 +311,6 @@ class StrategiesPage(QWidget):
             manual_form.addLayout(row)
             return result
 
-        # Рынки — галочками
         self.cb_markets.update(make_market_row(
             "Победитель партии:",
             [("winner_1", "П1"), ("winner_2", "П2")],
@@ -317,7 +335,7 @@ class StrategiesPage(QWidget):
 
         what_layout.addWidget(self.manual_group)
 
-        # ── Пороги отставания (общие для авто и ручного) ──
+        # ── Пороги отставания ──
         thresholds_sep = QFrame()
         thresholds_sep.setFrameShape(QFrame.HLine)
         thresholds_sep.setStyleSheet(
@@ -338,6 +356,14 @@ class StrategiesPage(QWidget):
         thr_hint.setWordWrap(True)
         what_layout.addWidget(thr_hint)
 
+        # ── Рекомендуемые пороги по спорту ──
+        self.thr_recommend_label = QLabel("")
+        self.thr_recommend_label.setWordWrap(True)
+        self.thr_recommend_label.setStyleSheet(
+            "color: #21c1de; font-size: 10px; font-weight: 600; "
+            "padding: 4px 0;")
+        what_layout.addWidget(self.thr_recommend_label)
+
         thr_row = QHBoxLayout()
         thr_row.setSpacing(14)
 
@@ -351,7 +377,7 @@ class StrategiesPage(QWidget):
                 "color: rgba(245,249,252,0.82); font-size: 12px;")
             h.addWidget(lbl)
             spin = QSpinBox()
-            spin.setRange(1, 15)
+            spin.setRange(1, 30)
             spin.setValue(default)
             spin.setSuffix(" очк.")
             spin.setFixedWidth(85)
@@ -361,9 +387,11 @@ class StrategiesPage(QWidget):
         w1, self.spin_winner_thr = make_threshold("Победитель:", 2)
         w2, self.spin_total_thr = make_threshold("Тотал:", 1)
         w3, self.spin_handicap_thr = make_threshold("Фора:", 3)
+        w4, self.spin_it_thr = make_threshold("ИТ:", 2)
         thr_row.addWidget(w1)
         thr_row.addWidget(w2)
         thr_row.addWidget(w3)
+        thr_row.addWidget(w4)
         thr_row.addStretch()
         what_layout.addLayout(thr_row)
 
@@ -378,24 +406,22 @@ class StrategiesPage(QWidget):
         self.cb_race_enabled = QCheckBox(
             "Учитывать гонку внутри сета (RACE)")
         self.cb_race_enabled.setToolTip(
-            "Дополнительно ставить на рынки гонки — например,\n"
-            "«Тотал в гонке до 5 очков», «Фора в гонке до 7 очков».\n"
-            "Работает по тем же правилам, что и основной сет."
+            "Работает только у БК, которые дают рынки RACE в лайв-ленте.\n"
+            "Сейчас это только LigaStavok."
         )
         what_layout.addWidget(self.cb_race_enabled)
 
         race_hint = QLabel(
             "RACE — это отрезок внутри сета (до 3, 5, 7 или 10 очков). "
             "Букмекер даёт по ним отдельные тоталы и форы.\n"
-            "Если включено — движок рассмотрит и основной сет, и гонку.\n"
-            "Если выключено — только основной сет (до 11 очков)."
+            "У LigaStavok — есть. У Marathon — нет. У остальных — проверяйте."
         )
         race_hint.setStyleSheet(
             "color: rgba(199,214,223,0.5); font-size: 10px; font-style: italic;")
         race_hint.setWordWrap(True)
         what_layout.addWidget(race_hint)
 
-        # ── Показ/скрытие блоков в зависимости от режима ──
+        # ── Обновление видимости ──
         def _update_market_mode():
             is_auto = self.market_mode_auto.isChecked()
             self.auto_criterion_group.setVisible(is_auto)
@@ -481,6 +507,7 @@ class StrategiesPage(QWidget):
 
         self._rebuild_cards()
         self._load_form(0)
+        self._update_threshold_hint()
 
     # ---------- Аккаунты ----------
     def _load_accounts(self):
@@ -523,6 +550,25 @@ class StrategiesPage(QWidget):
         if 0 <= index < len(self.accounts):
             return self.accounts[index]
         return None
+
+    # ---------- Подсказка по порогам ----------
+    def _update_threshold_hint(self):
+        """Обновляет label с рекомендованными порогами по спорту."""
+        sport_key = SPORT_CHOICES.get(self.sport_combo.currentText(), SPORT_ANY)
+        if sport_key == SPORT_ANY:
+            self.thr_recommend_label.setText(
+                "💡 Для «Все виды» пороги применяются ко всем спортам. "
+                "Для точной настройки создайте отдельные стратегии "
+                "под каждый вид."
+            )
+            return
+
+        rec = recommended_thresholds_for_sport(sport_key)
+        self.thr_recommend_label.setText(
+            f"💡 Рекомендуем для этого вида: "
+            f"Победитель={rec['winner']}, Тотал={rec['total']}, "
+            f"Фора={rec['handicap']}, ИТ={rec['it']}"
+        )
 
     # ---------- Карточки ----------
     def _rebuild_cards(self):
@@ -633,16 +679,15 @@ class StrategiesPage(QWidget):
         for code, cb in self.cb_markets.items():
             cb.setChecked(code in manual)
 
-        # ── RACE (гонка внутри сета) ──
         self.cb_race_enabled.setChecked(
             bool(st.get("race_enabled", False))
         )
 
-        # пороги
         thresholds = st.get("market_thresholds") or {}
         self.spin_winner_thr.setValue(int(thresholds.get("winner", 2)))
         self.spin_total_thr.setValue(int(thresholds.get("total", 1)))
         self.spin_handicap_thr.setValue(int(thresholds.get("handicap", 3)))
+        self.spin_it_thr.setValue(int(thresholds.get("it", 2)))
 
         # ставка
         self.bet_size.setValue(st.get("bet_size", 100))
@@ -656,6 +701,8 @@ class StrategiesPage(QWidget):
         self.max_bets_per_session.setValue(st.get("max_bets_per_session", 0))
         self.ignore_repeats.setChecked(st.get("ignore_repeats", False))
         self.headless_checkbox.setChecked(st.get("headless", False))
+
+        self._update_threshold_hint()
 
     def _on_save(self):
         if not (0 <= self.selected < len(self.store.strategies)):
@@ -692,12 +739,17 @@ class StrategiesPage(QWidget):
             "winner":   self.spin_winner_thr.value(),
             "total":    self.spin_total_thr.value(),
             "handicap": self.spin_handicap_thr.value(),
-            "it":       int(st.get("market_thresholds", {}).get("it", 2)),
+            "it":       self.spin_it_thr.value(),
         }
+        # min_score_diff — legacy fallback, используется только в
+        # _get_min_threshold при auto-режиме и в дефолтах.
+        # Считаем минимум по ВСЕМ четырём базовым рынкам, чтобы
+        # не блокировать стратегии «только ИТ» (см. _MARKET_CODE_TO_BASE).
         st["min_score_diff"] = min(
             st["market_thresholds"]["winner"],
             st["market_thresholds"]["total"],
             st["market_thresholds"]["handicap"],
+            st["market_thresholds"]["it"],
         )
 
         # ── Рынки ──
@@ -717,7 +769,6 @@ class StrategiesPage(QWidget):
             manual = ["winner_1", "winner_2"]
         st["manual_markets"] = manual
 
-        # ── RACE (гонка внутри сета) ──
         st["race_enabled"] = self.cb_race_enabled.isChecked()
 
         # ставка
@@ -736,3 +787,18 @@ class StrategiesPage(QWidget):
         self.store.save()
         self.strategies_changed.emit()
         self._rebuild_cards()
+
+        # ── Проверка рынков против возможностей БК ──
+        try:
+            missing = missing_markets_for_strategy(st)
+            if missing:
+                pretty = ", ".join(
+                    MARKET_DISPLAY.get(code, code) for code in missing
+                )
+                log_bus.warning(
+                    "Стратегия",
+                    f"«{st.get('name')}» ({st.get('bk') or '—'}): "
+                    f"рынки не поддерживаются БК и будут пропущены: {pretty}"
+                )
+        except Exception as e:
+            logger.warning(f"capability check on save: {e}", exc_info=True)
