@@ -23,6 +23,12 @@ from .after_goal import (
     MarathonHandler,
 )
 from core.adspower_browser import AdsPowerBrowser
+from core.fast_client import (
+    get_fast_client, has_fast_client, shutdown_all as fast_clients_shutdown,
+)
+from core.fast_config import (
+    is_fast_configured, get_fast_profile_id, get_fast_api_key,
+)
 from .paths import get_app_data_dir
 from .after_goal.match_urls import build_match_url
 from .config_loader import load_config
@@ -237,6 +243,14 @@ class AfterGoalEngine:
 
         self._fast_state: Dict[str, dict] = {}
         self._fast_poll_tasks: Dict[str, asyncio.Task] = {}
+        self._fast_markets_poll_tasks: Dict[str, asyncio.Task] = {}
+
+        # ── Fast-профиль AdsPower (для БК без HTTP-клиента: LigaStavok, Zenit) ──
+        self._fast_browser: Optional[AdsPowerBrowser] = None
+        self._fast_profile_lock = asyncio.Lock()
+        self._fast_pages: Dict[str, Page] = {}
+        self._fast_handlers: Dict[str, BookmakerHandler] = {}
+        self._fast_monitor_tasks: Dict[str, asyncio.Task] = {}
 
         self._last_ui_state: Dict[str, tuple] = {}
 
@@ -401,15 +415,15 @@ class AfterGoalEngine:
                         prev_entry = self._fast_state.get(match_id) or {}
                         prev_keys = prev_entry.get("_last_logged_keys")
 
-                        self._fast_state[match_id] = {
-                            "bks": bks,
-                            "fetched_at": time.time(),
-                            "now_on_backend": data.get("now"),
-                            "_last_logged_keys": prev_keys,
-                        }
+                        state = self._fast_state.setdefault(match_id, {})
+                        state["bks"] = bks
+                        state["fetched_at"] = time.time()
+                        state["now_on_backend"] = data.get("now")
+                        state["_last_logged_keys"] = prev_keys
+                        state.pop("not_found", None)
 
                         if prev_keys != bks_keys:
-                            self._fast_state[match_id]["_last_logged_keys"] = bks_keys
+                            state["_last_logged_keys"] = bks_keys
                             logger.info(
                                 f"📡 FAST_STATE[{match_id}] bks={bks_keys} "
                                 f"fast_present={fast_bk in bks}"
@@ -423,12 +437,11 @@ class AfterGoalEngine:
                         was_not_found = (self._fast_state
                                          .get(match_id, {})
                                          .get("not_found", False))
-                        self._fast_state[match_id] = {
-                            "bks": {},
-                            "fetched_at": time.time(),
-                            "now_on_backend": data.get("now"),
-                            "not_found": True,
-                        }
+                        state = self._fast_state.setdefault(match_id, {})
+                        state["bks"] = {}
+                        state["fetched_at"] = time.time()
+                        state["now_on_backend"] = data.get("now")
+                        state["not_found"] = True
                         if not was_not_found:
                             logger.warning(
                                 f"📡 FAST_STATE[{match_id}] матч пропал из агрегатора"
@@ -451,6 +464,114 @@ class AfterGoalEngine:
             await asyncio.sleep(FAST_STATE_POLL_INTERVAL)
 
         logger.info(f"🛑 FAST_STATE poll остановлен match={match_id}")
+
+    async def _poll_fast_markets(self, match_id: str, sport: str,
+                                 player1: str, player2: str,
+                                 fast_bk: str):
+        """
+        Каждые 2 сек дёргает fast-клиент и кладёт внутриматчевые
+        рынки в _fast_state[match_id]['markets'].
+
+        Работает параллельно с _poll_fast_state (счёт) — не мешает ему.
+        """
+        if not fast_bk:
+            logger.info(f"🛑 FAST_MARKETS poll: fast_bk пустой, стоп")
+            return
+
+        client = get_fast_client(fast_bk)
+        if client is None:
+            logger.warning(
+                f"⚠️ FAST_MARKETS: нет клиента для {fast_bk}, "
+                f"останавливаю polling"
+            )
+            return
+
+        logger.info(
+            f"🔄 FAST_MARKETS poll запущен match={match_id} "
+            f"fast_bk={fast_bk} teams='{player1}' / '{player2}'"
+        )
+
+        fail_count = 0
+        while self._monitoring_active.get(match_id, False):
+            try:
+                # ── Если у клиента есть метод get_markets_by_native_id ──
+                # (Pari — ему нужен eventId от Pari из /match_state,
+                #  а не имена игроков), сначала пробуем его.
+                result = None
+                if hasattr(client, "get_markets_by_native_id"):
+                    state = self._fast_state.get(match_id) or {}
+                    bks = state.get("bks") or {}
+                    bk_info = bks.get(fast_bk) or {}
+                    native_id = bk_info.get("match_id")
+                    if native_id:
+                        result = await client.get_markets_by_native_id(
+                            native_id
+                        )
+
+                # ── Fallback: старый путь по именам ──
+                if result is None:
+                    result = await client.get_markets(sport, player1, player2)
+
+                if result:
+                    fail_count = 0
+
+                    # Мержим в _fast_state, не перетирая данные счёта
+                    state = self._fast_state.setdefault(match_id, {})
+                    state["markets"] = result.get("set_markets", {})
+                    state["markets_phase"] = result.get("phase_num", 0)
+                    state["markets_score1"] = result.get("score1", 0)
+                    state["markets_score2"] = result.get("score2", 0)
+                    state["markets_sub1"] = result.get("sub_score1", 0)
+                    state["markets_sub2"] = result.get("sub_score2", 0)
+                    state["markets_match_id"] = result.get("match_id")
+                    state["markets_fetched_at"] = time.time()
+
+                    logger.debug(
+                        f"📡 FAST_MARKETS[{match_id}] {fast_bk} "
+                        f"phase={result.get('phase_num')} "
+                        f"sets={list(result.get('set_markets', {}).keys())}"
+                    )
+                else:
+                    fail_count += 1
+                    if fail_count == 5:
+                        logger.warning(
+                            f"⚠️ FAST_MARKETS[{match_id}] {fast_bk}: "
+                            f"5 промахов подряд — матч не находится"
+                        )
+
+            except Exception as e:
+                fail_count += 1
+                if fail_count <= 3:
+                    logger.debug(
+                        f"FAST_MARKETS[{match_id}] poll error: {e}"
+                    )
+
+            await asyncio.sleep(2.0)
+
+        logger.info(f"🛑 FAST_MARKETS poll остановлен match={match_id}")
+
+    def _get_fast_markets(self, match_id: str) -> Optional[Dict]:
+        """
+        Возвращает markets из _fast_state, если свежие (< 5 сек).
+        Иначе None.
+        """
+        entry = self._fast_state.get(match_id)
+        if not entry:
+            return None
+        fetched_at = entry.get("markets_fetched_at", 0)
+        if not fetched_at:
+            return None
+        if time.time() - fetched_at > 5.0:
+            return None
+        return {
+            "set_markets": entry.get("markets") or {},
+            "phase_num":   entry.get("markets_phase", 0),
+            "score1":      entry.get("markets_score1", 0),
+            "score2":      entry.get("markets_score2", 0),
+            "sub_score1":  entry.get("markets_sub1", 0),
+            "sub_score2":  entry.get("markets_sub2", 0),
+            "match_id":    entry.get("markets_match_id"),
+        }
 
     def _get_fast_state(self, match_id: str, fast_bk: str) -> Optional[dict]:
         entry = self._fast_state.get(match_id)
@@ -571,11 +692,55 @@ class AfterGoalEngine:
         if slow_age > SLOW_DATA_STALE_SEC:
             return False, f"slow_data старше {slow_age:.1f}с"
 
+        sport = payload.get('sport', 'table_tennis')
+
         fast_sub1 = int(fast_state.get("sub_score1") or 0)
         fast_sub2 = int(fast_state.get("sub_score2") or 0)
         slow_sub1 = int(slow_data.get("sub_score1") or 0)
         slow_sub2 = int(slow_data.get("sub_score2") or 0)
 
+        fast_score1 = int(fast_state.get("score1") or 0)
+        fast_score2 = int(fast_state.get("score2") or 0)
+        slow_score1 = int(slow_data.get("score1") or 0)
+        slow_score2 = int(slow_data.get("score2") or 0)
+
+        # ── Определяем фазу ──
+        # НТ/волейбол: фаза = счёт партий + 1.
+        # НЕ доверяем phase_num — у некоторых БК (Olimp) он врёт.
+        # Баскетбол/кибер: фаза берётся из fast_phase и phase_num,
+        # потому что score там = очки, а не партии.
+        if sport in PHASE_END_BY_SCORE:
+            fast_phase_num = fast_score1 + fast_score2 + 1
+            slow_phase_num = slow_score1 + slow_score2 + 1
+        else:
+            fast_phase_num = self._parse_phase_num(
+                payload.get('fast_phase', '')
+            )
+            slow_phase_num = int(slow_data.get('phase_num') or 0)
+
+        # ── Случай 1: fast на партию впереди (валидный after-goal) ──
+        if (fast_phase_num > 0 and slow_phase_num > 0
+                and fast_phase_num == slow_phase_num + 1):
+            logger.debug(
+                f"verify_delay_now: fast на партию впереди "
+                f"(fast={fast_phase_num}, slow={slow_phase_num}) — delay OK"
+            )
+            return True, (
+                f"fast на партию впереди "
+                f"(fast {fast_score1}:{fast_score2}, "
+                f"slow {slow_score1}:{slow_score2})"
+            )
+
+        # ── Случай 2: рассинхрон фаз — не сравниваем sub_score ──
+        if (fast_phase_num > 0 and slow_phase_num > 0
+                and fast_phase_num != slow_phase_num):
+            return False, (
+                f"фазы рассинхронизированы "
+                f"(fast={fast_phase_num}, slow={slow_phase_num}) — "
+                f"sub_score несравним"
+            )
+
+        # ── Случай 3: обе в одной фазе — сравниваем sub_score ──
         diff = max(fast_sub1 - slow_sub1, fast_sub2 - slow_sub2)
         if market:
             threshold = self._get_market_threshold(strategy, market)
@@ -644,6 +809,217 @@ class AfterGoalEngine:
             await self._preopen_impl(payload, strategy)
         finally:
             self._preopen_in_flight.discard(match_id)
+
+    # ============================================================
+    # Fast-профиль (вкладка) для БК без HTTP-клиента
+    # ============================================================
+    async def _ensure_fast_browser(self) -> Optional[AdsPowerBrowser]:
+        """Запускает fast-профиль AdsPower (из fast_config.json)."""
+        if not is_fast_configured():
+            logger.warning("[FAST-TAB] fast-профиль не настроен")
+            return None
+
+        profile_id = get_fast_profile_id()
+        api_key = get_fast_api_key()
+
+        async with self._fast_profile_lock:
+            if self._fast_browser is not None:
+                try:
+                    if (self._fast_browser.browser
+                            and self._fast_browser.browser.is_connected()):
+                        return self._fast_browser
+                except Exception:
+                    pass
+                try:
+                    await self._fast_browser.stop()
+                except Exception:
+                    pass
+                self._fast_browser = None
+
+            try:
+                wrapper = AdsPowerBrowser(
+                    profile_id=profile_id,
+                    api_key=api_key,
+                    api_url=ADSPOWER_API_URL,
+                    headless=True,
+                )
+                await wrapper.__aenter__()
+                self._fast_browser = wrapper
+                logger.info(
+                    f"[FAST-TAB] ✅ Fast-профиль {profile_id} запущен (headless)"
+                )
+                log_bus.success(
+                    "Fast БК", f"Fast-профиль {profile_id} запущен"
+                )
+                return wrapper
+            except Exception as e:
+                logger.error(
+                    f"[FAST-TAB] ❌ Не удалось запустить fast-профиль: {e}",
+                    exc_info=True,
+                )
+                log_bus.error(
+                    "Fast БК", f"Fast-профиль не запущен: {e}"
+                )
+                return None
+
+    async def _open_fast_match(self, match_id: str, fast_bk: str,
+                                payload: dict, sport: str) -> Optional[Page]:
+        """
+        Открывает вкладку fast БК на конкретном матче в fast-профиле.
+        Используется ТОЛЬКО для БК без HTTP-клиента (LigaStavok, Zenit).
+        """
+        fast_browser = await self._ensure_fast_browser()
+        if not fast_browser:
+            return None
+
+        existing = self._fast_pages.get(match_id)
+        if existing and not existing.is_closed():
+            return existing
+
+        player1, player2 = payload.get('match_teams', ['', ''])
+
+        handler_cls = HANDLERS.get(fast_bk)
+        if not handler_cls:
+            logger.error(f"[FAST-TAB] нет хендлера для {fast_bk}")
+            return None
+
+        try:
+            page = await fast_browser.new_page()
+        except Exception as e:
+            logger.error(f"[FAST-TAB] не удалось открыть вкладку: {e}")
+            return None
+
+        handler = handler_cls(
+            target_match_id=match_id,
+            target_teams=[player1, player2],
+        )
+        self._fast_handlers[match_id] = handler
+
+        # prepare_page ДО goto (для LigaStavok — установка fetch-хука)
+        if hasattr(handler, "prepare_page"):
+            try:
+                await handler.prepare_page(page)
+            except Exception as e:
+                logger.warning(f"[FAST-TAB] prepare_page ({fast_bk}): {e}")
+
+        # Прогрев cookies Qrator для LigaStavok
+        if fast_bk == "ligastavok":
+            try:
+                cookies = await page.context.cookies()
+                has_qrator = any(
+                    "qrator" in (c.get("name") or "").lower()
+                    for c in cookies
+                    if "ligastavok" in (c.get("domain") or "")
+                )
+                if not has_qrator:
+                    logger.info("[FAST-TAB] LigaStavok: прогрев через /live")
+                    try:
+                        await page.goto(
+                            "https://www.ligastavok.ru/live",
+                            wait_until="domcontentloaded", timeout=20000,
+                        )
+                        await page.wait_for_timeout(2500)
+                    except Exception as e:
+                        logger.warning(f"[FAST-TAB] прогрев: {e}")
+            except Exception as e:
+                logger.debug(f"[FAST-TAB] cookies check: {e}")
+
+        # Идём на live-раздел
+        bk_urls = LIVE_URLS.get(fast_bk, {})
+        start_url = bk_urls.get(sport) or bk_urls.get('any')
+        if start_url:
+            try:
+                await page.goto(start_url, wait_until="domcontentloaded",
+                                timeout=30000)
+                await page.wait_for_timeout(2500)
+            except Exception as e:
+                logger.warning(f"[FAST-TAB] goto ({fast_bk}): {e}")
+
+        # Пытаемся открыть конкретный матч по URL
+        match_url = payload.get('match_url') or build_match_url(fast_bk, payload)
+        url_ok = False
+        if match_url:
+            try:
+                await page.goto(match_url, wait_until="domcontentloaded",
+                                timeout=25000)
+                await page.wait_for_timeout(2000)
+                for _ in range(20):
+                    if await self._check_players_on_page(page, player1, player2):
+                        url_ok = True
+                        break
+                    await page.wait_for_timeout(300)
+            except Exception as e:
+                logger.debug(f"[FAST-TAB] URL: {e}")
+
+        if not url_ok:
+            found = await self._click_match_on_page(page, player1, player2)
+            if not found:
+                logger.warning(
+                    f"[FAST-TAB] матч '{player1}' vs '{player2}' "
+                    f"не найден на {fast_bk}"
+                )
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                self._fast_handlers.pop(match_id, None)
+                return None
+
+        self._fast_pages[match_id] = page
+        logger.info(f"[FAST-TAB] ✅ вкладка открыта: match={match_id} bk={fast_bk}")
+        return page
+
+    async def _monitor_fast_markets_via_handler(
+        self, match_id: str, fast_bk: str,
+        payload: dict, strategy: dict,
+    ):
+        """
+        Хендлер fast БК слушает матч и пишет set_markets
+        в _fast_state[match_id] в том же формате, что HTTP-клиент.
+        """
+        page = self._fast_pages.get(match_id)
+        handler = self._fast_handlers.get(match_id)
+        if not page or not handler:
+            return
+
+        fast_bk_norm = _normalize_bk(fast_bk)
+
+        async def on_update(data: dict):
+            if not self._monitoring_active.get(match_id, False):
+                return
+            # Пишем в тот же формат, что _poll_fast_markets
+            state = self._fast_state.setdefault(match_id, {})
+            state["markets"] = data.get('set_markets', {}) or {}
+            state["markets_phase"] = data.get('phase_num', 0)
+            state["markets_score1"] = data.get('score1', 0)
+            state["markets_score2"] = data.get('score2', 0)
+            state["markets_sub1"] = data.get('sub_score1', 0)
+            state["markets_sub2"] = data.get('sub_score2', 0)
+            state["markets_match_id"] = data.get('match_id')
+            state["markets_fetched_at"] = time.time()
+
+        try:
+            await handler.setup_listener(
+                page, on_update,
+                match_id=match_id,
+                match_teams=payload.get('match_teams'),
+            )
+            logger.info(
+                f"[FAST-TAB] ▶️ monitor запущен match={match_id} bk={fast_bk_norm}"
+            )
+        except TypeError:
+            try:
+                await handler.setup_listener(page, on_update, match_id=match_id)
+            except TypeError:
+                await handler.setup_listener(page, on_update)
+        except Exception as e:
+            logger.error(f"[FAST-TAB] setup_listener: {e}", exc_info=True)
+            return
+
+        while self._monitoring_active.get(match_id, False):
+            await asyncio.sleep(1.0)
+
+        logger.info(f"[FAST-TAB] 🛑 monitor остановлен match={match_id}")
 
     async def _preopen_impl(self, payload: dict, strategy: dict):
         match_id = payload.get('match_id')
@@ -888,6 +1264,54 @@ class AfterGoalEngine:
                 slow_bk=slow_bk,
             )
         )
+
+        # ── Fast-кэфы ──
+        #   Есть HTTP-клиент → быстрый polling, без вкладок.
+        #   Нет клиента, но есть хендлер (LigaStavok, Zenit) → вкладка в fast-профиле.
+        if fast_bk and fast_bk != slow_bk and has_fast_client(fast_bk):
+            logger.info(
+                f"📊 FAST_MARKETS: match={match_id} "
+                f"slow={slow_bk} fast={fast_bk} (HTTP)"
+            )
+            self._fast_markets_poll_tasks[match_id] = asyncio.create_task(
+                self._poll_fast_markets(
+                    match_id=match_id, sport=sport,
+                    player1=player1, player2=player2,
+                    fast_bk=fast_bk,
+                )
+            )
+        elif (fast_bk and fast_bk != slow_bk
+                and fast_bk in HANDLERS
+                and is_fast_configured()
+                and (strategy.get('type') or '').lower() == 'live-value'):
+            logger.info(
+                f"📊 FAST_MARKETS: match={match_id} "
+                f"slow={slow_bk} fast={fast_bk} (TAB в fast-профиле)"
+            )
+            try:
+                fast_page = await self._open_fast_match(
+                    match_id=match_id,
+                    fast_bk=fast_bk,
+                    payload=payload,
+                    sport=sport,
+                )
+                if fast_page:
+                    task = asyncio.create_task(
+                        self._monitor_fast_markets_via_handler(
+                            match_id=match_id,
+                            fast_bk=fast_bk,
+                            payload=payload,
+                            strategy=strategy,
+                        )
+                    )
+                    self._fast_monitor_tasks[match_id] = task
+            except Exception as e:
+                logger.warning(f"[FAST-TAB] {fast_bk}: {e}")
+        else:
+            logger.info(
+                f"📊 FAST_MARKETS: {fast_bk or '—'} — live-value пропущен "
+                f"(нет HTTP-клиента и вкладка не открыта)"
+            )
 
         task = asyncio.create_task(
             self._monitor_loop(match_id, payload, strategy, handler)
@@ -1156,6 +1580,61 @@ class AfterGoalEngine:
             except Exception:
                 pass
         self._fast_poll_tasks.clear()
+
+        # Отменяем polling fast-маркетов
+        for mid, t in list(self._fast_markets_poll_tasks.items()):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if self._fast_markets_poll_tasks:
+            try:
+                await asyncio.wait(
+                    list(self._fast_markets_poll_tasks.values()), timeout=2.0
+                )
+            except Exception:
+                pass
+        self._fast_markets_poll_tasks.clear()
+
+        # ── Fast-вкладки ──
+        for mid, t in list(self._fast_monitor_tasks.items()):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if self._fast_monitor_tasks:
+            try:
+                await asyncio.wait(
+                    list(self._fast_monitor_tasks.values()), timeout=2.0
+                )
+            except Exception:
+                pass
+        self._fast_monitor_tasks.clear()
+
+        for mid, page in list(self._fast_pages.items()):
+            try:
+                if page and not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+        self._fast_pages.clear()
+        self._fast_handlers.clear()
+
+        # Останавливаем fast-профиль
+        if self._fast_browser is not None:
+            try:
+                await self._fast_browser.stop()
+                logger.info("[FAST-TAB] ✅ Fast-профиль закрыт")
+            except Exception as e:
+                logger.warning(f"[FAST-TAB] fast_browser.stop: {e}")
+            self._fast_browser = None
+
+        # Закрываем HTTP-сессии fast-клиентов
+        try:
+            await fast_clients_shutdown()
+        except Exception as e:
+            logger.debug(f"fast_clients_shutdown: {e}")
+
         self._fast_state.clear()
 
         for pid, w in list(self._queue_workers.items()):
@@ -1221,6 +1700,38 @@ class AfterGoalEngine:
                 await poll_t
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # Отменяем polling fast-маркетов
+        poll_m = self._fast_markets_poll_tasks.pop(match_id, None)
+        if poll_m and not poll_m.done():
+            poll_m.cancel()
+            try:
+                await poll_m
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # ── Fast-вкладка (для LigaStavok/Zenit) ──
+        fast_task = self._fast_monitor_tasks.pop(match_id, None)
+        if fast_task and not fast_task.done():
+            fast_task.cancel()
+            try:
+                await fast_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        fast_page = self._fast_pages.pop(match_id, None)
+        fast_handler = self._fast_handlers.pop(match_id, None)
+        if fast_handler and fast_page and not fast_page.is_closed():
+            try:
+                await fast_handler.stop_listener(fast_page)
+            except Exception as e:
+                logger.debug(f"[FAST-TAB] stop_listener({match_id}): {e}")
+        if fast_page and not fast_page.is_closed():
+            try:
+                await fast_page.close()
+            except Exception:
+                pass
+
         self._fast_state.pop(match_id, None)
 
         handler = self._handlers.pop(match_id, None)
@@ -2224,6 +2735,256 @@ class AfterGoalEngine:
         return result
 
     # ============================================================
+    # Live-value: сравнение кэфов fast и slow
+    # ============================================================
+    def _choose_live_value_bet(self, slow_data: dict, strategy: dict,
+                                payload: dict) -> Optional[dict]:
+        """
+        Сравнивает внутриматчевые кэфы fast (HTTP) и slow (хендлер).
+        Возвращает dict той же структуры, что _choose_best_bet, или None.
+
+        Ключ сравнения: (set_key, market, side).
+        Для total/handicap/it дополнительно проверяется совпадение линии.
+        """
+        match_id = payload.get('match_id')
+
+        # ── Свежие fast-кэфы ──
+        fast_entry = self._get_fast_markets(match_id)
+        if not fast_entry:
+            logger.debug("live_value: нет свежих fast_markets")
+            return None
+
+        sport = (payload.get('sport') or 'table_tennis').lower()
+
+        fast_set_markets = fast_entry.get("set_markets") or {}
+        slow_set_markets = slow_data.get('set_markets') or {}
+
+        fast_phase_num = int(fast_entry.get("phase_num") or 0)
+        slow_phase_num = int(slow_data.get('phase_num') or 0)
+
+        # ── Для НТ/волейбола фазу считаем из счёта партий ──
+        # У Olimp бывает битый phase_num (показывает 2 при score=0:0).
+        # Счёт партий — надёжнее.
+        if sport in PHASE_END_BY_SCORE:
+            fsc1 = int(fast_entry.get("score1") or 0)
+            fsc2 = int(fast_entry.get("score2") or 0)
+            ssc1 = int(slow_data.get("score1") or 0)
+            ssc2 = int(slow_data.get("score2") or 0)
+            fast_phase_num = fsc1 + fsc2 + 1
+            slow_phase_num = ssc1 + ssc2 + 1
+
+        if fast_phase_num <= 0 or slow_phase_num <= 0:
+            return None
+
+        # Фазы должны совпадать
+        if fast_phase_num != slow_phase_num:
+            logger.debug(
+                f"live_value: фазы разные fast={fast_phase_num} "
+                f"slow={slow_phase_num}"
+            )
+            return None
+
+        set_key = f"set_{slow_phase_num}"
+        slow_markets = slow_set_markets.get(set_key, {}) or {}
+        fast_markets = fast_set_markets.get(set_key, {}) or {}
+
+        if not slow_markets or not fast_markets:
+            return None
+
+        only = strategy.get('only_markets') or ['winner', 'total', 'handicap']
+        min_edge = float(strategy.get('min_edge_percent', 5.0)) / 100.0
+        min_odds = float(strategy.get('min_odds', 1.30))
+        max_odds = float(strategy.get('max_odds', 5.0))
+
+        candidates = []
+
+        # ── WINNER ──
+        if 'winner' in only:
+            sw = slow_markets.get('winner', {}) or {}
+            fw = fast_markets.get('winner', {}) or {}
+            for side in ('1', '2'):
+                so = sw.get(side)
+                fo = fw.get(side)
+                if not so or not fo or fo <= 1.01:
+                    continue
+                if not (min_odds <= so <= max_odds):
+                    continue
+                edge = so / fo - 1
+                if edge >= min_edge:
+                    candidates.append({
+                        'market': 'winner',
+                        'side': side,
+                        'odd': float(so),
+                        'fast_odd': float(fo),
+                        'edge': edge,
+                        'set_number': slow_phase_num,
+                        'reason': (f"LV winner {side}: "
+                                   f"slow {so:.2f} / fast {fo:.2f} "
+                                   f"= +{edge*100:.1f}%"),
+                    })
+
+        # ── TOTAL (линия должна совпадать) ──
+        if 'total' in only:
+            st = slow_markets.get('total', {}) or {}
+            ft = fast_markets.get('total', {}) or {}
+            slow_line = float(st.get('line', 0) or 0)
+            fast_line = float(ft.get('line', 0) or 0)
+            if slow_line > 0 and abs(slow_line - fast_line) < 0.01:
+                for side in ('over', 'under'):
+                    so = st.get(side)
+                    fo = ft.get(side)
+                    if not so or not fo or fo <= 1.01:
+                        continue
+                    if not (min_odds <= so <= max_odds):
+                        continue
+                    edge = so / fo - 1
+                    if edge >= min_edge:
+                        candidates.append({
+                            'market': 'total',
+                            'side': side,
+                            'odd': float(so),
+                            'fast_odd': float(fo),
+                            'edge': edge,
+                            'set_number': slow_phase_num,
+                            'line': slow_line,
+                            'reason': (f"LV total {side} {slow_line}: "
+                                       f"slow {so:.2f} / fast {fo:.2f} "
+                                       f"= +{edge*100:.1f}%"),
+                        })
+
+        # ── HANDICAP (линия должна совпадать) ──
+        if 'handicap' in only:
+            sh = slow_markets.get('handicap', {}) or {}
+            fh = fast_markets.get('handicap', {}) or {}
+            for side in ('1', '2'):
+                ss = sh.get(side, {}) or {}
+                fs = fh.get(side, {}) or {}
+                so = ss.get('odd')
+                fo = fs.get('odd')
+                sl = float(ss.get('line', 0) or 0)
+                fl = float(fs.get('line', 0) or 0)
+                if not so or not fo or fo <= 1.01:
+                    continue
+                if abs(sl - fl) > 0.01:
+                    continue
+                if not (min_odds <= so <= max_odds):
+                    continue
+                edge = so / fo - 1
+                if edge >= min_edge:
+                    candidates.append({
+                        'market': 'handicap',
+                        'side': side,
+                        'odd': float(so),
+                        'fast_odd': float(fo),
+                        'edge': edge,
+                        'set_number': slow_phase_num,
+                        'line': sl,
+                        'reason': (f"LV handicap {side} {sl}: "
+                                   f"slow {so:.2f} / fast {fo:.2f} "
+                                   f"= +{edge*100:.1f}%"),
+                    })
+
+        # ── IT (линия + игрок должны совпадать) ──
+        if 'it' in only:
+            sit = slow_markets.get('it', {}) or {}
+            fit = fast_markets.get('it', {}) or {}
+            for player in ('1', '2'):
+                sp = sit.get(player, {}) or {}
+                fp = fit.get(player, {}) or {}
+                sl = float(sp.get('line', 0) or 0)
+                fl = float(fp.get('line', 0) or 0)
+                if sl <= 0 or abs(sl - fl) > 0.01:
+                    continue
+                for side in ('over', 'under'):
+                    so = sp.get(side)
+                    fo = fp.get(side)
+                    if not so or not fo or fo <= 1.01:
+                        continue
+                    if not (min_odds <= so <= max_odds):
+                        continue
+                    edge = so / fo - 1
+                    if edge >= min_edge:
+                        candidates.append({
+                            'market': 'it',
+                            'side': f'{player}_{side}',
+                            'player': player,
+                            'direction': side,
+                            'odd': float(so),
+                            'fast_odd': float(fo),
+                            'edge': edge,
+                            'set_number': slow_phase_num,
+                            'line': sl,
+                            'reason': (f"LV it{player} {side} {sl}: "
+                                       f"slow {so:.2f} / fast {fo:.2f} "
+                                       f"= +{edge*100:.1f}%"),
+                        })
+
+        # ── ODD (чёт/нечёт) ──
+        if 'odd' in only:
+            so_m = slow_markets.get('odd', {}) or {}
+            fo_m = fast_markets.get('odd', {}) or {}
+            for side in ('even', 'odd'):
+                so = so_m.get(side)
+                fo = fo_m.get(side)
+                if not so or not fo or fo <= 1.01:
+                    continue
+                if not (min_odds <= so <= max_odds):
+                    continue
+                edge = so / fo - 1
+                if edge >= min_edge:
+                    candidates.append({
+                        'market': 'odd',
+                        'side': side,
+                        'odd': float(so),
+                        'fast_odd': float(fo),
+                        'edge': edge,
+                        'set_number': slow_phase_num,
+                        'reason': (f"LV odd {side}: "
+                                   f"slow {so:.2f} / fast {fo:.2f} "
+                                   f"= +{edge*100:.1f}%"),
+                    })
+
+        # ── POINT (следующее очко) ──
+        if 'point' in only:
+            sp_m = slow_markets.get('point', {}) or {}
+            fp_m = fast_markets.get('point', {}) or {}
+            for side in ('1', '2'):
+                so = sp_m.get(side)
+                fo = fp_m.get(side)
+                if not so or not fo or fo <= 1.01:
+                    continue
+                if not (min_odds <= so <= max_odds):
+                    continue
+                edge = so / fo - 1
+                if edge >= min_edge:
+                    candidates.append({
+                        'market': 'point',
+                        'side': side,
+                        'odd': float(so),
+                        'fast_odd': float(fo),
+                        'edge': edge,
+                        'set_number': slow_phase_num,
+                        'reason': (f"LV point {side}: "
+                                   f"slow {so:.2f} / fast {fo:.2f} "
+                                   f"= +{edge*100:.1f}%"),
+                    })
+
+        if not candidates:
+            logger.debug(
+                f"live_value: нет кандидатов (phase={slow_phase_num}, "
+                f"only={only}, min_edge={min_edge*100:.1f}%)"
+            )
+            return None
+
+        # Максимальный edge
+        best = max(candidates, key=lambda c: c['edge'])
+        logger.info(
+            f"💎 live_value best: {best['market']} {best['side']} "
+            f"@ {best['odd']:.2f} (fast {best['fast_odd']:.2f}) "
+            f"edge={best['edge']*100:.1f}%"
+        )
+        return best
+    # ============================================================
     # Монитор
     # ============================================================
     async def _monitor_loop(self, match_id: str, payload: dict, strategy: dict,
@@ -2309,56 +3070,76 @@ class AfterGoalEngine:
 
             current_payload = self._monitoring_payloads.get(match_id, payload)
             current_strategy = self._monitoring_strategies.get(match_id, strategy)
-
-            is_open, reason = self._verify_delay_still_open(
-                data, current_payload, current_strategy, fast_state
-            )
-            logger.info(f"🔍 delay_still_open={is_open} ({reason})")
+            strategy_type = (current_strategy.get('type') or '').lower()
 
             teams_ui = current_payload.get('match_teams', ['?', '?'])
-            prev_ui = self._last_ui_state.get(match_id)
-            cur_ui = (tuple(fast_sub), tuple(slow_sub), is_open)
-            if prev_ui != cur_ui:
-                self._last_ui_state[match_id] = cur_ui
-                if is_open:
-                    log_bus.match_event(
-                        bk=slow_bk, match_id=match_id, teams=teams_ui,
-                        message=f"✅ Задержка подтверждена: fast "
-                                f"{fast_sub[0]}:{fast_sub[1]} / slow "
-                                f"{slow_sub[0]}:{slow_sub[1]} · {reason}",
-                        level="success",
-                    )
-                else:
-                    log_bus.match_event(
-                        bk=slow_bk, match_id=match_id, teams=teams_ui,
-                        message=f"⏸ Задержки нет: fast {fast_sub[0]}:{fast_sub[1]} "
-                                f"/ slow {slow_sub[0]}:{slow_sub[1]} · {reason}",
-                        level="info",
-                        level3=True,
-                    )
 
-            if not is_open:
-                return
+            if strategy_type == 'live-value':
+                # ── Live-value: сравнение кэфов fast vs slow ──
+                best_bet = self._choose_live_value_bet(
+                    data, current_strategy, current_payload
+                )
+                if not best_bet:
+                    return
 
-            prev_phase_name = (current_payload.get('fast_prev_phase') or '').strip()
-            fast_prev_sub = current_payload.get('fast_prev_sub_score') or [0, 0]
+                log_bus.match_event(
+                    bk=slow_bk, match_id=match_id, teams=teams_ui,
+                    message=f"💎 LV: {best_bet['market']} {best_bet['side']} "
+                            f"@ {best_bet['odd']:.2f} "
+                            f"(fast {best_bet.get('fast_odd', 0):.2f}) "
+                            f"edge +{best_bet['edge']*100:.1f}%",
+                    level="success",
+                )
+            else:
+                # ── After-goal (старое поведение) ──
+                is_open, reason = self._verify_delay_still_open(
+                    data, current_payload, current_strategy, fast_state
+                )
+                logger.info(f"🔍 delay_still_open={is_open} ({reason})")
 
-            best_bet = self._choose_best_bet(
-                data, current_strategy, current_payload,
-                fast_sub, fast_prev_sub, prev_phase_name,
-                fast_score, slow_score
-            )
-            logger.info(f"🎯 best_bet={best_bet}")
-            if not best_bet:
-                return
+                prev_ui = self._last_ui_state.get(match_id)
+                cur_ui = (tuple(fast_sub), tuple(slow_sub), is_open)
+                if prev_ui != cur_ui:
+                    self._last_ui_state[match_id] = cur_ui
+                    if is_open:
+                        log_bus.match_event(
+                            bk=slow_bk, match_id=match_id, teams=teams_ui,
+                            message=f"✅ Задержка подтверждена: fast "
+                                    f"{fast_sub[0]}:{fast_sub[1]} / slow "
+                                    f"{slow_sub[0]}:{slow_sub[1]} · {reason}",
+                            level="success",
+                        )
+                    else:
+                        log_bus.match_event(
+                            bk=slow_bk, match_id=match_id, teams=teams_ui,
+                            message=f"⏸ Задержки нет: fast {fast_sub[0]}:{fast_sub[1]} "
+                                    f"/ slow {slow_sub[0]}:{slow_sub[1]} · {reason}",
+                            level="info",
+                            level3=True,
+                        )
 
-            log_bus.match_event(
-                bk=slow_bk, match_id=match_id, teams=teams_ui,
-                message=f"🎯 Выбор: {best_bet['market']} {best_bet['side']} "
-                        f"@ {best_bet['odd']:.2f} · фаза {best_bet['set_number']} "
-                        f"· {best_bet.get('reason', '')}",
-                level="success",
-            )
+                if not is_open:
+                    return
+
+                prev_phase_name = (current_payload.get('fast_prev_phase') or '').strip()
+                fast_prev_sub = current_payload.get('fast_prev_sub_score') or [0, 0]
+
+                best_bet = self._choose_best_bet(
+                    data, current_strategy, current_payload,
+                    fast_sub, fast_prev_sub, prev_phase_name,
+                    fast_score, slow_score
+                )
+                logger.info(f"🎯 best_bet={best_bet}")
+                if not best_bet:
+                    return
+
+                log_bus.match_event(
+                    bk=slow_bk, match_id=match_id, teams=teams_ui,
+                    message=f"🎯 Выбор: {best_bet['market']} {best_bet['side']} "
+                            f"@ {best_bet['odd']:.2f} · фаза {best_bet['set_number']} "
+                            f"· {best_bet.get('reason', '')}",
+                    level="success",
+                )
 
             phase_key = (match_id, best_bet['set_number'])
             if self._bets_by_phase.get(phase_key, 0) >= max_bets_per_phase:

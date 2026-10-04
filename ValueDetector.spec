@@ -20,8 +20,10 @@ hiddenimports = [
     'fastapi',
     'pydantic',
     'httpx',
+    'httpcore',
     'curl_cffi',
     'requests',
+    'websockets',
 
     # Qt
     'PyQt5.QtWebSockets',
@@ -35,10 +37,22 @@ hiddenimports = [
 hiddenimports += collect_submodules('playwright')
 hiddenimports += collect_submodules('pyee')
 hiddenimports += collect_submodules('greenlet')
+hiddenimports += collect_submodules('websockets')
+hiddenimports += collect_submodules('httpx')
+hiddenimports += collect_submodules('httpcore')
 
 # Все модули проекта — все подмодули каждого пакета
 for pkg in ('ui', 'ui.after_goal', 'ui.components', 'ui.pages', 'core', 'parsers'):
     hiddenimports += collect_submodules(pkg)
+
+# Явно — новые модули, импортируемые лениво
+hiddenimports += [
+    'core.fast_client',
+    'core.fast_config',
+    'core.fast_cookie_collector',
+    'core.adspower_launcher',
+    'ui.fast_cookie_runner',
+]
 
 
 # ===== ФАЙЛЫ ДАННЫХ =====

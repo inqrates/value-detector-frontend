@@ -14,6 +14,13 @@ VALID_SPORTS = {
 
 VALID_MARKET_MODES = {"auto", "manual"}
 VALID_AUTO_CRITERIA = {"reliable", "max_odds", "all_confirmed"}
+# ── Типы стратегий ──
+VALID_TYPES = {"after-goal", "live-value"}
+
+# ── Рынки, которые можно сравнивать в live-value ──
+LIVE_VALUE_MARKETS = [
+    "winner", "total", "handicap", "it", "odd", "point"
+]
 
 # Все возможные рынки (для manual галочек)
 ALL_MARKETS = [
@@ -192,6 +199,10 @@ def _default(name, stype, enabled, profile_id="", bk="", sport="table_tennis"):
         # ── Автоматизация ──
         "max_bets_per_session": 0,
         "headless": False,
+
+        # ── Live-value ──
+        "min_edge_percent": 5.0,
+        "only_markets": ["winner", "total", "handicap"],
     }
 
 
@@ -339,7 +350,32 @@ class StrategyStore:
             for dead in DEAD_FIELDS:
                 s.pop(dead, None)
 
-            if s.get('type', '').lower() == 'after-goal':
+            # ── Live-value поля ──
+            if 'min_edge_percent' not in s:
+                s['min_edge_percent'] = 5.0
+            else:
+                try:
+                    s['min_edge_percent'] = max(0.5, min(50.0,
+                        float(s['min_edge_percent'])))
+                except (ValueError, TypeError):
+                    s['min_edge_percent'] = 5.0
+
+            if 'only_markets' not in s or not isinstance(s['only_markets'], list):
+                s['only_markets'] = ["winner", "total", "handicap"]
+            else:
+                s['only_markets'] = [
+                    m for m in s['only_markets'] if m in LIVE_VALUE_MARKETS
+                ] or ["winner"]
+
+            # Проверка типа
+            t = (s.get('type') or '').lower()
+            if t not in VALID_TYPES:
+                # Невалидный тип (Value, Arbitrage, Corridor из дефолтов) —
+                # приводим к After-goal, чтобы стратегия работала.
+                s['type'] = 'After-goal'
+                t = 'after-goal'
+
+            if t == 'after-goal':
                 s.setdefault('profile_id', '')
 
         self.save()
@@ -381,7 +417,8 @@ class StrategyStore:
         for s in self.strategies:
             if not s.get('enabled'):
                 continue
-            if s.get('type', '').lower() != 'after-goal':
+            # Сигнал релевантен и для Послегола, и для Лайв-Валуя
+            if (s.get('type') or '').lower() not in ('after-goal', 'live-value'):
                 continue
             if _normalize_bk(s.get('bk', '')) != _normalize_bk(payload.get('slow_bk', '')):
                 continue
@@ -398,7 +435,8 @@ class StrategyStore:
         for s in self.strategies:
             if not s.get('enabled'):
                 continue
-            if s.get('type', '').lower() != 'after-goal':
+            # Сигнал релевантен и для Послегола, и для Лайв-Валуя
+            if (s.get('type') or '').lower() not in ('after-goal', 'live-value'):
                 continue
             if _normalize_bk(s.get('bk', '')) != _normalize_bk(payload.get('slow_bk', '')):
                 continue
@@ -423,3 +461,17 @@ class StrategyStore:
                 continue
             result.append(s)
         return result
+
+
+def get_live_value_strategy_for_bk(store, slow_bk: str) -> Optional[dict]:
+    """
+    Возвращает первую включённую live-value стратегию под указанную slow_bk.
+    """
+    for s in store.strategies:
+        if not s.get('enabled'):
+            continue
+        if (s.get('type') or '').lower() != 'live-value':
+            continue
+        if _normalize_bk(s.get('bk', '')) == _normalize_bk(slow_bk):
+            return s
+    return None

@@ -38,11 +38,13 @@ SPORT_SHORT = {
 }
 
 TYPE_CHOICES = {
-    "Послегол": "After-goal",
+    "Послегол":    "After-goal",
+    "Валуй-Live":  "live-value",
 }
 TYPE_DISPLAY = {v: k for k, v in TYPE_CHOICES.items()}
 TYPE_DISPLAY_FULL = {
     "After-goal": "Послегол",
+    "live-value": "Live-value",
 }
 
 # Понятные названия для рынков — для warning'ов
@@ -421,7 +423,7 @@ class StrategiesPage(QWidget):
         race_hint.setWordWrap(True)
         what_layout.addWidget(race_hint)
 
-        # ── Обновление видимости ──
+        # ── Обновление видимости «Что ставить» ──
         def _update_market_mode():
             is_auto = self.market_mode_auto.isChecked()
             self.auto_criterion_group.setVisible(is_auto)
@@ -431,6 +433,74 @@ class StrategiesPage(QWidget):
         _update_market_mode()
 
         right.addWidget(what_group)
+
+        # ---- Live-value параметры ----
+        self.live_value_group = QGroupBox("Параметры Live-value")
+        lv_form = QFormLayout(self.live_value_group)
+        lv_form.setSpacing(10)
+        _make_field_grow(lv_form)
+
+        self.lv_min_edge = QDoubleSpinBox()
+        self.lv_min_edge.setRange(0.5, 50.0)
+        self.lv_min_edge.setSingleStep(0.5)
+        self.lv_min_edge.setSuffix(" %")
+        self.lv_min_edge.setValue(5.0)
+        self.lv_min_edge.setToolTip(
+            "Минимальная разница между кэфом slow и fast, при которой\n"
+            "считаем что есть валуй.\n\n"
+            "edge = (slow_odd / fast_odd - 1) × 100%\n\n"
+            "Пример: slow=2.05, fast=1.75 → edge=17%"
+        )
+        lv_form.addRow("Минимальный edge:", self.lv_min_edge)
+
+        lv_hint = QLabel(
+            "Сравниваются внутриматчевые кэфы (партии) fast и slow.\n"
+            "Fast-БК берётся автоматически из сигнала бэкенда."
+        )
+        lv_hint.setWordWrap(True)
+        lv_hint.setProperty("class", "hintLabel")
+        lv_form.addRow("", lv_hint)
+
+        markets_label = QLabel("Рынки для сравнения:")
+        markets_label.setStyleSheet(
+            "color: rgba(245,249,252,0.85); font-size: 12px; font-weight: 600;")
+        lv_form.addRow(markets_label)
+
+        # Чекбоксы рынков
+        lv_markets_widget = QWidget()
+        lv_markets_layout = QVBoxLayout(lv_markets_widget)
+        lv_markets_layout.setContentsMargins(20, 0, 0, 0)
+        lv_markets_layout.setSpacing(4)
+
+        self.lv_market_cbs = {}
+        for code, label in [
+            ("winner", "Победитель партии"),
+            ("total", "Тотал партии"),
+            ("handicap", "Фора партии"),
+            ("it", "Индивидуальный тотал"),
+            ("odd", "Чёт/Нечёт партии"),
+            ("point", "Следующее очко"),
+        ]:
+            cb = QCheckBox(label)
+            cb.setChecked(code in ("winner", "total", "handicap"))
+            self.lv_market_cbs[code] = cb
+            lv_markets_layout.addWidget(cb)
+
+        lv_form.addRow(lv_markets_widget)
+
+        right.addWidget(self.live_value_group)
+
+        # ── Видимость Live-value блока ──
+        # ВАЖНО: вызываем ПОСЛЕ создания self.live_value_group
+        def _update_type_visibility():
+            t = TYPE_CHOICES.get(self.strategy_type.currentText(), "After-goal")
+            is_live_value = (t == "live-value")
+            self.live_value_group.setVisible(is_live_value)
+
+        self.strategy_type.currentTextChanged.connect(
+            lambda _: _update_type_visibility()
+        )
+        _update_type_visibility()
 
         # ---- Банкролл / ставка ----
         bank_group = QGroupBox("Ставка")
@@ -683,6 +753,20 @@ class StrategiesPage(QWidget):
             bool(st.get("race_enabled", False))
         )
 
+        # ── Live-value поля ──
+        try:
+            self.lv_min_edge.setValue(float(st.get("min_edge_percent", 5.0)))
+        except (ValueError, TypeError):
+            self.lv_min_edge.setValue(5.0)
+
+        only = set(st.get("only_markets") or ["winner", "total", "handicap"])
+        for code, cb in self.lv_market_cbs.items():
+            cb.setChecked(code in only)
+
+        # Обновить видимость группы
+        t = (st.get("type") or "").lower()
+        self.live_value_group.setVisible(t == "live-value")
+
         thresholds = st.get("market_thresholds") or {}
         self.spin_winner_thr.setValue(int(thresholds.get("winner", 2)))
         self.spin_total_thr.setValue(int(thresholds.get("total", 1)))
@@ -770,6 +854,12 @@ class StrategiesPage(QWidget):
         st["manual_markets"] = manual
 
         st["race_enabled"] = self.cb_race_enabled.isChecked()
+
+        # ── Live-value поля ──
+        st["min_edge_percent"] = self.lv_min_edge.value()
+        st["only_markets"] = [
+            code for code, cb in self.lv_market_cbs.items() if cb.isChecked()
+        ] or ["winner"]
 
         # ставка
         st["bet_size"] = self.bet_size.value()

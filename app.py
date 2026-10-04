@@ -38,6 +38,9 @@ def main():
     app.setPalette(create_dark_palette())
     app.setStyleSheet(APP_STYLE)
 
+    # ── Автозапуск AdsPower в headless ──
+    _try_start_adspower_headless(app)
+
     # ---- Single-instance через QLockFile ----
     # Не даём запустить второй экземпляр, пока жив первый.
     # QLockFile сам определяет stale lock (умерший процесс).
@@ -99,6 +102,89 @@ def main():
     # QWebSocket, AdsPower) убьётся вместе с процессом.
     os._exit(0)
 
+def _try_start_adspower_headless(app):
+    """
+    Пытается поднять AdsPower в headless при старте.
+    Не блокирует UI: если долго — показывает статус, но продолжает.
+    """
+    from core.fast_config import (
+        get_fast_api_key, get_adspower_exe_path,
+        set_adspower_exe_path, load_fast_config,
+    )
+
+    cfg = load_fast_config()
+    api_key = (cfg.get("api_key") or "").strip()
+
+    # Нет API-ключа — значит fast-профиль не настроен.
+    # Ничего не запускаем, пользователь сам разберётся позже.
+    if not api_key:
+        logging.getLogger(__name__).info(
+            "AdsPower headless: API-ключ не задан, пропускаем автозапуск"
+        )
+        return
+
+    saved_exe = get_adspower_exe_path()
+
+    # Проверяем, живой ли уже API — быстро и без блокировки
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    from core.adspower_launcher import (
+        ensure_adspower_running, is_api_alive, find_adspower_exe,
+    )
+
+    # Быстрая проверка (2 сек таймаут) — не блокирует UI надолго
+    try:
+        if loop.is_running():
+            # Если loop уже работает (qasync) — создаём task
+            asyncio.ensure_future(
+                _do_start_adspower(api_key, saved_exe)
+            )
+        else:
+            # Иначе — короткий blocking-вызов, максимум 2 сек
+            already = loop.run_until_complete(is_api_alive(timeout=2.0))
+            if not already:
+                asyncio.ensure_future(
+                    _do_start_adspower(api_key, saved_exe)
+                )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"AdsPower autostart: {e}")
+
+
+async def _do_start_adspower(api_key: str, saved_exe: str):
+    """Фоновая задача: поднять AdsPower, если ещё не поднят."""
+    import logging
+    from core.adspower_launcher import (
+        ensure_adspower_running, find_adspower_exe,
+    )
+    from core.fast_config import set_adspower_exe_path
+
+    log = logging.getLogger(__name__)
+
+    exe = saved_exe or find_adspower_exe()
+    if not exe:
+        log.warning(
+            "AdsPower: .exe не найден. Пользователь должен указать путь "
+            "в настройках."
+        )
+        return
+
+    # Сохраняем путь, если он не был сохранён
+    if not saved_exe and exe:
+        set_adspower_exe_path(exe)
+
+    result = await ensure_adspower_running(api_key=api_key, exe_path=exe)
+    if result["ok"]:
+        if result["started"]:
+            log.info("✅ AdsPower запущен в headless")
+        else:
+            log.info("✅ AdsPower API уже доступен")
+    else:
+        log.warning(f"⚠️ AdsPower autostart: {result['reason']}")
 
 if __name__ == "__main__":
     main()
