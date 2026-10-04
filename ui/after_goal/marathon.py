@@ -15,7 +15,6 @@ Marathon handler — instance-based.
 MTCH_CS) игнорируются.
 
 У Marathon в лайв-ленте НТ НЕТ рынка «N-е очко» и НЕТ RACE.
-Ветка MTCH_POINT/NP оставлена на случай, если когда-нибудь появится.
 """
 import asyncio
 import json
@@ -73,15 +72,14 @@ class MarathonHandler(BookmakerHandler):
         self.target_teams = list(target_teams or [])
         self._page: Optional[Page] = None
         self._callback: Optional[Callable] = None
-        self._warned_missing = set()      # рынки, о которых уже предупредили
-        self._warned_phase = None         # для какой фазы актуальны предупреждения
-        self._snapshot: Optional[dict] = None  # кэш последнего полного снапшота
+        self._warned_missing = set()
+        self._warned_phase = None
+        self._snapshot: Optional[dict] = None
 
     # ============================================================
-    # prepare_page
+    # prepare_page — вызвать ДО page.goto()
     # ============================================================
     async def prepare_page(self, page: Page):
-        """Регистрирует Python-bridge и вешает JS-хук. Вызывать ДО page.goto()."""
         try:
             await page.expose_function(
                 "__marathon_on_sse",
@@ -112,7 +110,6 @@ class MarathonHandler(BookmakerHandler):
         self._warned_phase = None
         self._snapshot = None
 
-        # ── Баланс ──
         async def on_resp_balance(response: Response):
             url = response.url
             if '/client-gate/heartbeat' not in url:
@@ -155,7 +152,7 @@ class MarathonHandler(BookmakerHandler):
                         and str(data.get("treeId")) != self.target_match_id):
                     return
                 self._snapshot = data
-                parsed = self.parse_update(data)
+                parsed = self._parse_event(data)
                 if parsed and self._callback:
                     self._check_missing_markets(parsed)
                     await self._callback(parsed)
@@ -171,15 +168,13 @@ class MarathonHandler(BookmakerHandler):
                                 and str(event.get("treeId")) != self.target_match_id):
                             continue
                         self._snapshot = event
-                        parsed = self.parse_update(event)
+                        parsed = self._parse_event(event)
                         if parsed and self._callback:
                             self._check_missing_markets(parsed)
                             await self._callback(parsed)
                 return
 
             # ── В: список изменений ──
-            # Тут приходят как полные снапшоты, так и diff-кадры
-            # вида [{"path":[{"inObj":"matchScore"}],"value":{...}}].
             if isinstance(data, list):
                 score_changed = False
                 for change in data:
@@ -196,15 +191,13 @@ class MarathonHandler(BookmakerHandler):
                                 and str(value.get("treeId")) != self.target_match_id):
                             continue
                         self._snapshot = value
-                        parsed = self.parse_update(value)
+                        parsed = self._parse_event(value)
                         if parsed and self._callback:
                             self._check_missing_markets(parsed)
                             await self._callback(parsed)
                         continue
 
-                    # В.2 — diff только по счёту:
-                    # обновляем matchScore в кэше, полный снапшот рынков
-                    # переиспользуем (линии не менялись)
+                    # В.2 — diff по счёту: обновляем matchScore в кэше
                     if (isinstance(path, list) and path
                             and isinstance(path[0], dict)
                             and path[0].get("inObj") == "matchScore"
@@ -213,9 +206,9 @@ class MarathonHandler(BookmakerHandler):
                         self._snapshot["matchScore"] = value
                         score_changed = True
 
-                # После сбора всех диффов — один колбэк со свежим счётом
+                # После всех диффов — один колбэк со свежим счётом
                 if score_changed and self._snapshot is not None:
-                    parsed = self.parse_update(self._snapshot)
+                    parsed = self._parse_event(self._snapshot)
                     if parsed and self._callback:
                         await self._callback(parsed)
                 return
@@ -229,24 +222,18 @@ class MarathonHandler(BookmakerHandler):
     # Диагностика отсутствующих рынков
     # ============================================================
     def _check_missing_markets(self, parsed: dict):
-        """
-        Логирует отсутствие ожидаемых рынков в текущей фазе.
-        Предупреждения сбрасываются при смене фазы.
-        """
         sm = parsed.get("set_markets") or {}
         phase = parsed.get("phase_num")
         set_key = f"set_{phase}" if phase else None
         if not set_key:
             return
 
-        # Сброс при смене фазы
         if phase != self._warned_phase:
             self._warned_missing = set()
             self._warned_phase = phase
 
         markets = sm.get(set_key, {})
-
-        expected = ["winner", "total", "handicap", "odd", "it", "point"]
+        expected = ["winner", "total", "handicap", "odd", "it"]
         missing = [k for k in expected if k not in markets]
 
         if missing:
@@ -260,10 +247,9 @@ class MarathonHandler(BookmakerHandler):
                 self._warned_missing.update(new_missing)
 
     # ============================================================
-    # Парсер снапшота
+    # Парсер события
     # ============================================================
-    @staticmethod
-    def parse_update(data: dict) -> Optional[dict]:
+    def _parse_event(self, data: dict) -> Optional[dict]:
         try:
             tree_id = data.get("treeId")
             event_id = data.get("eventId")
@@ -300,7 +286,20 @@ class MarathonHandler(BookmakerHandler):
 
             phase = data.get("phase", {}) or {}
             set_num = int(phase.get("partNumber") or 1)
+
+            # Фоллбэк: если partNumber нет — считаем по сыгранным частям + 1
             parts = ms.get("parts", []) or []
+            if not set_num and parts:
+                for i in range(len(parts) - 1, -1, -1):
+                    p = parts[i] or {}
+                    try:
+                        if int(p.get("home", 0)) > 0 or int(p.get("away", 0)) > 0:
+                            set_num = i + 1
+                            break
+                    except Exception:
+                        pass
+            if not set_num:
+                set_num = 1
 
             sub1, sub2 = 0, 0
             if parts and len(parts) >= set_num:
@@ -372,13 +371,6 @@ class MarathonHandler(BookmakerHandler):
                     if mm6:
                         kind = "odd"
                         m_set = int(mm6.group(1))
-
-                # POINT: MTCH_POINT{N} или MTCH_NP{N} — на НТ обычно нет
-                elif re.match(r"^MTCH_(POINT|NP)\d+$", model):
-                    mm7 = re.search(r"MTCH_(?:POINT|NP)(\d+)", model)
-                    if mm7:
-                        kind = "point"
-                        m_set = int(mm7.group(1))
 
                 if not kind or not m_set:
                     continue
@@ -475,7 +467,7 @@ class MarathonHandler(BookmakerHandler):
                                     **outcome, "line": line,
                                 }
 
-                    # ── IT (индивидуальный тотал игрока) ──
+                    # ── IT ──
                     elif kind == "it" and player:
                         lower = sel_name.lower()
                         side = None
@@ -505,28 +497,12 @@ class MarathonHandler(BookmakerHandler):
                             .setdefault("odd", {})
                         oi = outcome_ids.setdefault(set_key, {}) \
                             .setdefault("odd", {})
-                        # «нечет» проверяем РАНЬШЕ «чет» — иначе "нечет"
-                        # матчится и на "чет". Поддержка "ё" и без.
                         if "нечет" in lower or "нечёт" in lower:
                             om["odd"] = odds
                             oi["odd"] = outcome
                         elif "чет" in lower or "чёт" in lower:
                             om["even"] = odds
                             oi["even"] = outcome
-
-                    # ── POINT (следующее очко) — у НТ Marathon обычно нет ──
-                    elif kind == "point":
-                        side = None
-                        if player1 and player1 in sel_name:
-                            side = "1"
-                        elif player2 and player2 in sel_name:
-                            side = "2"
-                        if side:
-                            pm = set_markets.setdefault(set_key, {}) \
-                                .setdefault("point", {})
-                            pm[side] = odds
-                            outcome_ids.setdefault(set_key, {}) \
-                                .setdefault("point", {})[side] = outcome
 
             if not set_markets:
                 return None
@@ -548,7 +524,7 @@ class MarathonHandler(BookmakerHandler):
             }
 
         except Exception as e:
-            logger.error(f"Marathon parse_update: {e}", exc_info=True)
+            logger.error(f"Marathon parse: {e}", exc_info=True)
             return None
 
     # ============================================================
@@ -556,26 +532,18 @@ class MarathonHandler(BookmakerHandler):
     # ============================================================
     @staticmethod
     async def place_bet(page: Page, bet_data: dict) -> dict:
-        """
-        POST /client-gate/betting/place-bets
-        + при статусе LIVE_DELAY — /client-gate/betting/complete-bet-ticket
-        """
         script = f"""
         (async function() {{
             const d = {json.dumps(bet_data)};
-
             const getCookie = (n) => {{
                 const m = document.cookie.match(
                     new RegExp('(^|; )' + n + '=([^;]*)')
                 );
                 return m ? decodeURIComponent(m[2]) : '';
             }};
-
             const punterHash = getCookie('punter-session-hash');
-
             const den = 10000;
             const num = Math.round(den * (d.odds - 1));
-
             const headers = {{
                 'Content-Type': 'application/json',
                 'Accept': '*/*',
@@ -586,7 +554,6 @@ class MarathonHandler(BookmakerHandler):
                 'x-pan-version': 'MOBILE-SSR-2.7.1'
             }};
             if (punterHash) headers['punter-session-hash'] = punterHash;
-
             const placeBody = {{
                 bets: [{{
                     type: 'SINGLE',
@@ -600,85 +567,59 @@ class MarathonHandler(BookmakerHandler):
                 betPlacingMode: 'EqualsToCurrent',
                 oneClick: false
             }};
-
             try {{
                 const placeResp = await fetch(
                     'https://new.marathonbet.ru/client-gate/betting/place-bets',
-                    {{
-                        method: 'POST',
-                        headers,
-                        credentials: 'include',
-                        body: JSON.stringify(placeBody)
-                    }}
+                    {{ method: 'POST', headers, credentials: 'include',
+                       body: JSON.stringify(placeBody) }}
                 );
                 const placeJson = await placeResp.json();
-
                 if (placeJson.status !== 'OK') {{
-                    return {{
-                        success: false,
-                        error: 'place-bets: ' + JSON.stringify(placeJson).slice(0, 400)
-                    }};
+                    return {{ success: false,
+                              error: 'place-bets: ' + JSON.stringify(placeJson).slice(0,400) }};
                 }}
-
                 const payload = placeJson.payload || {{}};
                 const status = payload.status;
                 const code = payload.code;
                 const delay = payload.liveDelayMillis || 0;
-
                 if (status !== 'LIVE_DELAY') {{
                     const results = payload.betPlacingResults || [];
                     if (results.length > 0) {{
                         const r = results[0];
                         if (r.status === 'OK' || r.status === 'ACCEPTED') {{
-                            return {{
-                                success: true,
-                                betId: r.betId || r.ticketId || code || null
-                            }};
+                            return {{ success: true,
+                                      betId: r.betId || r.ticketId || code || null }};
                         }}
-                        return {{ success: false, error: JSON.stringify(r).slice(0, 400) }};
+                        return {{ success: false, error: JSON.stringify(r).slice(0,400) }};
                     }}
                     return {{ success: false, error: 'unknown status: ' + status }};
                 }}
-
                 if (!code) {{
                     return {{ success: false, error: 'LIVE_DELAY без code' }};
                 }}
-
                 await new Promise(r => setTimeout(r, delay + 500));
-
                 const confirmResp = await fetch(
                     'https://new.marathonbet.ru/client-gate/betting/complete-bet-ticket',
-                    {{
-                        method: 'POST',
-                        headers,
-                        credentials: 'include',
-                        body: JSON.stringify({{ code }})
-                    }}
+                    {{ method: 'POST', headers, credentials: 'include',
+                       body: JSON.stringify({{ code }}) }}
                 );
                 const confirmJson = await confirmResp.json();
                 const cPayload = confirmJson.payload || {{}};
                 const cResults = cPayload.betPlacingResults || [];
-
                 if (cResults.length > 0) {{
                     const r = cResults[0];
                     if (r.status === 'OK' || r.status === 'ACCEPTED') {{
-                        return {{ success: true, betId: r.betId || r.ticketId || code }};
+                        return {{ success: true,
+                                  betId: r.betId || r.ticketId || code }};
                     }}
-                    return {{
-                        success: false,
-                        error: 'confirm: ' + JSON.stringify(r).slice(0, 400)
-                    }};
+                    return {{ success: false,
+                              error: 'confirm: ' + JSON.stringify(r).slice(0,400) }};
                 }}
-
                 if (cPayload.status === 'OK' || cPayload.status === 'ACCEPTED') {{
                     return {{ success: true, betId: code }};
                 }}
-
-                return {{
-                    success: false,
-                    error: 'confirm unknown: ' + JSON.stringify(confirmJson).slice(0, 400)
-                }};
-
+                return {{ success: false,
+                          error: 'confirm unknown: ' + JSON.stringify(confirmJson).slice(0,400) }};
             }} catch(e) {{
                 return {{ success: false, error: e.message }};
             }}
