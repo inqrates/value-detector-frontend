@@ -95,35 +95,54 @@ class FonbetHandler(BookmakerHandler):
     @staticmethod
     def _resolve_active_phase(data: dict, root_id: str):
         """
-        Приоритет 1: liveEventInfos.subscores с ненулевым счётом
-        Приоритет 2 (fallback): ПЕРВАЯ партия среди children.
-            Когда liveEventInfos ещё пуст (SPA не разослала subscores
-            для только что стартовавших матчей) — активна первая партия.
+        Возвращает (phase_num, phase_event_id, phase_name, sub1, sub2).
+
+        sub1/sub2 берутся из liveEventInfos.subscores — это структурированный
+        источник от Fonbet (kindName="N-й сет", c1/c2 = точный счёт).
+
+        Если subscores нет — возвращаем sub1=sub2=0 и caller
+        сделает fallback на comment.
         """
+        children = [ev for ev in data.get('events', []) or []
+                    if str(ev.get('parentId')) == str(root_id)]
+        children.sort(key=lambda e: e.get('sortOrder', ''))
+
+        children_by_kind = {}
+        for ch in children:
+            k = ch.get('kind')
+            if k is not None and k not in children_by_kind:
+                children_by_kind[k] = ch
+
+        # ── Приоритет 1: subscore с ненулевым счётом ──
         for info in data.get('liveEventInfos', []) or []:
             if str(info.get('eventId')) != str(root_id):
                 continue
-            subs = info.get('subscores') or []
-            for sub in subs:
+            for sub in info.get('subscores') or []:
                 kind_id = sub.get('kindId')
-                kind_name = sub.get('kindName', '')
                 c1 = int(sub.get('c1', 0) or 0)
                 c2 = int(sub.get('c2', 0) or 0)
-                if c1 > 0 or c2 > 0:
-                    m = re.search(r'(\d+)', kind_name)
-                    if m:
-                        return int(m.group(1)), kind_id, kind_name
-        children = [ev for ev in data.get('events', []) or []
-                    if str(ev.get('parentId')) == str(root_id)]
+                if c1 <= 0 and c2 <= 0:
+                    continue
+
+                ch = children_by_kind.get(kind_id)
+                if not ch:
+                    continue
+
+                name = ch.get('name', '') or sub.get('kindName', '')
+                m = re.search(r'(\d+)', name)
+                if not m:
+                    continue
+
+                return int(m.group(1)), str(ch.get('id')), name, c1, c2
+
+        # ── Приоритет 2: первая партия (без sub) ──
         if children:
-            children.sort(key=lambda e: e.get('sortOrder', ''))
-            # ── Fallback: ПЕРВАЯ партия (а не последняя) ──
             first = children[0]
             name = first.get('name', '')
             m = re.search(r'(\d+)', name)
             if m:
-                return int(m.group(1)), str(first.get('id')), name
-        return 0, None, ''
+                return int(m.group(1)), str(first.get('id')), name, 0, 0
+        return 0, None, '', 0, 0
 
     @staticmethod
     def _parse_phase_factors(factors: list, set_key: str,
@@ -257,22 +276,32 @@ class FonbetHandler(BookmakerHandler):
 
     @staticmethod
     def parse_update(data: dict, match_id: str = None) -> dict:
+        # ── Универсально: поддерживаем оба формата ответа ──
+        #   /ma/events/listBase, /ma/events/list → data['events'] = [...]
+        #   /ma/events/event                     → data['event'] = {...}
+        events_list = data.get('events') or []
+        single_event = data.get('event')
+
+        if single_event and isinstance(single_event, dict):
+            events_list = [single_event] + list(events_list)
+
+        if not events_list:
+            return None
+
         if not match_id:
-            events = data.get('events', [])
-            if events:
-                match_id = str(events[0].get('id'))
-            else:
-                return None
+            match_id = str(events_list[0].get('id'))
 
         event = None
-        for ev in data.get('events', []) or []:
+        for ev in events_list:
             if str(ev.get('id')) == str(match_id):
                 event = ev
                 break
         if not event:
             return None
 
-        phase_num, phase_event_id, phase_name = FonbetHandler._resolve_active_phase(data, match_id)
+        (phase_num, phase_event_id, phase_name,
+         sub_from_subs1, sub_from_subs2) = \
+            FonbetHandler._resolve_active_phase(data, match_id)
 
         misc = None
         for m in data.get('eventMiscs', []) or []:
@@ -289,13 +318,39 @@ class FonbetHandler(BookmakerHandler):
         elif event:
             comment = event.get('comment', '') or ''
 
+        # ── Приоритет 1: sub1/sub2 из subscores ──
+        #  Это структурированный источник, всегда синхронный
+        #  с реальной активной партией.
         sub1, sub2 = 0, 0
-        if comment:
-            pairs = re.findall(r'(\d+)[-:](\d+)', comment)
+        if sub_from_subs1 > 0 or sub_from_subs2 > 0:
+            sub1 = sub_from_subs1
+            sub2 = sub_from_subs2
+        elif comment:
+            # ── Приоритет 2: fallback через comment ──
+            #  Ищем пару со звёздочкой (активная партия).
+            #  Если звёздочки нет — берём pairs[-1] ТОЛЬКО если
+            #  пар ровно столько, сколько ожидается по score.
+            pairs = re.findall(r'(\d+[*]?)-(\d+[*]?)', comment)
             if pairs:
-                last = pairs[-1]
-                sub1 = int(last[0])
-                sub2 = int(last[1])
+                active = None
+                for p in pairs:
+                    if '*' in p[0] or '*' in p[1]:
+                        active = p
+                        break
+
+                if active is None:
+                    expected = (int(misc.get('score1', 0) or 0)
+                                + int(misc.get('score2', 0) or 0)
+                                + 1) if misc else 0
+                    if expected and len(pairs) == expected:
+                        active = pairs[-1]
+
+                if active is not None:
+                    a = active[0].replace('*', '')
+                    b = active[1].replace('*', '')
+                    if a.isdigit() and b.isdigit():
+                        sub1 = int(a)
+                        sub2 = int(b)
 
         set_markets = {}
         outcome_ids = {}

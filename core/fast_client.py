@@ -1,13 +1,18 @@
 # core/fast_client.py
 """
-HTTP-клиенты для получения внутриматчевых кэфов с fast БК.
+HTTP/WS/SSE клиенты для получения внутриматчевых кэфов с fast БК.
 
-Работают по аналогии с бэкенд-парсерами, но в лёгком режиме:
-  - один AsyncSession на БК
-  - кэш raw-ответа N секунд (чтобы 5 матчей не дёргали API 5 раз)
-  - поиск матча по именам игроков
-  - возвращают set_markets в том же формате, что slow-хендлеры
+ВАЖНО (2026-10):
+  Парсинг делегируется в `ui/after_goal/*.py`. Это единый источник
+  правды — те же функции, что уже отлажены в браузерных хендлерах.
 
+  Транспорт у нас свой (HTTP/WS/SSE, без Playwright), но парсинг —
+  общий. Если БК завтра поменяет формат, правим в одном месте.
+
+  Для Betcity это автоматически даёт поддержку баскета:
+  `BetcityHandler._parse_event` сам выбирает `_parse_nt_markets`
+  (НТ, mid 35/905/913) или `_parse_phase_markets` (баскет/волейбол,
+  rows с num_per и ext['779'] "Исходы по четвертям").
 """
 import asyncio
 import json
@@ -16,14 +21,25 @@ import re
 import time
 import gzip
 from typing import Optional, Dict, List, Any, Tuple
-import httpx  # в начале файла, если ещё нет
+import httpx
 from curl_cffi.requests import AsyncSession
 import websockets
+
+# ════════════════════════════════════════════════════════════
+# Делегируемые парсеры (единый источник правды)
+# ════════════════════════════════════════════════════════════
+from ui.after_goal.betcity import BetcityHandler
+from ui.after_goal.olimp import OlimpHandler
+from ui.after_goal.marathon import MarathonHandler
+from ui.after_goal.sportbet import SportbetHandler
+from ui.after_goal.fonbet import FonbetHandler
+from ui.after_goal.pari import PariHandler
+
 logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════
-# Нормализация имён (упрощённый аналог core/normalizer.py)
+# Нормализация имён (fallback-поиск)
 # ════════════════════════════════════════════════════════════
 def _normalize_name(name: str) -> str:
     if not name:
@@ -61,6 +77,16 @@ def _players_match(p1a: str, p2a: str, p1b: str, p2b: str) -> bool:
     return direct or cross
 
 
+def _strip_outcome_ids(parsed: Optional[dict]) -> Optional[dict]:
+    """Убирает из результата after_goal то, что fast-клиенту не нужно."""
+    if not parsed:
+        return None
+    parsed.pop("outcome_ids", None)
+    parsed.pop("race_outcome_ids", None)
+    parsed.pop("race_set_markets", None)
+    return parsed
+
+
 # ════════════════════════════════════════════════════════════
 # Базовый класс
 # ════════════════════════════════════════════════════════════
@@ -87,7 +113,6 @@ class FastOddsClient:
                 pass
             self._session = None
 
-    # ── Override в наследниках ──
     async def _build_session(self) -> AsyncSession:
         raise NotImplementedError
 
@@ -95,15 +120,13 @@ class FastOddsClient:
         raise NotImplementedError
 
     def _find_match(self, raw: Any, p1: str, p2: str) -> Optional[dict]:
-        """Возвращает найденное событие (dict) или None."""
         raise NotImplementedError
 
     def _parse(self, raw: Any, event: dict) -> Optional[Dict]:
-        """Собирает итоговый set_markets."""
         raise NotImplementedError
 
-    # ── Публичный API ──
     async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
+        """Базовый fallback по именам (переопределяется в наследниках)."""
         await self.start()
 
         async with self._lock:
@@ -130,12 +153,13 @@ class FastOddsClient:
 
 
 # ════════════════════════════════════════════════════════════
-# Fonbet
+# Fonbet — делегирует в FonbetHandler.parse_update
 # ════════════════════════════════════════════════════════════
 class FonbetFastClient(FastOddsClient):
     bk = "fonbet"
 
-    URL = "https://line-lb54-w.bk6bba-resources.com/ma/events/listBase"
+    EVENT_URL = "https://line-lb54-w.bk6bba-resources.com/ma/events/event"
+    SCOPE = "1600"
 
     HEADERS = {
         "accept": "application/json, text/plain, */*",
@@ -144,19 +168,9 @@ class FonbetFastClient(FastOddsClient):
         "referer": "https://fon.bet/",
     }
 
-    # Коды факторов (см. бэкенд fonbet_api.py и фронт fonbet.py)
-    F_WIN1, F_WIN2 = 921, 923
-    F_TOTAL_OVER, F_TOTAL_UNDER = 930, 931
-    F_HCP1, F_HCP2 = 910, 912
-    F_HCP1_ALT, F_HCP2_ALT = 1845, 1846
-    F_IT1_OVER, F_IT1_UNDER = 974, 976
-    F_IT2_OVER, F_IT2_UNDER = 978, 980
-    F_EVEN, F_ODD = 698, 699
-    F_PT1, F_PT2 = 2393, 2394
-
     def __init__(self):
         super().__init__(timeout=10.0)
-        self._fetch_interval = 2.0   # listBase тяжёлый (~200 KB)
+        self._fetch_interval = 2.0
 
     async def _build_session(self) -> AsyncSession:
         return AsyncSession(
@@ -166,29 +180,16 @@ class FonbetFastClient(FastOddsClient):
         )
 
     async def _fetch_raw(self) -> Optional[Any]:
-        try:
-            r = await self._session.get(
-                self.URL,
-                params={"lang": "ru", "scopeMarket": "1600"},
-            )
-        except Exception as e:
-            logger.warning(f"[fonbet_fast] fetch: {e}")
-            return None
-        if r.status_code != 200:
-            logger.warning(f"[fonbet_fast] HTTP {r.status_code}")
-            return None
-        try:
-            return r.json()
-        except Exception:
-            return None
+        return None
 
-    # ── Запрос по конкретному матчу (eventId из /match_state) ──
-    EVENT_URL = "https://line-lb54-w.bk6bba-resources.com/ma/events/event"
-    SCOPE = "1600"
+    def _find_match(self, raw, p1, p2):
+        return None
+
+    def _parse(self, raw, event):
+        return None
 
     async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
         await self.start()
-
         try:
             r = await self._session.get(
                 self.EVENT_URL,
@@ -203,300 +204,46 @@ class FonbetFastClient(FastOddsClient):
             logger.warning(f"[fonbet_fast] event {native_id}: {e}")
             return None
         if r.status_code != 200:
-            logger.warning(
-                f"[fonbet_fast] event {native_id} HTTP {r.status_code}"
-            )
+            logger.warning(f"[fonbet_fast] event {native_id} HTTP {r.status_code}")
             return None
         try:
             data = r.json()
         except Exception:
             return None
 
+
+
         try:
-            return self._parse_event_response(data, native_id)
+            parsed = FonbetHandler.parse_update(data, str(native_id))
         except Exception as e:
-            logger.warning(f"[fonbet_fast] parse event: {e}", exc_info=True)
+            logger.warning(f"[fonbet_fast] parse: {e}", exc_info=True)
             return None
 
-    def _parse_event_response(self, data: dict, native_id) -> Optional[Dict]:
-        """
-        Разбирает ответ /ma/events/event для конкретного матча.
-        Логика 1-в-1 как у Pari (_parse_event_response), но с
-        factor-кодами Fonbet (910/912, 930/931, 1845/1846, ...).
-        """
-        events = data.get("events") or []
-        miscs = {m.get("id"): m for m in (data.get("eventMiscs") or [])}
-
-        root = None
-        for ev in events:
-            if str(ev.get("id")) == str(native_id):
-                root = ev
-                break
-        if not root:
+        if not parsed:
+            logger.warning(f"[fonbet_fast] native {native_id}: parse_update → None")
             return None
 
-        children = [ev for ev in events
-                    if str(ev.get("parentId")) == str(native_id)]
-        children.sort(key=lambda e: e.get("sortOrder", ""))
-
-        active_child = children[-1] if children else None
-        for info in data.get("liveEventInfos") or []:
-            if str(info.get("eventId")) != str(native_id):
-                continue
-            for sub in info.get("subscores") or []:
-                c1 = int(sub.get("c1", 0) or 0)
-                c2 = int(sub.get("c2", 0) or 0)
-                if c1 == 0 and c2 == 0:
-                    continue
-                mm = re.search(r"(\d+)", sub.get("kindName", "") or "")
-                if not mm:
-                    continue
-                target = int(mm.group(1))
-                for ch in children:
-                    mm2 = re.search(r"(\d+)", ch.get("name", "") or "")
-                    if mm2 and int(mm2.group(1)) == target:
-                        active_child = ch
-                        break
-                break
-            break
-
-        if not active_child:
-            return None
-
-        child_id = str(active_child.get("id"))
-        child_name = active_child.get("name", "") or ""
-        mm = re.search(r"(\d+)", child_name)
-        phase_num = int(mm.group(1)) if mm else 1
-        set_key = f"set_{phase_num}"
-
-        try:
-            native_id_int = int(native_id)
-        except Exception:
-            native_id_int = None
-        misc_root = miscs.get(native_id_int) or {}
-        score1 = int(misc_root.get("score1", 0) or 0)
-        score2 = int(misc_root.get("score2", 0) or 0)
-        comment = misc_root.get("comment", "") or ""
-        sub1, sub2 = self._parse_sub(comment)
-
-        factors: List[dict] = []
-        for block in data.get("customFactors") or []:
-            if str(block.get("e")) == child_id:
-                factors = block.get("factors") or []
-                break
-        if not factors:
-            return None
-
-        by_code = {f.get("f"): f for f in factors if f.get("f") is not None}
-        markets = self._build_markets(by_code)
-        if not markets:
-            return None
+        logger.debug(
+            f"[fonbet_fast] native {native_id}: OK "
+            f"phase={parsed.get('phase_num')} "
+            f"score={parsed.get('score1')}:{parsed.get('score2')} "
+            f"sub={parsed.get('sub_score1')}:{parsed.get('sub_score2')} "
+            f"sets={list((parsed.get('set_markets') or {}).keys())}"
+        )
 
         return {
-            "match_id": str(native_id),
-            "phase_num": phase_num,
-            "score1": score1, "score2": score2,
-            "sub_score1": sub1, "sub_score2": sub2,
-            "set_markets": {set_key: markets},
+            "match_id": parsed.get("match_id"),
+            "phase_num": parsed.get("phase_num", 0),
+            "score1": parsed.get("score1", 0),
+            "score2": parsed.get("score2", 0),
+            "sub_score1": parsed.get("sub_score1", 0),
+            "sub_score2": parsed.get("sub_score2", 0),
+            "set_markets": parsed.get("set_markets", {}),
         }
-
-    def _find_match(self, raw: Any, p1: str, p2: str) -> Optional[dict]:
-        # Ищем корневое событие (без parentId)
-        for ev in raw.get("events") or []:
-            if ev.get("parentId"):
-                continue
-            t1 = ev.get("team1", "") or ev.get("participant1", "")
-            t2 = ev.get("team2", "") or ev.get("participant2", "")
-            if _players_match(p1, p2, t1, t2):
-                return ev
-        return None
-
-    def _parse(self, raw: Any, root: dict) -> Optional[Dict]:
-        root_id = str(root.get("id"))
-
-        # ── Дочерние события (партии) ──
-        children = [ev for ev in (raw.get("events") or [])
-                    if str(ev.get("parentId")) == root_id]
-        if not children:
-            return None
-        children.sort(key=lambda e: e.get("sortOrder", ""))
-
-        # ── Активная партия: из liveEventInfos, иначе последняя ──
-        active = children[-1]
-        for info in raw.get("liveEventInfos") or []:
-            if str(info.get("eventId")) != root_id:
-                continue
-            for sub in info.get("subscores") or []:
-                c1 = int(sub.get("c1", 0) or 0)
-                c2 = int(sub.get("c2", 0) or 0)
-                if c1 == 0 and c2 == 0:
-                    continue
-                mm = re.search(r"(\d+)", sub.get("kindName", "") or "")
-                if not mm:
-                    continue
-                target_num = int(mm.group(1))
-                for ch in children:
-                    mm2 = re.search(r"(\d+)", ch.get("name", "") or "")
-                    if mm2 and int(mm2.group(1)) == target_num:
-                        active = ch
-                        break
-                break
-            break
-
-        child_id = str(active.get("id"))
-        child_name = active.get("name", "") or ""
-        mm = re.search(r"(\d+)", child_name)
-        phase_num = int(mm.group(1)) if mm else 1
-        set_key = f"set_{phase_num}"
-
-        # ── Факторы ──
-        factors: List[dict] = []
-        for block in raw.get("customFactors") or []:
-            if str(block.get("e")) == child_id:
-                factors = block.get("factors") or []
-                break
-        if not factors:
-            return None
-
-        # ── Счёт ──
-        misc = {}
-        for m in raw.get("eventMiscs") or []:
-            if str(m.get("id")) == root_id:
-                misc = m
-                break
-        score1 = int(misc.get("score1", 0) or 0)
-        score2 = int(misc.get("score2", 0) or 0)
-        sub1, sub2 = self._parse_sub(misc.get("comment", "") or "")
-
-        # ── Рынки ──
-        by_code = {f.get("f"): f for f in factors if f.get("f") is not None}
-        markets = self._build_markets(by_code)
-
-        if not markets:
-            return None
-
-        return {
-            "match_id": root_id,
-            "phase_num": phase_num,
-            "score1": score1,
-            "score2": score2,
-            "sub_score1": sub1,
-            "sub_score2": sub2,
-            "set_markets": {set_key: markets},
-        }
-
-    @staticmethod
-    def _parse_sub(comment: str) -> Tuple[int, int]:
-        if not comment:
-            return 0, 0
-        pairs = re.findall(r"(\d+)[-:](\d+)", comment)
-        if pairs:
-            return int(pairs[-1][0]), int(pairs[-1][1])
-        return 0, 0
-
-    def _build_markets(self, by_code: Dict) -> Dict:
-        result: Dict[str, Any] = {}
-
-        # WINNER
-        w1 = by_code.get(self.F_WIN1)
-        w2 = by_code.get(self.F_WIN2)
-        if w1 or w2:
-            w = {}
-            if w1: w["1"] = float(w1.get("v", 0) or 0)
-            if w2: w["2"] = float(w2.get("v", 0) or 0)
-            if w:
-                result["winner"] = w
-
-        # TOTAL
-        to = by_code.get(self.F_TOTAL_OVER)
-        tu = by_code.get(self.F_TOTAL_UNDER)
-        if to and tu:
-            line = self._line(to) or self._line(tu)
-            result["total"] = {
-                "line": line,
-                "over": float(to.get("v", 0) or 0),
-                "under": float(tu.get("v", 0) or 0),
-            }
-
-        # HANDICAP
-        h1 = by_code.get(self.F_HCP1) or by_code.get(self.F_HCP1_ALT)
-        h2 = by_code.get(self.F_HCP2) or by_code.get(self.F_HCP2_ALT)
-        if h1 or h2:
-            hk = {}
-            if h1:
-                hk["1"] = {"line": self._line(h1), "odd": float(h1.get("v", 0) or 0)}
-            if h2:
-                hk["2"] = {"line": self._line(h2), "odd": float(h2.get("v", 0) or 0)}
-            if hk:
-                result["handicap"] = hk
-
-        # IT (индивидуальные тоталы)
-        it = {}
-        for player, (oc, uc) in (
-            ("1", (self.F_IT1_OVER, self.F_IT1_UNDER)),
-            ("2", (self.F_IT2_OVER, self.F_IT2_UNDER)),
-        ):
-            fo = by_code.get(oc)
-            fu = by_code.get(uc)
-            if fo and fu:
-                line = self._line_pos(fo)
-                if line > 0:
-                    it[player] = {
-                        "line": line,
-                        "over": float(fo.get("v", 0) or 0),
-                        "under": float(fu.get("v", 0) or 0),
-                    }
-        if it:
-            result["it"] = it
-
-        # ODD (чёт/нечёт)
-        fe = by_code.get(self.F_EVEN)
-        fo = by_code.get(self.F_ODD)
-        if fe and fo:
-            result["odd"] = {
-                "even": float(fe.get("v", 0) or 0),
-                "odd":  float(fo.get("v", 0) or 0),
-            }
-
-        # POINT (следующее очко)
-        p1 = by_code.get(self.F_PT1)
-        p2 = by_code.get(self.F_PT2)
-        if p1 and p2:
-            result["point"] = {
-                "1": float(p1.get("v", 0) or 0),
-                "2": float(p2.get("v", 0) or 0),
-            }
-
-        return result
-
-    @staticmethod
-    def _line(factor: dict) -> float:
-        pt = str(factor.get("pt", "")).strip()
-        m = re.search(r"([+-]?\d+\.?\d*)", pt)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-        try:
-            return float(factor.get("p", 0)) / 100.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    @staticmethod
-    def _line_pos(factor: dict) -> float:
-        pt = str(factor.get("pt", "")).strip()
-        m = re.search(r"(\d+\.?\d*)", pt)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-        return 0.0
 
 
 # ════════════════════════════════════════════════════════════
-# Pari (копия Fonbet, другой домен и scopeMarket)
+# Pari — делегирует в PariHandler.parse_update
 # ════════════════════════════════════════════════════════════
 class PariFastClient(FastOddsClient):
     bk = "pari"
@@ -532,7 +279,6 @@ class PariFastClient(FastOddsClient):
 
     async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
         await self.start()
-
         try:
             r = await self._session.get(
                 self.EVENT_URL,
@@ -544,7 +290,7 @@ class PariFastClient(FastOddsClient):
                 },
             )
         except Exception as e:
-            logger.warning(f"[pari_fast] fetch event {native_id}: {e}")
+            logger.warning(f"[pari_fast] event {native_id}: {e}")
             return None
         if r.status_code != 200:
             logger.warning(f"[pari_fast] event {native_id} HTTP {r.status_code}")
@@ -555,185 +301,37 @@ class PariFastClient(FastOddsClient):
             return None
 
         try:
-            return self._parse_event_response(data, native_id)
+            parsed = PariHandler.parse_update(data, str(native_id))
         except Exception as e:
             logger.warning(f"[pari_fast] parse: {e}", exc_info=True)
             return None
 
-    def _parse_event_response(self, data: dict, native_id) -> Optional[Dict]:
-        events = data.get("events") or []
-        miscs = {m.get("id"): m for m in (data.get("eventMiscs") or [])}
-
-        root = None
-        for ev in events:
-            if str(ev.get("id")) == str(native_id):
-                root = ev
-                break
-        if not root:
+        if not parsed:
             return None
-
-        children = [ev for ev in events
-                    if str(ev.get("parentId")) == str(native_id)]
-        children.sort(key=lambda e: e.get("sortOrder", ""))
-
-        active_child = children[-1] if children else None
-        for info in data.get("liveEventInfos") or []:
-            if str(info.get("eventId")) != str(native_id):
-                continue
-            for sub in info.get("subscores") or []:
-                c1 = int(sub.get("c1", 0) or 0)
-                c2 = int(sub.get("c2", 0) or 0)
-                if c1 == 0 and c2 == 0:
-                    continue
-                mm = re.search(r"(\d+)", sub.get("kindName", "") or "")
-                if not mm:
-                    continue
-                target = int(mm.group(1))
-                for ch in children:
-                    mm2 = re.search(r"(\d+)", ch.get("name", "") or "")
-                    if mm2 and int(mm2.group(1)) == target:
-                        active_child = ch
-                        break
-                break
-            break
-
-        if not active_child:
-            return None
-
-        child_id = str(active_child.get("id"))
-        child_name = active_child.get("name", "") or ""
-        mm = re.search(r"(\d+)", child_name)
-        phase_num = int(mm.group(1)) if mm else 1
-        set_key = f"set_{phase_num}"
-
-        misc_root = miscs.get(int(native_id)) or {}
-        score1 = int(misc_root.get("score1", 0) or 0)
-        score2 = int(misc_root.get("score2", 0) or 0)
-        comment = misc_root.get("comment", "") or ""
-        sub1, sub2 = self._parse_sub(comment)
-
-        factors = []
-        for block in data.get("customFactors") or []:
-            if str(block.get("e")) == child_id:
-                factors = block.get("factors") or []
-                break
-        if not factors:
-            return None
-
-        markets = self._build_markets(factors)
-        if not markets:
-            return None
-
         return {
-            "match_id": str(native_id),
-            "phase_num": phase_num,
-            "score1": score1, "score2": score2,
-            "sub_score1": sub1, "sub_score2": sub2,
-            "set_markets": {set_key: markets},
+            "match_id": parsed.get("match_id"),
+            "phase_num": parsed.get("phase_num", 0),
+            "score1": parsed.get("score1", 0),
+            "score2": parsed.get("score2", 0),
+            "sub_score1": parsed.get("sub_score1", 0),
+            "sub_score2": parsed.get("sub_score2", 0),
+            "set_markets": parsed.get("set_markets", {}),
         }
 
-    @staticmethod
-    def _parse_sub(comment: str) -> Tuple[int, int]:
-        if not comment:
-            return 0, 0
-        pairs = re.findall(r"(\d+)[-:](\d+)", comment)
-        if pairs:
-            return int(pairs[-1][0]), int(pairs[-1][1])
-        return 0, 0
 
-    def _build_markets(self, factors: list) -> Dict:
-        by_code = {f.get("f"): f for f in factors if f.get("f") is not None}
-        result: Dict[str, Any] = {}
-
-        w1, w2 = by_code.get(921), by_code.get(923)
-        if w1 or w2:
-            w = {}
-            if w1: w["1"] = float(w1.get("v", 0) or 0)
-            if w2: w["2"] = float(w2.get("v", 0) or 0)
-            if w:
-                result["winner"] = w
-
-        to, tu = by_code.get(1696), by_code.get(1697)
-        if to and tu:
-            line = self._line(to) or self._line(tu)
-            result["total"] = {
-                "line": line,
-                "over": float(to.get("v", 0) or 0),
-                "under": float(tu.get("v", 0) or 0),
-            }
-
-        h1, h2 = by_code.get(910), by_code.get(912)
-        if h1 or h2:
-            hk = {}
-            if h1: hk["1"] = {"line": self._line(h1),
-                              "odd": float(h1.get("v", 0) or 0)}
-            if h2: hk["2"] = {"line": self._line(h2),
-                              "odd": float(h2.get("v", 0) or 0)}
-            if hk:
-                result["handicap"] = hk
-
-        it = {}
-        for player, (oc, uc) in (("1", (974, 976)), ("2", (978, 980))):
-            fo, fu = by_code.get(oc), by_code.get(uc)
-            if fo and fu:
-                line = self._line_pos(fo)
-                if line > 0:
-                    it[player] = {
-                        "line": line,
-                        "over": float(fo.get("v", 0) or 0),
-                        "under": float(fu.get("v", 0) or 0),
-                    }
-        if it:
-            result["it"] = it
-
-        fe, fo = by_code.get(698), by_code.get(699)
-        if fe and fo:
-            result["odd"] = {
-                "even": float(fe.get("v", 0) or 0),
-                "odd":  float(fo.get("v", 0) or 0),
-            }
-
-        p1, p2 = by_code.get(2393), by_code.get(2394)
-        if p1 and p2:
-            result["point"] = {
-                "1": float(p1.get("v", 0) or 0),
-                "2": float(p2.get("v", 0) or 0),
-            }
-
-        return result
-
-    @staticmethod
-    def _line(factor: dict) -> float:
-        pt = str(factor.get("pt", "")).strip()
-        m = re.search(r"([+-]?\d+\.?\d*)", pt)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-        try:
-            return float(factor.get("p", 0)) / 100.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    @staticmethod
-    def _line_pos(factor: dict) -> float:
-        pt = str(factor.get("pt", "")).strip()
-        m = re.search(r"(\d+\.?\d*)", pt)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-        return 0.0
-    
 # ════════════════════════════════════════════════════════════
-# Olimp (открытое API, tableType == "OTHER" — фазовые рынки)
+# Olimp — делегирует в OlimpHandler._extract_all_events / _parse_event
 # ════════════════════════════════════════════════════════════
 class OlimpFastClient(FastOddsClient):
     bk = "olimp"
 
+    # Bulk — отдаёт только базовые рынки (RESULT/HANDICAP/TOTAL).
+    # Используется как fallback для поиска по именам.
     URL = "https://www.olimp.bet/api/v4/0/live/sports-with-competitions-with-events"
+
+    # Точечный — отдаёт ВСЕ рынки матча, включая фазовые OTHER
+    # (корзина партий, ИТ партий, форы партий). Основной источник.
+    EVENTS_URL = "https://www.olimp.bet/api/v4/0/live/events"
 
     HEADERS = {
         "Accept": "application/json, text/plain, */*",
@@ -743,8 +341,6 @@ class OlimpFastClient(FastOddsClient):
         "Origin": "https://www.olimp.bet",
         "Referer": "https://www.olimp.bet/live",
     }
-
-    _P = r"[СЧПCQPсчпcqp]"    # префикс фазы: Сет / Четверть / Период
 
     def __init__(self):
         super().__init__(timeout=15.0)
@@ -771,189 +367,164 @@ class OlimpFastClient(FastOddsClient):
         except Exception:
             return None
 
-    def _find_match(self, raw: Any, p1: str, p2: str) -> Optional[dict]:
-        items = raw if isinstance(raw, list) else [raw]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            payload = item.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            comps = payload.get("competitionsWithEvents")
-            if not isinstance(comps, list):
-                continue
-            for block in comps:
-                for event in (block.get("events") or []):
-                    if not isinstance(event, dict):
-                        continue
-                    t1 = event.get("team1Name", "")
-                    t2 = event.get("team2Name", "")
-                    if _players_match(p1, p2, t1, t2):
-                        return event
+    def _find_match(self, raw, p1, p2):
         return None
 
-    def _parse(self, raw: Any, event: dict) -> Optional[Dict]:
-        match_id = str(event.get("id") or "")
-        if not match_id:
-            return None
-
-        score_str = event.get("score", "0:0") or "0:0"
-        try:
-            score1, score2 = map(int, score_str.split(":"))
-        except Exception:
-            score1 = score2 = 0
-
-        # sub_score из mapsScore
-        pairs = []
-        for m in event.get("mapsScore") or []:
-            if isinstance(m, dict):
-                try:
-                    pairs.append((int(m.get("team1", 0) or 0),
-                                  int(m.get("team2", 0) or 0)))
-                except Exception:
-                    pairs.append((0, 0))
-        sub1 = sub2 = 0
-        if pairs:
-            sub1, sub2 = pairs[-1]
-
-        # phase_num
-        comment = event.get("comment", "") or ""
-        phase_num = self._resolve_phase_num(
-            event.get("sportId"), score1, score2, comment, pairs, event
-        )
-
-        set_key = f"set_{phase_num}"
-        markets = self._build_markets(event, phase_num)
-        if not markets:
-            return None
-
-        return {
-            "match_id": match_id,
-            "phase_num": phase_num,
-            "score1": score1,
-            "score2": score2,
-            "sub_score1": sub1,
-            "sub_score2": sub2,
-            "set_markets": {set_key: markets},
-        }
+    def _parse(self, raw, event):
+        return None
 
     @staticmethod
-    def _resolve_phase_num(sport_id, score1, score2, comment, pairs, event):
-        sid = str(sport_id or "")
-        if sid in ("5", "140"):    # баскет / кибербаскет
-            mm = re.search(r"(\d+)-я\s+четверть", comment)
-            if mm:
-                return int(mm.group(1))
-            return len(pairs) if pairs else 1
+    def _extract_all_from_raw(raw) -> Dict[str, dict]:
+        """
+        Olimp отдаёт МАССИВ из 20 payload'ов (по одному на вид спорта).
+        Внутри каждого — payload.competitionsWithEvents[].events[].
 
-        # НТ и волейбол — из "#N" в comment или score1 + score2 + 1
-        mm = re.search(r"#(\d+)", comment)
-        if mm:
-            return int(mm.group(1))
-        return score1 + score2 + 1
+        ВАЖНО: OlimpHandler._extract_all_events ожидает СПИСОК
+        верхнеуровневых items, каждый из которых имеет ключ `payload`.
+        Поэтому НЕ разворачиваем payload сами — передаём raw как есть.
+        """
+        if not raw:
+            return {}
 
-    def _build_markets(self, event: dict, phase_num: int) -> Dict:
-        result: Dict[str, Any] = {}
+        # Если прилетел одиночный payload вместо массива — оборачиваем
+        # в один item так, как его увидел бы _extract_all_events.
+        if isinstance(raw, dict):
+            if "competitionsWithEvents" in raw:
+                raw = [{"payload": raw}]
+            elif isinstance(raw.get("payload"), dict):
+                raw = [raw]
+            else:
+                return {}
 
-        for out in event.get("outcomes", []) or []:
-            if not isinstance(out, dict):
-                continue
-            if (out.get("tableType") or "").upper() != "OTHER":
-                continue
+        if not isinstance(raw, list):
+            return {}
 
-            short = (out.get("shortName") or "").strip()
-            if not short:
-                continue
+        try:
+            return OlimpHandler._extract_all_events(raw) or {}
+        except Exception as e:
+            logger.warning(f"[olimp_fast] extract: {e}", exc_info=True)
+            return {}
 
-            try:
-                prob = float(str(out.get("probability", "0")).replace(",", "."))
-            except Exception:
-                continue
-            if prob <= 1.01:
-                continue
-            try:
-                param = float(str(out.get("param", "0")).replace(",", "."))
-            except Exception:
-                param = 0.0
+    async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
+        await self.start()
 
-            P = self._P
+        # ── Точечный запрос по event_id ──
+        # Bulk (URL) отдаёт только RESULT/HANDICAP/TOTAL — фазовые OTHER
+        # приходят отдельно, через /live/events?vids[]=<id>:&main=false.
+        try:
+            r = await self._session.get(
+                self.EVENTS_URL,
+                params={"vids[]": f"{native_id}:", "main": "false"},
+            )
+        except Exception as e:
+            logger.warning(f"[olimp_fast] native {native_id}: {e}")
+            return None
 
-            # Winner партии: С5П1 / Ч4П2
-            m = re.match(rf"^{P}(\d+)П([12])$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                result.setdefault("winner", {})[m.group(2)] = prob
-                continue
+        if r.status_code != 200:
+            logger.warning(
+                f"[olimp_fast] native {native_id} HTTP {r.status_code}"
+            )
+            return None
 
-            # Фора: С5Ф1К
-            m = re.match(rf"^{P}(\d+)Ф([12])К$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                h = result.setdefault("handicap", {}).setdefault(m.group(2), {})
-                if "line" not in h:
-                    h["line"] = param
-                    h["odd"] = prob
-                continue
+        try:
+            data = r.json()
+        except Exception:
+            return None
 
-            # Тотал: С5ТотС5ТотМ / С5ТотС5ТотБ
-            m = re.match(rf"^{P}(\d+)Тот{P}\d+Тот([МБ])$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                side = "under" if m.group(2) == "М" else "over"
-                t = result.setdefault("total", {})
-                t.setdefault("line", param)
-                t[side] = prob
-                continue
+        # Ответ: list[{operationId, id, version, payload: {event...}}]
+        if not isinstance(data, list) or not data:
+            logger.debug(f"[olimp_fast] native {native_id}: пустой ответ")
+            return None
 
-            # Чёт/Нечёт: 5СТотЧет / 5СТотНечет
-            m = re.match(rf"^(?:{P})?(\d+)(?:{P})?ТотЧет$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                result.setdefault("odd", {})["even"] = prob
-                continue
-            m = re.match(rf"^(?:{P})?(\d+)(?:{P})?ТотНечет$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                result.setdefault("odd", {})["odd"] = prob
-                continue
+        item = data[0]
+        if not isinstance(item, dict):
+            return None
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            return None
 
-            # ИТ игрока (старый формат): Ч4ИТ1Б / Ч4ИТ2М
-            m = re.match(rf"^{P}(\d+)ИТ([12])([БМ])$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                side = "over" if m.group(3) == "Б" else "under"
-                it = result.setdefault("it", {}).setdefault(m.group(2), {})
-                it.setdefault("line", param)
-                it[side] = prob
-                continue
+        # Парсим тем же парсером, что after-goal
+        try:
+            parsed = OlimpHandler._parse_event(payload)
+        except Exception as e:
+            logger.warning(
+                f"[olimp_fast] native {native_id} parse: {e}",
+                exc_info=True,
+            )
+            return None
 
-            # ИТ игрока (новый формат): С5ТотК1С5ТотК1М
-            m = re.match(rf"^{P}(\d+)ТотК([12]){P}\d+ТотК\2([МБ])$", short)
-            if m:
-                if int(m.group(1)) != phase_num:
-                    continue
-                side = "over" if m.group(3) == "Б" else "under"
-                it = result.setdefault("it", {}).setdefault(m.group(2), {})
-                it.setdefault("line", param)
-                it[side] = prob
-                continue
+        if not parsed:
+            logger.debug(
+                f"[olimp_fast] native {native_id}: "
+                f"_parse_event вернул None (нет фазовых рынков?)"
+            )
+            return None
 
-        return result
+        logger.info(
+            f"[olimp_fast] native {native_id}: OK "
+            f"phase={parsed.get('phase_num')} "
+            f"score={parsed.get('score1')}:{parsed.get('score2')} "
+            f"sub={parsed.get('sub_score1')}:{parsed.get('sub_score2')} "
+            f"sets={list((parsed.get('set_markets') or {}).keys())}"
+        )
+
+        return {
+            "match_id": parsed.get("match_id"),
+            "phase_num": parsed.get("phase_num", 0),
+            "score1": parsed.get("score1", 0),
+            "score2": parsed.get("score2", 0),
+            "sub_score1": parsed.get("sub_score1", 0),
+            "sub_score2": parsed.get("sub_score2", 0),
+            "set_markets": parsed.get("set_markets", {}),
+        }
+
+    async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
+        await self.start()
+
+        async with self._lock:
+            now = time.time()
+            if (self._last_raw is None
+                    or now - self._last_fetch_at >= self._fetch_interval):
+                raw = await self._fetch_raw()
+                if raw is None:
+                    return None
+                self._last_raw = raw
+                self._last_fetch_at = now
+            else:
+                raw = self._last_raw
+
+        all_events = self._extract_all_from_raw(raw)
+
+        for ev_id, parsed in all_events.items():
+            t1 = parsed.get("player1", "")
+            t2 = parsed.get("player2", "")
+            if _players_match(p1, p2, t1, t2):
+                return {
+                    "match_id": parsed.get("match_id"),
+                    "phase_num": parsed.get("phase_num", 0),
+                    "score1": parsed.get("score1", 0),
+                    "score2": parsed.get("score2", 0),
+                    "sub_score1": parsed.get("sub_score1", 0),
+                    "sub_score2": parsed.get("sub_score2", 0),
+                    "set_markets": parsed.get("set_markets", {}),
+                }
+        return None
+
 
 # ════════════════════════════════════════════════════════════
-# Betcity (HTTP + cookies из fast_cookies/betcity.json)
+# Betcity — прямой поиск по native_id + делегирование парсинга
+# в BetcityHandler (НТ / баскет / волейбол — автоматически)
 # ════════════════════════════════════════════════════════════
 class BetcityFastClient(FastOddsClient):
     bk = "betcity"
 
+    # Общий снапшот (fallback)
     URL = ("https://ad.betcity.ru/d/on_air/bets"
            "?rev=8&add=dep_events&ver=88&csn=ooca9s&lng=0")
+
+    # Точечный запрос по native_id (как делает фронт Betcity)
+    EVENT_URL_TPL = ("https://ad.betcity.ru/d/on_air/bets"
+                     "?rev=8&add=dep_event&ids={eid}&stat=1&ver=91&csn=ooca9s")
 
     HEADERS = {
         "accept": "application/json, text/plain, */*",
@@ -962,17 +533,12 @@ class BetcityFastClient(FastOddsClient):
         "origin": "https://betcity.ru",
     }
 
-    # ID спортов Betcity
+    # ID спортов Betcity → наши sport_key
     SPORT_IDS = {
         "46": "table_tennis",
         "12": "volleyball",
         "3":  "basketball",
     }
-
-    # Коды market_id в блоке ext (по дампу бэкенда)
-    M_WINNER   = "35"
-    M_HANDICAP = "905"
-    M_IT       = "913"
 
     def __init__(self):
         super().__init__(timeout=10.0)
@@ -1019,17 +585,66 @@ class BetcityFastClient(FastOddsClient):
         except Exception:
             return None
 
-    def _find_match(self, raw: Any, p1: str, p2: str) -> Optional[dict]:
-        reply = raw.get("reply") or {}
+    def _find_match(self, raw, p1, p2):
+        return None
+
+    def _parse(self, raw, event):
+        return None
+
+    @staticmethod
+    def _extract_one(parsed: Optional[dict]) -> Optional[Dict]:
+        """Приводит результат after_goal к формату fast-клиента."""
+        if not parsed:
+            return None
+        return {
+            "match_id": parsed.get("match_id"),
+            "phase_num": parsed.get("phase_num", 0),
+            "score1": parsed.get("score1", 0),
+            "score2": parsed.get("score2", 0),
+            "sub_score1": parsed.get("sub_score1", 0),
+            "sub_score2": parsed.get("sub_score2", 0),
+            "set_markets": parsed.get("set_markets", {}),
+        }
+
+    @staticmethod
+    def _empty_result(ev_id) -> Dict:
+        """
+        Результат, когда событие НАЙДЕНО, но рынки ещё не пришли
+        (например, только что началась новая четверть).
+        Возвращаем пустой set_markets, чтобы polling не считал
+        это промахом и продолжал ждать появления рынков.
+        """
+        return {
+            "match_id": str(ev_id),
+            "phase_num": 0,
+            "score1": 0,
+            "score2": 0,
+            "sub_score1": 0,
+            "sub_score2": 0,
+            "set_markets": {},
+        }
+
+    def _find_event_raw(self, data: dict, native_id) -> Optional[tuple]:
+        """
+        Прямой поиск события по ev_id в raw-ответе on_air/bets.
+        Возвращает (ev_id, ev_dict, sport_key) или None.
+
+        ВАЖНО: не использует BetcityHandler._extract_all_events —
+        тот отбрасывает события без рынков (пустые set_markets).
+        А нам нужно уметь найти событие, даже если рынки ещё не
+        подгрузились (например, при смене четверти Betcity
+        кратковременно убирает фазовые рынки).
+        """
+        reply = data.get("reply") or {}
         sports = reply.get("sports") or {}
         if not isinstance(sports, dict):
             return None
 
         for sid_str, sport_block in sports.items():
+            if not isinstance(sport_block, dict):
+                continue
             sport_key = self.SPORT_IDS.get(str(sid_str))
             if not sport_key:
-                continue
-            if not isinstance(sport_block, dict):
                 continue
 
             for chmp in (sport_block.get("chmps") or {}).values():
@@ -1041,199 +656,150 @@ class BetcityFastClient(FastOddsClient):
                     eff_sport = "cyber_basketball"
 
                 for ev_id, ev in (chmp.get("evts") or {}).items():
+                    if str(ev_id) != str(native_id):
+                        continue
                     if not isinstance(ev, dict):
                         continue
                     if ev.get("team_type_f", 0) != 0:
                         continue
                     if ev.get("is_dep", 0) == 1:
                         continue
-
-                    t1 = ev.get("name_ht", "")
-                    t2 = ev.get("name_at", "")
-                    if _players_match(p1, p2, t1, t2):
-                        return {
-                            "ev_id": str(ev_id),
-                            "ev": ev,
-                            "sport_key": eff_sport,
-                        }
+                    return str(ev_id), ev, eff_sport
         return None
 
-    def _parse(self, raw: Any, found: dict) -> Optional[Dict]:
-        ev_id = found["ev_id"]
-        ev = found["ev"]
-        sport_key = found.get("sport_key", "table_tennis")
+    async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
+        await self.start()
 
-        # Счёт партий
-        score_str = ev.get("sc_ev", "0:0") or "0:0"
+        # ── 1) Точечный запрос по ids=<native_id> (23 KB вместо 3.4 MB) ──
+        url = self.EVENT_URL_TPL.format(eid=native_id)
         try:
-            s1, s2 = map(int, score_str.split(":"))
+            r = await self._session.get(url)
+        except Exception as e:
+            logger.warning(f"[betcity_fast] native {native_id}: {e}")
+            r = None
+
+        if r is not None and r.status_code == 200:
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+
+            if isinstance(data, dict):
+                found = self._find_event_raw(data, native_id)
+                if found:
+                    ev_id, ev, sport_key = found
+                    try:
+                        parsed = BetcityHandler._parse_event(
+                            ev_id, ev, sport_key
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[betcity_fast] native {native_id} parse: {e}",
+                            exc_info=True,
+                        )
+                        parsed = None
+
+                    if parsed:
+                        return self._extract_one(parsed)
+
+                    # Событие нашли, но рынков ещё нет — возвращаем
+                    # пустой результат, чтобы polling не считал это
+                    # промахом и продолжал ждать появления рынков.
+                    logger.debug(
+                        f"[betcity_fast] native {native_id}: "
+                        f"событие найдено, но _parse_event вернул None "
+                        f"(рынки ещё не пришли)"
+                    )
+                    return self._empty_result(ev_id)
+
+                logger.debug(
+                    f"[betcity_fast] native {native_id}: "
+                    f"точечный ответ без нашего eid"
+                )
+        elif r is not None:
+            logger.debug(
+                f"[betcity_fast] native {native_id}: "
+                f"точечный запрос HTTP {r.status_code}"
+            )
+
+        # ── 2) Fallback: общий снапшот ──
+        logger.debug(
+            f"[betcity_fast] native {native_id}: fallback на общий снапшот"
+        )
+        try:
+            r2 = await self._session.get(self.URL)
+        except Exception as e:
+            logger.warning(f"[betcity_fast] snapshot {native_id}: {e}")
+            return None
+        if r2.status_code != 200:
+            logger.warning(
+                f"[betcity_fast] snapshot {native_id} HTTP {r2.status_code}"
+            )
+            return None
+        try:
+            data2 = r2.json()
         except Exception:
-            s1 = s2 = 0
-
-        # История партий из sc_inter: "11:8,9:11,7:5"
-        pairs = []
-        for part in (ev.get("sc_inter") or "").split(","):
-            part = part.strip()
-            if ":" in part:
-                try:
-                    a, b = part.split(":", 1)
-                    pairs.append((int(a), int(b)))
-                except Exception:
-                    pass
-
-        if sport_key == "table_tennis":
-            phase_num = s1 + s2 + 1
-        elif sport_key == "volleyball":
-            phase_num = s1 + s2 + 1
-        else:
-            phase_num = len(pairs) if pairs else 1
-
-        sub1 = sub2 = 0
-        if pairs:
-            sub1, sub2 = pairs[-1]
-
-        # Фазовые рынки
-        markets = self._parse_ext(ev, phase_num)
-
-        if not markets:
             return None
 
-        set_key = f"set_{phase_num}"
-        return {
-            "match_id": ev_id,
-            "phase_num": phase_num,
-            "score1": s1, "score2": s2,
-            "sub_score1": sub1, "sub_score2": sub2,
-            "set_markets": {set_key: markets},
-        }
+        found = self._find_event_raw(data2, native_id)
+        if not found:
+            logger.warning(
+                f"[betcity_fast] native {native_id} не найден "
+                f"в снапшоте (raw)"
+            )
+            return None
 
-    def _parse_ext(self, ev: dict, phase_num: int) -> Dict:
-        """Парсит блок ext для активной партии."""
-        ext = ev.get("ext") or {}
-        if not isinstance(ext, dict):
-            return {}
+        ev_id, ev, sport_key = found
+        try:
+            parsed = BetcityHandler._parse_event(ev_id, ev, sport_key)
+        except Exception as e:
+            logger.warning(
+                f"[betcity_fast] snapshot parse {native_id}: {e}",
+                exc_info=True,
+            )
+            return None
 
-        result: Dict[str, Any] = {}
-        num_re = re.compile(r"(\d+\.?\d*)")
+        if not parsed:
+            logger.debug(
+                f"[betcity_fast] native {native_id}: найден в снапшоте, "
+                f"но рынков нет — возвращаю пустой"
+            )
+            return self._empty_result(ev_id)
 
-        for market_id, market_data in ext.items():
-            mid = str(market_id)
-            if mid not in (self.M_WINNER, self.M_HANDICAP, self.M_IT):
-                continue
-            if not isinstance(market_data, dict):
-                continue
+        return self._extract_one(parsed)
 
-            rows = market_data.get("rows") or {}
-            for row in rows.values():
-                if not isinstance(row, dict):
-                    continue
-                row_name = row.get("name", "") or ""
-                mm = re.search(r"(\d+)-я партия", row_name)
-                if not mm:
-                    continue
-                if int(mm.group(1)) != phase_num:
-                    continue
+    async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
+        """Fallback по именам, если native_id нет в /match_state."""
+        await self.start()
 
-                data_block = row.get("data") or {}
-                for block in data_block.values():
-                    if not isinstance(block, dict):
-                        continue
-                    blocks = block.get("blocks") or {}
-                    if not isinstance(blocks, dict):
-                        continue
+        async with self._lock:
+            now = time.time()
+            if (self._last_raw is None
+                    or now - self._last_fetch_at >= self._fetch_interval):
+                raw = await self._fetch_raw()
+                if raw is None:
+                    return None
+                self._last_raw = raw
+                self._last_fetch_at = now
+            else:
+                raw = self._last_raw
 
-                    # mid=35: W (winner), T1..T5 (totals), TEO (odd/even)
-                    if mid == self.M_WINNER:
-                        w = blocks.get("W") or {}
-                        for side, key in (("1", "P1"), ("2", "P2")):
-                            info = w.get(key) or {}
-                            try:
-                                odd = float(info.get("kf", 0) or 0)
-                            except Exception:
-                                continue
-                            if odd > 1.01:
-                                result.setdefault("winner", {})[side] = odd
+        try:
+            all_events = BetcityHandler._extract_all_events(raw)
+        except Exception as e:
+            logger.warning(f"[betcity_fast] extract: {e}", exc_info=True)
+            return None
 
-                        t1 = blocks.get("T1") or {}
-                        if t1:
-                            try:
-                                line = float(t1.get("Tot", 0) or 0)
-                            except Exception:
-                                line = 0.0
-                            if line > 0:
-                                try:
-                                    o_over = float((t1.get("Tb") or {}).get("kf", 0) or 0)
-                                    o_under = float((t1.get("Tm") or {}).get("kf", 0) or 0)
-                                except Exception:
-                                    o_over = o_under = 0.0
-                                if o_over > 1.01 and o_under > 1.01:
-                                    result["total"] = {
-                                        "line": line,
-                                        "over": o_over,
-                                        "under": o_under,
-                                    }
+        for ev_id, parsed in all_events.items():
+            t1 = parsed.get("player1", "")
+            t2 = parsed.get("player2", "")
+            if _players_match(p1, p2, t1, t2):
+                return self._extract_one(parsed)
+        return None
 
-                        teo = blocks.get("TEO") or {}
-                        if teo:
-                            try:
-                                o_even = float((teo.get("E") or {}).get("kf", 0) or 0)
-                                o_odd = float((teo.get("O") or {}).get("kf", 0) or 0)
-                            except Exception:
-                                o_even = o_odd = 0.0
-                            if o_even > 1.01 and o_odd > 1.01:
-                                result["odd"] = {"even": o_even, "odd": o_odd}
-
-                    # mid=905: форы
-                    elif mid == self.M_HANDICAP:
-                        for f_key, f_block in blocks.items():
-                            if not f_key.startswith("F"):
-                                continue
-                            if "Kf_F1" not in f_block or "Kf_F2" not in f_block:
-                                continue
-                            for side, lkey, kkey in (
-                                ("1", "F1", "Kf_F1"),
-                                ("2", "F2", "Kf_F2"),
-                            ):
-                                try:
-                                    line = float(f_block.get(lkey, 0) or 0)
-                                    odd = float((f_block[kkey] or {}).get("kf", 0) or 0)
-                                except Exception:
-                                    continue
-                                if odd > 1.01:
-                                    result.setdefault("handicap", {})[side] = {
-                                        "line": line,
-                                        "odd": odd,
-                                    }
-
-                    # mid=913: ИТ
-                    elif mid == self.M_IT:
-                        for it_key, it_block in blocks.items():
-                            if "Tm" not in it_block or "Tb" not in it_block:
-                                continue
-                            try:
-                                line = float(it_block.get("Tot", 0) or 0)
-                            except Exception:
-                                continue
-                            if line <= 0:
-                                continue
-                            player = "1" if ("IT1" in it_key or "_T1" in it_key) else "2"
-                            try:
-                                o_over = float((it_block["Tb"] or {}).get("kf", 0) or 0)
-                                o_under = float((it_block["Tm"] or {}).get("kf", 0) or 0)
-                            except Exception:
-                                continue
-                            if o_over > 1.01 or o_under > 1.01:
-                                it = result.setdefault("it", {}).setdefault(player, {})
-                                it["line"] = line
-                                if o_over > 1.01:
-                                    it["over"] = o_over
-                                if o_under > 1.01:
-                                    it["under"] = o_under
-
-        return result
 
 # ════════════════════════════════════════════════════════════
-# Sportbet (HTTP без cookies)
+# Sportbet — делегирует в SportbetHandler._parse_phase_markets
 # ════════════════════════════════════════════════════════════
 class SportbetFastClient(FastOddsClient):
     bk = "sportbet"
@@ -1277,33 +843,10 @@ class SportbetFastClient(FastOddsClient):
         except Exception:
             return None
 
-    def _find_match(self, raw: Any, p1: str, p2: str) -> Optional[dict]:
-        data = (raw or {}).get("data") or {}
-        sports = data.get("sports") or []
-        if not isinstance(sports, list):
-            return None
+    def _find_match(self, raw, p1, p2):
+        return None
 
-        for sport in sports:
-            if not isinstance(sport, dict):
-                continue
-            sport_key = self._resolve_sport(sport)
-            if not sport_key:
-                continue
-
-            for tournament in sport.get("tournaments", []) or []:
-                if not isinstance(tournament, dict):
-                    continue
-                for event in tournament.get("events", []) or []:
-                    if not isinstance(event, dict):
-                        continue
-                    teams = event.get("teams") or {}
-                    t1 = (teams.get("team1") or {}).get("name", "")
-                    t2 = (teams.get("team2") or {}).get("name", "")
-                    if _players_match(p1, p2, t1, t2):
-                        return {
-                            "event": event,
-                            "sport_key": sport_key,
-                        }
+    def _parse(self, raw, event):
         return None
 
     @staticmethod
@@ -1318,8 +861,13 @@ class SportbetFastClient(FastOddsClient):
             return "basketball"
         return None
 
+    @staticmethod
+    def _build_page_key(sport_key: str, phase_num: int) -> str:
+        if sport_key in ("basketball", "cyber_basketball"):
+            return f"quarter_{phase_num}"
+        return f"set_{phase_num}"
+
     async def _fetch_page_markets(self, eid: str, page_key: str) -> list:
-        """Запрашивает рынки для конкретной страницы (set_N)."""
         now = time.time()
         cache_key = f"{eid}::{page_key}"
         cached = self._markets_cache.get(cache_key)
@@ -1343,37 +891,17 @@ class SportbetFastClient(FastOddsClient):
             logger.debug(f"[sportbet_fast] markets {page_key}: {e}")
             return []
 
-    def _build_page_key(self, sport_key: str, phase_num: int) -> str:
-        if sport_key in ("basketball", "cyber_basketball"):
-            return f"quarter_{phase_num}"
-        return f"set_{phase_num}"
-
-    async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
-        """Override: Sportbet требует 2 запроса — снапшот + markets для партии."""
-        await self.start()
-
-        raw = await self._fetch_raw()
-        if raw is None:
-            return None
-
-        found = self._find_match(raw, p1, p2)
-        if not found:
-            return None
-
-        event = found["event"]
-        sport_key = found["sport_key"]
+    async def _build_result_from_event(self, event: dict, sport_key: str) -> Optional[Dict]:
         eid = str(event.get("id", ""))
         if not eid:
             return None
 
-        # Счёт
         score_str = event.get("score", "0:0") or "0:0"
         try:
             s1, s2 = map(int, score_str.split(":"))
         except Exception:
             s1 = s2 = 0
 
-        # sub_score из scores ("11:8 9:11 7:5")
         sub1 = sub2 = 0
         parts = [p for p in (event.get("scores") or "").split() if p.strip()]
         if parts and ":" in parts[-1]:
@@ -1389,198 +917,103 @@ class SportbetFastClient(FastOddsClient):
 
         page_key = self._build_page_key(sport_key, phase_num)
         markets_raw = await self._fetch_page_markets(eid, page_key)
-
-        markets = self._parse_markets(markets_raw, event, sport_key)
-        if not markets:
+        if not markets_raw:
             return None
 
+        teams = event.get("teams") or {}
+        t1 = ((teams.get("team1") or {}).get("name") or "").strip()
+        t2 = ((teams.get("team2") or {}).get("name") or "").strip()
+
         set_key = f"set_{phase_num}"
+        set_markets: Dict[str, dict] = {}
+        outcome_ids: Dict[str, dict] = {}
+
+        # ── Делегируем парсинг в after_goal ──
+        try:
+            SportbetHandler._parse_phase_markets(
+                markets_raw, set_key, t1, t2, set_markets, outcome_ids,
+            )
+        except Exception as e:
+            logger.warning(f"[sportbet_fast] parse: {e}", exc_info=True)
+            return None
+
+        if not set_markets:
+            return None
+
         return {
             "match_id": eid,
             "phase_num": phase_num,
             "score1": s1, "score2": s2,
             "sub_score1": sub1, "sub_score2": sub2,
-            "set_markets": {set_key: markets},
+            "set_markets": set_markets,
         }
 
-    def _parse_markets(self, markets_raw: list, event: dict, sport_key: str) -> Dict:
-        """markets_raw — список маркетов для партии."""
-        result: Dict[str, Any] = {}
-        teams = event.get("teams") or {}
-        t1l = ((teams.get("team1") or {}).get("name") or "").lower()
-        t2l = ((teams.get("team2") or {}).get("name") or "").lower()
+    async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
+        await self.start()
 
-        for market in markets_raw:
-            if not isinstance(market, dict):
+        raw = await self._fetch_raw()
+        if raw is None:
+            return None
+
+        data = (raw or {}).get("data") or {}
+        sports = data.get("sports") or []
+        if not isinstance(sports, list):
+            return None
+
+        target = str(native_id)
+        for sport in sports:
+            if not isinstance(sport, dict):
                 continue
-            if market.get("status") != "active":
+            sport_key = self._resolve_sport(sport)
+            if not sport_key:
                 continue
-            name = (market.get("name") or "").strip().lower()
-            outcomes = market.get("outcomes") or []
-            if not outcomes:
+            for tournament in sport.get("tournaments", []) or []:
+                if not isinstance(tournament, dict):
+                    continue
+                for event in tournament.get("events", []) or []:
+                    if not isinstance(event, dict):
+                        continue
+                    if str(event.get("id", "")) != target:
+                        continue
+                    return await self._build_result_from_event(event, sport_key)
+        return None
+
+    async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
+        await self.start()
+
+        raw = await self._fetch_raw()
+        if raw is None:
+            return None
+
+        data = (raw or {}).get("data") or {}
+        sports = data.get("sports") or []
+        if not isinstance(sports, list):
+            return None
+
+        for sport_block in sports:
+            if not isinstance(sport_block, dict):
                 continue
-
-            # Классификация по имени (порядок критичен)
-            if "победитель" in name or "исход" in name:
-                self._parse_winner(outcomes, result)
-
-            elif "чет/нечет" in name or "чёт/нечёт" in name:
-                self._parse_odd_even(outcomes, result)
-
-            elif "фора" in name:
-                self._parse_handicap(outcomes, result)
-
-            elif "гонка" in name or "разниц" in name:
+            sport_key = self._resolve_sport(sport_block)
+            if not sport_key:
                 continue
-
-            elif "тотал" in name:
-                if t1l and t1l in name:
-                    self._parse_it(outcomes, result, "1")
-                elif t2l and t2l in name:
-                    self._parse_it(outcomes, result, "2")
-                else:
-                    self._parse_total(outcomes, result)
-
-            elif "очко" in name:
-                # для fast БК следующее очко не критично, можно пропустить
-                continue
-
-        return result
-
-    @staticmethod
-    def _parse_winner(outcomes: list, result: dict):
-        for out in outcomes:
-            if out.get("active") is False:
-                continue
-            odd = out.get("odd")
-            if not odd:
-                continue
-            oname = (out.get("name") or "").strip()
-            if oname == "Поб 1":
-                result.setdefault("winner", {})["1"] = odd
-            elif oname == "Поб 2":
-                result.setdefault("winner", {})["2"] = odd
-
-    @staticmethod
-    def _parse_odd_even(outcomes: list, result: dict):
-        om = result.setdefault("odd", {})
-        for out in outcomes:
-            if out.get("active") is False:
-                continue
-            odd = out.get("odd")
-            if not odd:
-                continue
-            oname = (out.get("name") or "").strip()
-            if oname in ("Чет", "Чёт"):
-                om["even"] = odd
-            elif oname in ("Нечет", "Нечёт"):
-                om["odd"] = odd
-
-    @staticmethod
-    def _extract_line_from_spec(out: dict) -> float:
-        spec = out.get("specifiers") or ""
-        if isinstance(spec, str) and "total=" in spec:
-            try:
-                val = spec.split("total=", 1)[1]
-                val = re.split(r"[|&;]", val, 1)[0]
-                return float(val)
-            except (ValueError, IndexError):
-                pass
-        text = out.get("fullName") or out.get("name") or ""
-        m = re.search(r"(\d+\.?\d*)", text)
-        return float(m.group(1)) if m else 0.0
-
-    @classmethod
-    def _collect_lines(cls, outcomes: list) -> dict:
-        lines: Dict[float, dict] = {}
-        for out in outcomes:
-            if out.get("active") is False:
-                continue
-            odd = out.get("odd")
-            if not odd:
-                continue
-            oname = (out.get("name") or "").strip()
-            ofull = out.get("fullName") or ""
-            line = cls._extract_line_from_spec(out)
-            if not line:
-                continue
-            is_over = oname.startswith("ТБ") or "Больше" in ofull
-            is_under = oname.startswith("ТМ") or "Меньше" in ofull
-            if not (is_over or is_under):
-                continue
-            lines.setdefault(line, {})
-            lines[line]["over" if is_over else "under"] = out
-        return lines
-
-    @classmethod
-    def _parse_total(cls, outcomes: list, result: dict):
-        t = result.setdefault("total", {})
-        if "line" in t:
-            return
-        for line, pair in sorted(cls._collect_lines(outcomes).items()):
-            if "over" in pair and "under" in pair:
-                t["line"] = line
-                t["over"] = pair["over"].get("odd")
-                t["under"] = pair["under"].get("odd")
-                return
-
-    @classmethod
-    def _parse_it(cls, outcomes: list, result: dict, player: str):
-        it = result.setdefault("it", {}).setdefault(player, {})
-        if "line" in it:
-            return
-        for line, pair in sorted(cls._collect_lines(outcomes).items()):
-            if "over" in pair and "under" in pair:
-                it["line"] = line
-                it["over"] = pair["over"].get("odd")
-                it["under"] = pair["under"].get("odd")
-                return
-
-    @staticmethod
-    def _parse_handicap(outcomes: list, result: dict):
-        hk = result.setdefault("handicap", {})
-        if hk:
-            return
-        cand: Dict[float, dict] = {}
-        for out in outcomes:
-            if out.get("active") is False:
-                continue
-            odd = out.get("odd")
-            if not odd:
-                continue
-            oname = (out.get("name") or "").strip()
-            m = re.search(r"\(([+-]?\d+\.?\d*)\)", oname)
-            if not m:
-                continue
-            line = float(m.group(1))
-            if "Фора 1" in oname:
-                cand.setdefault(abs(line), {})["1"] = (out, line)
-            elif "Фора 2" in oname:
-                cand.setdefault(abs(line), {})["2"] = (out, line)
-        for key in sorted(cand.keys()):
-            pair = cand[key]
-            if "1" in pair and "2" in pair:
-                out1, line1 = pair["1"]
-                out2, line2 = pair["2"]
-                hk["1"] = {"line": line1, "odd": out1.get("odd")}
-                hk["2"] = {"line": line2, "odd": out2.get("odd")}
-                return
-
-# ════════════════════════════════════════════════════════════
-# Marathon (SSE через httpx)
-# ════════════════════════════════════════════════════════════
-
+            for tournament in sport_block.get("tournaments", []) or []:
+                if not isinstance(tournament, dict):
+                    continue
+                for event in tournament.get("events", []) or []:
+                    if not isinstance(event, dict):
+                        continue
+                    teams = event.get("teams") or {}
+                    t1 = (teams.get("team1") or {}).get("name", "")
+                    t2 = (teams.get("team2") or {}).get("name", "")
+                    if _players_match(p1, p2, t1, t2):
+                        return await self._build_result_from_event(event, sport_key)
+        return None
 
 
 # ════════════════════════════════════════════════════════════
-# Marathon (SSE конкретного матча)
+# Marathon — делегирует в MarathonHandler._parse_event
 # ════════════════════════════════════════════════════════════
 class MarathonFastClient(FastOddsClient):
-    """
-    Marathon:
-      1. JSON-снапшот all-tournaments → находим матч, забираем SEO-слаги.
-      2. SSE на events/by-slug конкретного матча → real-time.
-    """
     bk = "marathon"
 
     SNAPSHOT_URL_TPL = (
@@ -1620,8 +1053,8 @@ class MarathonFastClient(FastOddsClient):
         self._slugs: Dict[str, dict] = {}
         self._snapshot_cache: Dict[str, tuple] = {}
         self._last_sse_at: Dict[str, float] = {}
+        self._parser = MarathonHandler()  # для вызова instance-методов
 
-    # ── start / stop ──
     async def start(self):
         if self._client is not None:
             return
@@ -1672,7 +1105,12 @@ class MarathonFastClient(FastOddsClient):
     async def _fetch_raw(self):
         return None
 
-    # ── Шаг 1: JSON-снапшот для поиска матча ──
+    def _find_match(self, raw, p1, p2):
+        return None
+
+    def _parse(self, raw, event):
+        return None
+
     async def _fetch_snapshot(self, sport: str) -> Optional[dict]:
         now = time.time()
         cached = self._snapshot_cache.get(sport)
@@ -1691,9 +1129,6 @@ class MarathonFastClient(FastOddsClient):
             logger.warning(f"[marathon_fast] snapshot {sport}: {e}")
             return None
         if r.status_code != 200:
-            logger.warning(
-                f"[marathon_fast] snapshot {sport} HTTP {r.status_code}"
-            )
             return None
         try:
             data = r.json()
@@ -1703,7 +1138,22 @@ class MarathonFastClient(FastOddsClient):
         return data
 
     @staticmethod
-    def _find_match_in_snapshot(snapshot: dict, p1: str, p2: str) -> Optional[dict]:
+    def _find_in_snapshot_by_tree(snapshot: dict, tree_id) -> Optional[dict]:
+        item_map = (snapshot or {}).get("itemMap") or {}
+        if not isinstance(item_map, dict):
+            return None
+        for tournament in item_map.values():
+            if not isinstance(tournament, dict):
+                continue
+            for event in (tournament.get("liveEvents") or []):
+                if not isinstance(event, dict):
+                    continue
+                if str(event.get("treeId")) == str(tree_id):
+                    return event
+        return None
+
+    @staticmethod
+    def _find_in_snapshot_by_names(snapshot: dict, p1: str, p2: str) -> Optional[dict]:
         item_map = (snapshot or {}).get("itemMap") or {}
         if not isinstance(item_map, dict):
             return None
@@ -1737,7 +1187,6 @@ class MarathonFastClient(FastOddsClient):
             "matchSlug": match_slug,
         }
 
-    # ── Шаг 2: SSE на конкретный матч ──
     def _ensure_sse(self, tree_id: str, slugs: dict):
         existing = self._sse_tasks.get(tree_id)
         if existing and not existing.done():
@@ -1748,7 +1197,7 @@ class MarathonFastClient(FastOddsClient):
             return
         task = asyncio.create_task(self._sse_loop(tree_id, url))
         self._sse_tasks[tree_id] = task
-        logger.info(f"[marathon_fast] SSE start {tree_id}: {url}")
+        logger.info(f"[marathon_fast] SSE start {tree_id}")
 
     async def _sse_loop(self, tree_id: str, url: str):
         retry = 1
@@ -1758,39 +1207,27 @@ class MarathonFastClient(FastOddsClient):
                     "GET", url, headers=self.HEADERS
                 ) as response:
                     if response.status_code != 200:
-                        logger.warning(
-                            f"[marathon_fast] SSE {tree_id} "
-                            f"HTTP {response.status_code}"
-                        )
                         await asyncio.sleep(retry)
                         retry = min(retry * 2, 30)
                         continue
-
-                    logger.info(f"[marathon_fast] SSE {tree_id} connected")
                     retry = 1
                     buffer = b""
-
                     async for chunk in response.aiter_raw():
                         if not chunk:
                             break
-
                         if chunk.startswith(b"\x1f\x8b"):
                             try:
                                 chunk = gzip.decompress(chunk)
                             except Exception:
                                 pass
-
                         buffer += chunk
                         while b"\n\n" in buffer:
                             part, buffer = buffer.split(b"\n\n", 1)
                             try:
                                 self._process_sse_part(part, tree_id)
-                            except Exception as e:
-                                logger.debug(
-                                    f"[marathon_fast] part: {e}"
-                                )
+                            except Exception:
+                                pass
                             self._last_sse_at[tree_id] = time.time()
-
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -1803,7 +1240,6 @@ class MarathonFastClient(FastOddsClient):
             text = part_bytes.decode("utf-8", "ignore")
         except Exception:
             return
-
         data_line = ""
         for line in text.split("\n"):
             line = line.strip()
@@ -1813,20 +1249,18 @@ class MarathonFastClient(FastOddsClient):
                 data_line += line[5:].lstrip()
         if not data_line:
             return
-
         try:
             data = json.loads(data_line)
         except Exception:
             return
         if not isinstance(data, list):
             return
-
         for change in data:
             if isinstance(change, dict):
                 try:
                     self._apply_change(change, tree_id)
-                except Exception as e:
-                    logger.debug(f"[marathon_fast] change: {e}")
+                except Exception:
+                    pass
 
     def _apply_change(self, change: dict, expected_tree_id: str):
         value = change.get("value")
@@ -1844,91 +1278,84 @@ class MarathonFastClient(FastOddsClient):
             if isinstance(p, dict) and p.get("inObj") == "matchScore":
                 if isinstance(value, dict):
                     cache = self._events_cache.get(expected_tree_id)
-                    if cache:
-                        self._apply_match_score(cache, value)
+                    if cache and cache.get("_raw"):
+                        cache["_raw"]["matchScore"] = value
                 return
-
-        if (isinstance(value, dict)
-                and "selId" in value
-                and "coeff" in value):
-            cache = self._events_cache.get(expected_tree_id)
-            if not cache:
-                return
-            sel_id = value.get("selId")
-            new_coeff = value.get("coeff")
-            for m in (cache.get("markets") or {}).values():
-                sel = (m.get("selections") or {}).get(sel_id)
-                if sel is not None:
-                    sel["coeff"] = new_coeff
-                    break
 
     def _upsert_event(self, event: dict):
         tid = str(event.get("treeId", ""))
         if not tid:
             return
-
-        ht = (event.get("homeTeam") or {}).get("members") or []
-        at = (event.get("awayTeam") or {}).get("members") or []
-        home = ht[0].get("name", "") if ht else ""
-        away = at[0].get("name", "") if at else ""
-
-        phase = event.get("phase") or {}
-        try:
-            phase_num = int(phase.get("partNumber") or 1)
-        except Exception:
-            phase_num = 1
-
-        ms = event.get("matchScore") or {}
-        main = ms.get("main") or {}
-        try:
-            s1 = int(main.get("home", 0) or 0)
-            s2 = int(main.get("away", 0) or 0)
-        except Exception:
-            s1 = s2 = 0
-
-        sub1 = sub2 = 0
-        parts = ms.get("parts") or []
-        if parts:
-            idx = min(max(phase_num - 1, 0), len(parts) - 1)
-            p = parts[idx] or {}
-            try:
-                sub1 = int(p.get("home", 0) or 0)
-                sub2 = int(p.get("away", 0) or 0)
-            except Exception:
-                pass
-
         cache = self._events_cache.setdefault(tid, {})
-        cache.update({
-            "treeId": tid,
-            "homeTeam": home,
-            "awayTeam": away,
-            "phase_num": phase_num,
-            "score1": s1, "score2": s2,
-            "sub1": sub1, "sub2": sub2,
-            "markets": event.get("markets") or {},
-            "updated_at": time.time(),
-        })
+        cache["_raw"] = event
+        cache["updated_at"] = time.time()
 
-    @staticmethod
-    def _apply_match_score(cache: dict, ms: dict):
-        main = ms.get("main") or {}
+    async def _wait_sse_first_frame(self, tree_id: str, timeout_s: float = 5.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if tree_id in self._last_sse_at:
+                return True
+            await asyncio.sleep(0.3)
+        return False
+
+    async def _build_result(self, cache: dict) -> Optional[Dict]:
+        raw = cache.get("_raw")
+        if not raw:
+            return None
         try:
-            cache["score1"] = int(main.get("home", 0) or 0)
-            cache["score2"] = int(main.get("away", 0) or 0)
-        except Exception:
-            pass
-        parts = ms.get("parts") or []
-        if parts:
-            phase_num = cache.get("phase_num", 1)
-            idx = min(max(phase_num - 1, 0), len(parts) - 1)
-            p = parts[idx] or {}
-            try:
-                cache["sub1"] = int(p.get("home", 0) or 0)
-                cache["sub2"] = int(p.get("away", 0) or 0)
-            except Exception:
-                pass
+            parsed = self._parser._parse_event(raw)
+        except Exception as e:
+            logger.warning(f"[marathon_fast] parse: {e}", exc_info=True)
+            return None
 
-    # ── Публичный метод ──
+        if not parsed:
+            return None
+
+        return {
+            "match_id": parsed.get("match_id"),
+            "phase_num": parsed.get("phase_num", 0),
+            "score1": parsed.get("score1", 0),
+            "score2": parsed.get("score2", 0),
+            "sub_score1": parsed.get("sub_score1", 0),
+            "sub_score2": parsed.get("sub_score2", 0),
+            "set_markets": parsed.get("set_markets", {}),
+        }
+
+    async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
+        await self.start()
+        target = str(native_id)
+
+        # Если уже есть в кэше и SSE свежий — сразу
+        cache = self._events_cache.get(target)
+        if cache and cache.get("_raw") and target in self._last_sse_at:
+            return await self._build_result(cache)
+
+        # Иначе — ищем в снапшотах всех наших видов спорта
+        for sport in self.SLUG_BY_SPORT.keys():
+            snapshot = await self._fetch_snapshot(sport)
+            if not snapshot:
+                continue
+            event = self._find_in_snapshot_by_tree(snapshot, target)
+            if not event:
+                continue
+
+            if target not in self._slugs:
+                slugs = self._extract_slugs(event)
+                if not slugs:
+                    return None
+                self._slugs[target] = slugs
+                self._upsert_event(event)
+
+            self._ensure_sse(target, self._slugs[target])
+            await self._wait_sse_first_frame(target, timeout_s=5.0)
+
+            cache = self._events_cache.get(target)
+            if not cache:
+                return None
+            return await self._build_result(cache)
+
+        return None
+
     async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
         await self.start()
 
@@ -1936,7 +1363,7 @@ class MarathonFastClient(FastOddsClient):
         if not snapshot:
             return None
 
-        event = self._find_match_in_snapshot(snapshot, p1, p2)
+        event = self._find_in_snapshot_by_names(snapshot, p1, p2)
         if not event:
             return None
 
@@ -1947,188 +1374,23 @@ class MarathonFastClient(FastOddsClient):
         if tree_id not in self._slugs:
             slugs = self._extract_slugs(event)
             if not slugs:
-                logger.warning(
-                    f"[marathon_fast] {tree_id}: нет SEO-слагов в снапшоте"
-                )
                 return None
             self._slugs[tree_id] = slugs
             self._upsert_event(event)
 
         self._ensure_sse(tree_id, self._slugs[tree_id])
-
-        for _ in range(10):
-            if tree_id in self._last_sse_at:
-                break
-            await asyncio.sleep(0.5)
+        await self._wait_sse_first_frame(tree_id, timeout_s=5.0)
 
         cache = self._events_cache.get(tree_id)
         if not cache:
             return None
-
-        try:
-            return self._build_result(cache, p1, p2)
-        except Exception as e:
-            logger.warning(f"[marathon_fast] build: {e}", exc_info=True)
-            return None
-
-    def _build_result(self, cache: dict, p1: str, p2: str) -> Dict:
-        phase_num = int(cache.get("phase_num", 1))
-        markets_raw = cache.get("markets") or {}
-        markets = self._parse_markets(
-            markets_raw, phase_num,
-            cache.get("homeTeam", ""),
-            cache.get("awayTeam", ""),
-        )
-        set_key = f"set_{phase_num}"
-        return {
-            "match_id": cache.get("treeId"),
-            "phase_num": phase_num,
-            "score1": cache.get("score1", 0),
-            "score2": cache.get("score2", 0),
-            "sub_score1": cache.get("sub1", 0),
-            "sub_score2": cache.get("sub2", 0),
-            "set_markets": {set_key: markets},
-        }
-
-    @staticmethod
-    def _side_for_winner(name: str, p1: str, p2: str) -> Optional[str]:
-        n = _normalize_name(name)
-        n1 = _normalize_name(p1)
-        n2 = _normalize_name(p2)
-        if not (n and n1 and n2):
-            return None
-
-        def close(a: str, b: str) -> bool:
-            return a == b or (len(a) >= 4 and len(b) >= 4 and a[:4] == b[:4])
-
-        if close(n, n1):
-            return "1"
-        if close(n, n2):
-            return "2"
-        return None
-
-    def _parse_markets(self, markets_raw: dict, phase_num: int,
-                       home: str, away: str) -> Dict:
-        result: Dict[str, Any] = {}
-        num_re = re.compile(r"([+-]?\d+\.?\d*)")
-
-        for m in markets_raw.values():
-            if not isinstance(m, dict):
-                continue
-            if m.get("state") not in (None, "ACTIVE"):
-                continue
-
-            model = m.get("model", "") or ""
-            selections = m.get("selections") or {}
-
-            kind = None
-            player = None
-            m_set = None
-
-            # ── Матчевые модели ──
-            if model in ("MTCH_R", "MTCH_DNB"):
-                kind = "winner"
-            elif model == "MTCH_TTLP":
-                kind = "total"
-            elif model in ("MTCH_HB", "MTCH_HBP"):
-                kind = "handicap"
-            elif model == "MTCH_TTLPOE":
-                kind = "odd"
-            else:
-                # ── Фазовые модели ──
-                mm = re.match(r"^MTCH_R(\d+)$", model)
-                if mm:
-                    kind = "winner"; m_set = int(mm.group(1))
-                elif (mm := re.match(r"^MTCH_TTLG(\d+)$", model)):
-                    kind = "total"; m_set = int(mm.group(1))
-                elif (mm := re.match(r"^MTCH_HB(\d+)$", model)):
-                    kind = "handicap"; m_set = int(mm.group(1))
-                elif (mm := re.match(r"^MTCH_T1TTLG(\d+)$", model)):
-                    kind = "it"; player = "1"; m_set = int(mm.group(1))
-                elif (mm := re.match(r"^MTCH_T2TTLG(\d+)$", model)):
-                    kind = "it"; player = "2"; m_set = int(mm.group(1))
-                elif (mm := re.match(r"^MTCH_TTLGOE(\d+)$", model)):
-                    kind = "odd"; m_set = int(mm.group(1))
-                else:
-                    continue
-
-                if m_set != phase_num:
-                    continue
-
-            for sel in selections.values():
-                if not isinstance(sel, dict):
-                    continue
-
-                coeff = sel.get("coeff") or {}
-                price = coeff.get("price") or {}
-                n = price.get("n", 0)
-                d = price.get("d", 1)
-                if not d:
-                    continue
-                try:
-                    odd = (float(n) + float(d)) / float(d)
-                except Exception:
-                    continue
-                if odd <= 1.0:
-                    continue
-
-                name = (sel.get("name") or "").strip()
-                lower = name.lower()
-
-                if kind == "winner":
-                    side = self._side_for_winner(name, home, away)
-                    if side:
-                        result.setdefault("winner", {})[side] = odd
-
-                elif kind == "total":
-                    mline = num_re.search(name)
-                    line = float(mline.group(1)) if mline else 0.0
-                    if line <= 0:
-                        continue
-                    t = result.setdefault("total", {})
-                    t.setdefault("line", line)
-                    if "больше" in lower:
-                        t["over"] = odd
-                    elif "меньше" in lower:
-                        t["under"] = odd
-
-                elif kind == "handicap":
-                    side = self._side_for_winner(name, home, away)
-                    if not side:
-                        continue
-                    mline = num_re.search(name)
-                    if not mline:
-                        continue
-                    line = float(mline.group(1))
-                    h = result.setdefault("handicap", {}).setdefault(side, {})
-                    h["line"] = line
-                    h["odd"] = odd
-
-                elif kind == "it" and player:
-                    mline = num_re.search(name)
-                    line = float(mline.group(1)) if mline else 0.0
-                    if line <= 0:
-                        continue
-                    it = result.setdefault("it", {}).setdefault(player, {})
-                    it.setdefault("line", line)
-                    if "больше" in lower:
-                        it["over"] = odd
-                    elif "меньше" in lower:
-                        it["under"] = odd
-
-                elif kind == "odd":
-                    om = result.setdefault("odd", {})
-                    if "нечет" in lower or "нечёт" in lower:
-                        om["odd"] = odd
-                    elif "чет" in lower or "чёт" in lower:
-                        om["even"] = odd
-
-        return result
+        return await self._build_result(cache)
 
 
- # ════════════════════════════════════════════════════════════
-# Winline (WebSocket + бинарный декодер)
-# Портировано из ui/after_goal/winline.py + parsers/winline_api.py
+# ════════════════════════════════════════════════════════════
+# Winline — своя логика (WS + decoder + instance state)
+# Дублирует ui/after_goal/winline.py::WinlineHandler._build_snapshot
+# 1-в-1, потому что там нужен доступ к decoder и _lines.
 # ════════════════════════════════════════════════════════════
 _MARKET_TYPE_WINNER      = 51
 _MARKET_TYPE_TOTAL       = 71
@@ -2140,7 +1402,6 @@ _MID_POINT_NT = 952
 
 
 def _parse_winline_coefficient(coeff: str) -> Tuple[Optional[int], Optional[float]]:
-    """'1' → (1, None); '1/-2.5' → (1, -2.5); '1/1' → (1, 1.0)."""
     if not coeff:
         return None, None
     if "/" in coeff:
@@ -2165,8 +1426,7 @@ def _winline_tokenize(name: str) -> List[str]:
     return [t for t in tokens if len(t) >= 3]
 
 
-def _winline_teams_match(t1_tokens: List[str], t2_tokens: List[str],
-                          a: str, b: str) -> bool:
+def _winline_teams_match(t1_tokens, t2_tokens, a: str, b: str) -> bool:
     a_tokens = _winline_tokenize(a)
     b_tokens = _winline_tokenize(b)
 
@@ -2215,39 +1475,23 @@ class WinlineFastClient(FastOddsClient):
         self._ws = None
         self._ws_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
-
-        # Ключ — кортеж (event_id, market_id, coeff), как во фронт-хендлере
         self._lines: Dict[Tuple[int, int, str], dict] = {}
-        # event_id → {participants, score1, score2, sub_score1, sub_score2, phase_num, ...}
         self._live_events: Dict[int, dict] = {}
-
         self._cookie_header = ""
 
-    # ── Жизненный цикл ──
     async def start(self):
         if self._ws_task and not self._ws_task.done():
             return
-
         from core.fast_config import load_cookies
         cookies = load_cookies("winline")
-
-        # Оставляем ТОЛЬКО cookies доменов winline.ru.
-        # Иначе из общего профиля тянутся чужие (Betcity, Leon, Marathon)
-        # и WS-handshake отбивается HTTP 400 из-за раздутого Cookie.
-        cookies = [
-            c for c in cookies
-            if "winline" in (c.get("domain") or "").lower()
-        ]
-
+        cookies = [c for c in cookies
+                   if "winline" in (c.get("domain") or "").lower()]
         self._cookie_header = "; ".join(
             f"{c['name']}={c['value']}" for c in cookies
             if c.get("name") and c.get("value")
         )
         logger.info(f"[winline_fast] 🍪 отобрано {len(cookies)} cookies")
-
         self._ws_task = asyncio.create_task(self._ws_loop())
-
-        # Ждём первой пачки данных
         for _ in range(20):
             if self._live_events:
                 break
@@ -2268,7 +1512,6 @@ class WinlineFastClient(FastOddsClient):
         self._heartbeat_task = None
         self._lines.clear()
         self._live_events.clear()
-        logger.info("[winline_fast] остановлен")
 
     async def _build_session(self):
         return None
@@ -2276,7 +1519,12 @@ class WinlineFastClient(FastOddsClient):
     async def _fetch_raw(self):
         return None
 
-    # ── WS-цикл (по образцу parsers/winline_api.py) ──
+    def _find_match(self, raw, p1, p2):
+        return None
+
+    def _parse(self, raw, event):
+        return None
+
     async def _ws_loop(self):
         delay = self.WS_RECONNECT_DELAY
         while True:
@@ -2297,32 +1545,31 @@ class WinlineFastClient(FastOddsClient):
                     ping_interval=None,
                     ping_timeout=None,
                     close_timeout=5,
-                    compression=None,       # ← отключаем permessage-deflate
+                    compression=None,
                 ) as ws:
                     self._ws = ws
-                    logger.info("[winline_fast] ✅ WS подключён")
-
+                    # При новом подключении кэш от прошлой сессии невалиден —
+                    # чистим, чтобы _build_snapshot не отдал устаревшие кэфы.
+                    self._lines.clear()
+                    self._live_events.clear()
+                    logger.info("[winline_fast] ✅ WS подключён (кеш сброшен)")
                     for cmd in self.HANDSHAKE_FRAMES:
                         await ws.send(cmd)
                         await asyncio.sleep(0.05)
-
                     if self._heartbeat_task and not self._heartbeat_task.done():
                         self._heartbeat_task.cancel()
                     self._heartbeat_task = asyncio.create_task(
                         self._heartbeat(ws)
                     )
-
                     async for frame in ws:
                         try:
                             self._on_frame(frame)
                         except Exception as e:
                             logger.debug(f"[winline_fast] frame: {e}")
-
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 logger.debug(f"[winline_fast] WS: {type(e).__name__}: {e}")
-
             self._ws = None
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30)
@@ -2339,7 +1586,6 @@ class WinlineFastClient(FastOddsClient):
             except Exception:
                 break
 
-    # ── Обработка кадра ──
     def _on_frame(self, payload):
         if isinstance(payload, str):
             return
@@ -2360,9 +1606,6 @@ class WinlineFastClient(FastOddsClient):
             logger.debug(f"[winline_fast] decode: {e}")
 
     def _ingest(self, item: dict):
-        """
-        Один-в-один по ui/after_goal/winline.py::_ingest_live.
-        """
         for ev in item.get("events") or []:
             if not isinstance(ev, dict):
                 continue
@@ -2372,10 +1615,8 @@ class WinlineFastClient(FastOddsClient):
             parts = ev.get("participants") or []
             if not parts:
                 continue
-
             score_raw = (ev.get("score") or "").strip()
             set_scores_raw = (ev.get("setScores") or "").strip()
-
             sub1 = sub2 = 0
             parts_list = []
             if set_scores_raw:
@@ -2387,7 +1628,6 @@ class WinlineFastClient(FastOddsClient):
                     sub1, sub2 = int(a), int(b)
                 except Exception:
                     pass
-
             score1 = score2 = 0
             if score_raw and ":" in score_raw:
                 try:
@@ -2395,9 +1635,7 @@ class WinlineFastClient(FastOddsClient):
                     score1, score2 = int(a), int(b)
                 except Exception:
                     pass
-
             phase_num = len(parts_list) if parts_list else (score1 + score2 + 1)
-
             self._live_events[ev_id] = {
                 "participants": [str(p) for p in parts],
                 "score1": score1,
@@ -2408,7 +1646,6 @@ class WinlineFastClient(FastOddsClient):
                 "sport_id": ev.get("sportId"),
                 "ts": time.time(),
             }
-
         for line in item.get("lines") or []:
             if not isinstance(line, dict):
                 continue
@@ -2420,29 +1657,48 @@ class WinlineFastClient(FastOddsClient):
             key = (int(ev_id), int(market_id), str(coeff))
             self._lines[key] = line
 
-    # ── Публичный API ──
+    async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
+        await self.start()
+        try:
+            target_id = int(native_id)
+        except (ValueError, TypeError):
+            return None
+        if target_id not in self._live_events:
+            for _ in range(10):
+                if target_id in self._live_events:
+                    break
+                await asyncio.sleep(0.3)
+        if target_id not in self._live_events:
+            return None
+        set_markets = self._build_snapshot(target_id)
+        if not set_markets:
+            return None
+        ev_data = self._live_events.get(target_id) or {}
+        return {
+            "match_id": str(target_id),
+            "phase_num": ev_data.get("phase_num", 0) or 0,
+            "score1": ev_data.get("score1", 0),
+            "score2": ev_data.get("score2", 0),
+            "sub_score1": ev_data.get("sub_score1", 0),
+            "sub_score2": ev_data.get("sub_score2", 0),
+            "set_markets": set_markets,
+        }
+
     async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
         await self.start()
-
         if not self._live_events:
             return None
-
-        # Ожидаемый sport_id
         expected_sid = None
         for sid, name in self.SPORT_IDS.items():
             if name == sport:
                 expected_sid = sid
                 break
-
-        # Отфильтруем события по спорту
         sport_events = [
             (eid, data) for eid, data in self._live_events.items()
             if expected_sid is None or data.get("sport_id") == expected_sid
         ]
-
         t1_tokens = _winline_tokenize(p1)
         t2_tokens = _winline_tokenize(p2)
-
         target_id = None
         for eid, data in sport_events:
             parts = data.get("participants") or []
@@ -2451,27 +1707,10 @@ class WinlineFastClient(FastOddsClient):
             if _winline_teams_match(t1_tokens, t2_tokens, parts[0], parts[1]):
                 target_id = eid
                 break
-
         if target_id is None:
-            # Показать первые 5 событий ИМЕННО этого спорта
-            sample = [
-                (data.get("participants") or [])[:2]
-                for _, data in sport_events[:5]
-            ]
-            logger.warning(
-                f"[winline_fast] матч '{p1}' / '{p2}' не найден. "
-                f"всего={len(self._live_events)} "
-                f"спорт={sport}({expected_sid})={len(sport_events)} "
-                f"lines={len(self._lines)} "
-                f"menu={len(self._decoder.markets)}"
-            )
-            if sample:
-                logger.warning(f"[winline_fast] этого спорта: {sample}")
             return None
-
         set_markets = self._build_snapshot(target_id)
         ev_data = self._live_events.get(target_id) or {}
-
         return {
             "match_id": str(target_id),
             "phase_num": ev_data.get("phase_num", 0) or 0,
@@ -2483,24 +1722,17 @@ class WinlineFastClient(FastOddsClient):
         }
 
     def _build_snapshot(self, event_id: int) -> Dict[str, dict]:
-        """
-        Один-в-один по ui/after_goal/winline.py::_build_snapshot.
-        Возвращает set_markets (без outcome_ids).
-        """
         menu = self._decoder.markets
         set_markets: Dict[str, dict] = {}
-
         for (ev_id, market_id, coeff), line in list(self._lines.items()):
             if ev_id != event_id:
                 continue
             if market_id not in menu:
                 continue
-
             mtype, mname = menu[market_id]
             phase, line_val = _parse_winline_coefficient(coeff)
             if phase is None:
                 continue
-
             set_key = f"set_{phase}"
             values = line.get("values") or []
 
@@ -2512,14 +1744,12 @@ class WinlineFastClient(FastOddsClient):
                     w["X"] = values[1]
                 if "2" not in w:
                     w["2"] = values[2]
-
             elif mtype == _MARKET_TYPE_WINNER_2WAY and len(values) >= 2:
                 w = set_markets.setdefault(set_key, {}).setdefault("winner", {})
                 if "1" not in w:
                     w["1"] = values[0]
                 if "2" not in w:
                     w["2"] = values[1]
-
             elif (mtype == _MARKET_TYPE_TOTAL
                     and len(values) >= 2
                     and line_val is not None):
@@ -2528,7 +1758,6 @@ class WinlineFastClient(FastOddsClient):
                     t["line"] = line_val
                     t["over"] = values[0]
                     t["under"] = values[1]
-
             elif (mtype == _MARKET_TYPE_HANDICAP
                     and len(values) >= 2
                     and line_val is not None):
@@ -2536,19 +1765,18 @@ class WinlineFastClient(FastOddsClient):
                 if "1" not in h:
                     h["1"] = {"line": line_val, "odd": values[0]}
                     h["2"] = {"line": -line_val, "odd": values[1]}
-
             elif market_id == _MID_ODD_NT and len(values) >= 2:
                 om = set_markets.setdefault(set_key, {}).setdefault("odd", {})
                 om["odd"] = values[0]
                 om["even"] = values[1]
-
             elif market_id == _MID_POINT_NT and len(values) >= 2:
                 pm = set_markets.setdefault(set_key, {}).setdefault("point", {})
                 pm["1"] = values[0]
                 pm["2"] = values[1]
                 pm["line"] = int(line_val) if line_val is not None else 0
-
         return set_markets
+
+
 # ════════════════════════════════════════════════════════════
 # Реестр
 # ════════════════════════════════════════════════════════════
@@ -2566,7 +1794,6 @@ _CLASSES = {
 
 
 def get_fast_client(bk: str) -> Optional[FastOddsClient]:
-    """Возвращает (и кэширует) клиент для указанной БК. None — если не реализован."""
     bk = (bk or "").lower().strip()
     if bk in _CLIENTS:
         return _CLIENTS[bk]
@@ -2582,7 +1809,6 @@ def has_fast_client(bk: str) -> bool:
 
 
 async def shutdown_all():
-    """Закрыть все сессии при выходе приложения."""
     for client in list(_CLIENTS.values()):
         try:
             await client.stop()

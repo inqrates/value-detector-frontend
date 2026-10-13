@@ -11,38 +11,33 @@ Olimp handler — instance-based с ЛОКАЛЬНОЙ генерацией x-to
 
 X-GUID = cookie visitor_id.
 
+UKEY (обновление 2026-10-05):
+  В Cupis-стеке ukey НЕ хранится в cookies/localStorage.
+  Источники в порядке приоритета:
+    1) self._ukey_confirmed — успешный ukey из прошлой попытки (кэш)
+    2) cookie user_ukey     — если появится явное поле
+    3) uid из /api/user/info — внутренний Cupis ID (перехватывается на prepare_page)
+    4) l из /api/user/info   — равен cookie user_login
+    5) cookie user_login    — fallback
+  clear_basket пробует кандидатов по очереди, первый успешный кэшируется.
+
 ВАЖНО ПРО ПАРСИНГ:
   Olimp для НТ/волейбола/баскета отдаёт:
-    - матчевые рынки: tableType=RESULT/HANDICAP/TOTAL (П1/П2, Фора 1/2, ТотБ/ТотМ)
+    - матчевые рынки: tableType=RESULT/HANDICAP/TOTAL
     - фазовые рынки:  tableType=OTHER
-      Форматы shortName для НТ (проверено по дампу 2026-09-30):
-        С5П1, С5П2                 — winner партии (С = сет)
-        С5Ф1К, С5Ф2К               — фора партии
-        С5ТотС5ТотМ, С5ТотС5ТотБ   — тотал партии
-        5СТотЧет, 5СТотНечет       — чёт/нечёт партии
-        С5ТотК1С5ТотК1М/Б          — ИТ1 партии
-        С5ТотК2С5ТотК2М/Б          — ИТ2 партии
-      Также бывают варианты с префиксом Ч (четверть) для баскета.
-  В set_markets кладём ТОЛЬКО фазовые (OTHER). Матчевые пропускаем целиком —
-  иначе ловим матчевый тотал (84.5) как тотал партии и проигрываем.
+  В set_markets кладём ТОЛЬКО фазовые (OTHER).
 
 КОРЗИНА (КРИТИЧНО):
-  Серверная корзина Olimp — это SHARED состояние ПРОФИЛЯ, а не страницы.
+  Серверная корзина Olimp — SHARED состояние ПРОФИЛЯ.
   Все вкладки одного AdsPower-профиля работают в одной сессии → одна корзина.
-  Если clear не сделать ПЕРЕД add — остатки от предыдущего неудачного
-  захода превратят одиночную ставку в экспресс с чужими исходами.
-
-  Поэтому place_bet делает СИНХРОННЫЙ clear перед add:
-    - clear не удался (2 попытки) → ставку НЕ отправляем
-    - clear ок → add → save (можно ретраить из _execute_bet,
-      т.к. следующий place_bet снова начнётся с чистого листа)
+  clear выполняется ПЕРЕД add СИНХРОННО.
 """
 import asyncio
 import hashlib
 import json
 import logging
 import re
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Tuple   # ← Tuple добавлен
 from playwright.async_api import Page, Response
 from .base import BookmakerHandler
 
@@ -61,9 +56,6 @@ _SECRET_RAW = ";4f;94;3/44:g/63:f/;c47/c639hchc82g;"
 _SECRET_CUPIS = "".join(chr(ord(c) - 2) for c in _SECRET_RAW)
 
 # Регулярка префикса фазы в shortName: С / Ч / П / C / Q / P
-#   С5П1    — С (сет) + 5 (номер) + П1
-#   Ч4П1    — Ч (четверть) + 4 + П1
-#   П2П1    — вариант
 _P = r'[СЧПCQPсчпcqp]'
 
 
@@ -110,11 +102,55 @@ class OlimpHandler(BookmakerHandler):
         self._callback: Optional[Callable] = None
         self._listener = None
 
+        # ← НОВОЕ: данные пользователя из /api/user/info
+        self._uid_from_api: int = 0
+        self._login_from_api: str = ""
+        self._ukey_confirmed: str = ""   # кэш успешного ukey
+
+    # ============================================================
+    # prepare_page — вызывается ДО page.goto
+    # ============================================================
+    async def prepare_page(self, page: Page):
+        """
+        Вешает listener ДО page.goto, чтобы перехватить /api/user/info,
+        который фронт Olimp дёргает сразу при загрузке страницы.
+        Без этого мы пропустим uid и login.
+        """
+        if self._listener and self._page and not self._page.is_closed():
+            try:
+                self._page.remove_listener("response", self._listener)
+            except Exception:
+                pass
+
+        self._page = page
+
+        async def on_response(response: Response):
+            await self._handle_response(response)
+
+        self._listener = on_response
+        page.on("response", on_response)
+        logger.info("Olimp: prepare_page — listener установлен ДО goto")
+
     # ============================================================
     # setup / stop
     # ============================================================
     async def setup_listener(self, page: Page, callback,
                              match_id=None, match_teams=None):
+        # Если prepare_page уже вызван — listener уже стоит,
+        # просто обновляем target и callback.
+        if self._listener and self._page is page:
+            if match_id:
+                self.target_match_id = str(match_id)
+            if match_teams:
+                self.target_teams = list(match_teams)
+            self._callback = callback
+            logger.info(
+                f"Olimp: setup_listener (listener уже был) "
+                f"target={self.target_match_id}"
+            )
+            return
+
+        # Fallback: если prepare_page не звали — ставим listener сейчас
         if self._listener and self._page and not self._page.is_closed():
             try:
                 self._page.remove_listener("response", self._listener)
@@ -147,12 +183,30 @@ class OlimpHandler(BookmakerHandler):
         logger.info(f"Olimp: listener снят (target={self.target_match_id})")
 
     # ============================================================
-    # Парсинг live-данных
+    # Перехват ответов
     # ============================================================
     async def _handle_response(self, response: Response):
         url = response.url
 
-        # ── Баланс Olimp ──
+        # ── 1) /api/user/info — uid и login ──
+        # ← НОВОЕ
+        if '/api/user/info' in url:
+            try:
+                data = await response.json()
+                d = (data or {}).get("data") or {}
+                if d.get("uid"):
+                    self._uid_from_api = int(d["uid"])
+                if d.get("l"):
+                    self._login_from_api = str(d["l"])
+                logger.info(
+                    f"Olimp: user_info перехвачен "
+                    f"(l={self._login_from_api} uid={self._uid_from_api})"
+                )
+            except Exception as e:
+                logger.debug(f"Olimp user/info parse: {e}")
+            return
+
+        # ── 2) Баланс ──
         if '/api/user/balance' in url:
             try:
                 data = await response.json()
@@ -164,16 +218,51 @@ class OlimpHandler(BookmakerHandler):
                 pass
             return
 
-        if 'api/v4/0/live/' not in response.url:
+        # ── 3) Live-данные ──
+        if 'api/v4/0/live/' not in url:
             return
         try:
             data = await response.json()
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Olimp: live parse fail {url[-70:]}: {e}")
             return
+
         target = self.target_match_id
+
+        # ── ДИАГНОСТИКА: первые 8 live-ответов пишем в лог ──
+        if not hasattr(self, "_live_logged"):
+            self._live_logged = 0
+        if self._live_logged < 8:
+            self._live_logged += 1
+            try:
+                snippet = json.dumps(data, ensure_ascii=False)
+            except Exception:
+                snippet = repr(data)
+            logger.info(
+                f"Olimp: 🔍 live #{self._live_logged} "
+                f"target={target} "
+                f"url=...{url[-70:]} "
+                f"type={type(data).__name__} "
+                f"len={len(data) if hasattr(data, '__len__') else '?'} "
+                f"body[:500]={snippet[:500]}"
+            )
+
         if not target:
             return
+
         all_events = OlimpHandler._extract_all_events(data)
+
+        if not hasattr(self, "_extract_logged"):
+            self._extract_logged = 0
+        if self._extract_logged < 8:
+            self._extract_logged += 1
+            keys = list(all_events.keys())
+            logger.info(
+                f"Olimp: 🔍 extract → {len(all_events)} events, "
+                f"first_ids={keys[:5]}, "
+                f"target({target}) in_events={target in all_events}"
+            )
+
         parsed = all_events.get(target)
         if not parsed:
             return
@@ -183,6 +272,9 @@ class OlimpHandler(BookmakerHandler):
             except Exception as e:
                 logger.error(f"Olimp callback: {e}", exc_info=True)
 
+    # ============================================================
+    # Парсинг live-данных
+    # ============================================================
     @staticmethod
     def _extract_all_events(data) -> Dict[str, dict]:
         result: Dict[str, dict] = {}
@@ -245,33 +337,33 @@ class OlimpHandler(BookmakerHandler):
             sub1, sub2 = pairs[-1]
 
         comment = event.get('comment', '') or ''
-        phase_num = 0
+
+        # ── Определяем ТЕКУЩУЮ фазу ──
+        # НТ / волейбол: score = счёт по партиям → текущая партия = score1+score2+1.
+        #   Пример: score="2:2" → идёт 5-я партия → в исходах помечено С5П1 ✅
+        #   НЕ используем `#N` из comment — у Olimp там НЕ номер фазы!
+        #   (проверено на дампе 2026-10-05: comment="...#2", score="2:2",
+        #    исходы помечены С5П1 → реальная фаза = 5, а не 2)
+        #
+        # Баскет / кибер: score = очки, фазу берём из comment "N-я четверть"
+        #   или из количества записей в mapsScore.
         if sport_key in ('basketball', 'cyber_basketball'):
             mm = re.search(r'(\d+)-я\s+четверть', comment)
             if mm:
                 phase_num = int(mm.group(1))
+            elif maps:
+                phase_num = len(maps)
             else:
-                phase_num = len(pairs) if pairs else 1
-        elif sport_key == 'volleyball':
-            mm = re.search(r'#(\d+)', comment)
-            if mm:
-                phase_num = int(mm.group(1))
-            else:
-                phase_num = score1 + score2 + 1
+                phase_num = 1
         else:
-            mm = re.search(r'#(\d+)', comment)
-            if mm:
-                phase_num = int(mm.group(1))
-            else:
-                phase_num = score1 + score2 + 1
+            # table_tennis, volleyball и прочие партийные виды
+            phase_num = score1 + score2 + 1
 
         set_key = f"set_{phase_num}"
         set_markets: dict = {}
         outcome_ids: dict = {}
         outcomes = event.get('outcomes', []) or []
 
-        # ВАЖНО: берём ТОЛЬКО tableType == 'OTHER' (фазовые рынки).
-        # RESULT/HANDICAP/TOTAL — матчевые, игнорируем.
         for out in outcomes:
             if not isinstance(out, dict):
                 continue
@@ -283,6 +375,18 @@ class OlimpHandler(BookmakerHandler):
                 continue
             if not short_name:
                 continue
+
+            # ── Снимаем префиксы доп. линий (д / д1 / д2) ──
+            # У Olimp доп. форы и тоталы помечаются префиксом:
+            #   "дС5Ф1К", "д1С5Ф1К", "д2С5Ф1К"
+            # После снятия всё превращается в обычное "С5Ф1К"
+            # и матчится базовым regex'ом ниже.
+            sn = short_name
+            for _pfx in ("д1", "д2", "д"):
+                if sn.startswith(_pfx):
+                    sn = sn[len(_pfx):]
+                    break
+            short_name = sn
 
             try:
                 prob = float(str(out.get('probability', '0')).replace(',', '.'))
@@ -331,8 +435,9 @@ class OlimpHandler(BookmakerHandler):
                     }
                 continue
 
-            # ── Тотал сета: С5ТотС5ТотМ / Ч4ТотЧ4ТотМ ──
-            m = re.match(rf'^{_P}(\d+)Тот{_P}\d+Тот([МБ])$', short_name)
+            # ── Тотал сета: С5ТотС5ТотМ / С5Тот1С5Тот1М / Ч4ТотЧ4ТотМ ──
+            # \d* после каждого "Тот" — допускает номер линии (1, 2, 3...)
+            m = re.match(rf'^{_P}(\d+)Тот\d*{_P}\d+Тот\d*([МБ])$', short_name)
             if m:
                 n = int(m.group(1))
                 if n != phase_num:
@@ -396,10 +501,7 @@ class OlimpHandler(BookmakerHandler):
                 continue
 
             # ── ИТ игрока в сете (новый формат): С5ТотК1С5ТотК1М ──
-            m = re.match(
-                rf'^{_P}(\d+)ТотК([12]){_P}\d+ТотК\2([МБ])$',
-                short_name,
-            )
+            m = re.match(rf'^{_P}(\d+)ТотК([12])\d*{_P}\d+ТотК\2\d*([МБ])$', short_name,)
             if m:
                 n = int(m.group(1))
                 if n != phase_num:
@@ -441,18 +543,12 @@ class OlimpHandler(BookmakerHandler):
     # Clear basket — СИНХРОННЫЙ, ДВЕ ПОПЫТКИ
     # ============================================================
     async def _clear_basket(self, page: Page, ukey: str, x_guid: str) -> bool:
-        """
-        Синхронная очистка корзины Olimp.
-
-        Критично: корзина — shared state профиля, а не страницы.
-        Если clear не сделать перед add — остатки от предыдущего
-        неудачного захода превратят одиночную ставку в экспресс.
-
-        Две попытки: первая может упасть из-за сетевого блипа,
-        вторая обычно проходит. Если обе упали — возвращаем False,
-        и place_bet НЕ будет отправлять ставку.
-        """
-        if not ukey or page.is_closed():
+        """Синхронная очистка корзины. 2 попытки."""
+        if not ukey:
+            logger.warning("Olimp clear_basket: пустой ukey")
+            return False
+        if page.is_closed():
+            logger.warning("Olimp clear_basket: страница закрыта")
             return False
 
         body = {
@@ -496,10 +592,6 @@ class OlimpHandler(BookmakerHandler):
                 continue
 
             if not isinstance(result, dict):
-                logger.debug(
-                    f"Olimp clear_basket attempt {attempt}: bad response "
-                    f"({type(result).__name__})"
-                )
                 if attempt == 1:
                     await asyncio.sleep(0.3)
                 continue
@@ -523,23 +615,6 @@ class OlimpHandler(BookmakerHandler):
     # Place bet
     # ============================================================
     async def place_bet(self, page: Page, bet_data: dict) -> dict:
-        """
-        bet_data:
-          - market_data (str) — basketId
-          - kf (float)
-          - amount (int/float) — ставим int
-          - outcome_id (str|int|None) — originalId
-
-        Порядок:
-          1. Читаем cookies (session, x_guid, ukey)
-          2. СИНХРОННО чистим корзину (2 попытки)
-          3. Если clear не удался — НЕ ставим
-          4. basket/add — один исход
-          5. basket/save — фиксация ставки
-
-        Ретрай в _execute_bet безопасен: следующий place_bet снова
-        начнётся с синхронного clear и снесёт мусор от предыдущего.
-        """
         market_data = bet_data.get("market_data") or ""
         out_id = bet_data.get("outcome_id")
         if out_id is not None and market_data:
@@ -555,37 +630,93 @@ class OlimpHandler(BookmakerHandler):
         if not market_full or kf <= 1.01 or amount <= 0:
             return {"success": False, "error": "Olimp: invalid bet_data"}
 
-        # ── Читаем cookies ──
+        # ── 1) Cookies ──
         try:
-            session = await page.evaluate(
-                "() => { const m=document.cookie.match(/user_session=([^;]+)/); "
-                "return m ? decodeURIComponent(m[1]) : ''; }"
-            )
-            x_guid = await page.evaluate(
-                "() => { const m=document.cookie.match(/visitor_id=([^;]+)/); "
-                "return m ? decodeURIComponent(m[1]) : ''; }"
-            )
-            ukey = await page.evaluate(
-                "() => { const m=document.cookie.match(/user_ukey=([^;]+)/); "
-                "return m ? decodeURIComponent(m[1]) : ''; }"
-            )
+            cookies = await page.context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in cookies}
         except Exception as e:
             return {"success": False, "error": f"Olimp cookie: {e}"}
 
+        session = cookie_dict.get("user_session", "")
+        x_guid = cookie_dict.get("visitor_id", "")
+
         if not session:
             return {"success": False, "error": "Olimp: no user_session"}
+        if not x_guid:
+            return {"success": False, "error": "Olimp: no visitor_id (x-guid)"}
 
-        # ── СИНХРОННЫЙ CLEAR ПЕРЕД ADD ──
-        cleared = await self._clear_basket(page, ukey, x_guid)
-        if not cleared:
+        # ── 2) Кандидаты на ukey ──  ← НОВОЕ
+        ukey_candidates: List[Tuple[str, str]] = []
+
+        # 1) Кэш успешного ukey из прошлой попытки
+        if self._ukey_confirmed:
+            ukey_candidates.append(("cached", self._ukey_confirmed))
+
+        # 2) Явное поле user_ukey (если Olimp когда-то введёт)
+        direct_ukey = cookie_dict.get("user_ukey", "")
+        if direct_ukey:
+            ukey_candidates.append(("user_ukey", direct_ukey))
+
+        # 3) uid из /api/user/info (внутренний Cupis ID)
+        if self._uid_from_api:
+            ukey_candidates.append(("uid", str(self._uid_from_api)))
+
+        # 4) l из /api/user/info
+        if self._login_from_api:
+            ukey_candidates.append(("login_api", self._login_from_api))
+
+        # 5) cookie user_login (fallback)
+        login_cookie = cookie_dict.get("user_login", "")
+        if login_cookie:
+            existing_vals = {v for _, v in ukey_candidates}
+            if login_cookie not in existing_vals:
+                ukey_candidates.append(("login_cookie", login_cookie))
+
+        if not ukey_candidates:
             return {
                 "success": False,
-                "error": "Olimp: не удалось очистить корзину (риск экспресса)",
+                "error": ("Olimp: нет кандидатов ukey — "
+                          "/api/user/info не перехвачен и cookie user_login пуст"),
             }
 
+        # Уникализируем, сохраняя порядок
+        seen = set()
+        uniq = []
+        for name, val in ukey_candidates:
+            if val and val not in seen:
+                seen.add(val)
+                uniq.append((name, val))
+        ukey_candidates = uniq
+
+        short_list = [(n, (v[:8] + "…") if len(v) > 8 else v)
+                      for n, v in ukey_candidates]
+        logger.info(f"Olimp: кандидаты ukey: {short_list}")
+
+        # ── 3) Подбор рабочего ukey через clear ──  ← НОВОЕ
+        ukey = ""
+        for name, candidate in ukey_candidates:
+            cleared = await self._clear_basket(page, candidate, x_guid)
+            if cleared:
+                ukey = candidate
+                self._ukey_confirmed = candidate
+                logger.info(f"Olimp: ukey подтверждён (источник={name}) = {candidate}")
+                break
+            else:
+                logger.info(
+                    f"Olimp: ukey '{name}'={candidate} не прошёл clear — "
+                    f"пробуем следующего"
+                )
+
+        if not ukey:
+            return {
+                "success": False,
+                "error": ("Olimp: ни один из кандидатов ukey не сработал "
+                          "на clear_basket"),
+            }
+
+        # ── 4) basket/add ──
         sport_id = int(market_full.split(":")[-1] or 0)
 
-        # ── ADD ──
         add_body = {
             "coefs_ids": json.dumps(
                 [[market_full, str(kf), 1]],
@@ -638,7 +769,7 @@ class OlimpHandler(BookmakerHandler):
             return {"success": False, "error": "Olimp basket/add: empty stakes_list"}
         hash_key = list(stakes.keys())[0]
 
-        # ── SAVE ──
+        # ── 5) basket/save ──
         unique_hash = (await page.evaluate(
             "() => Array.from(crypto.getRandomValues(new Uint8Array(16)))"
             ".map(b => b.toString(16).padStart(2, '0')).join('')"

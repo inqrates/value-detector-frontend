@@ -257,6 +257,10 @@ class LigaStavokHandler(BookmakerHandler):
             except Exception:
                 pass
 
+        # Сначала гасим callback, чтобы snapshot_loop не дёргал его
+        # в момент отмены задачи
+        self._callback = None
+
         if self._snapshot_task and not self._snapshot_task.done():
             self._snapshot_task.cancel()
             try:
@@ -264,7 +268,6 @@ class LigaStavokHandler(BookmakerHandler):
             except (asyncio.CancelledError, Exception):
                 pass
         self._snapshot_task = None
-        self._callback = None
         self._page = None
 
         logger.info(f"LigaStavok: listener снят (target={self.target_match_id})")
@@ -614,7 +617,7 @@ class LigaStavokHandler(BookmakerHandler):
                     continue
                 set_markets.setdefault(set_key, {}).setdefault("winner", {})[side] = kf
                 outcome_ids.setdefault(set_key, {}).setdefault("winner", {})[side] = {
-                    "outcomeId": oid,
+                    "outcomeId": o.get("id"),
                     "factorId":  o.get("facId"),
                     "kf":        kf,
                 }
@@ -642,9 +645,11 @@ class LigaStavokHandler(BookmakerHandler):
             t["over"] = over[2]
             t["under"] = under[2]
             o = outcome_ids.setdefault(set_key, {}).setdefault("total", {})
-            o["over"] = {"outcomeId": over[0], "factorId": over[1].get("facId"),
+            o["over"] = {"outcomeId": over[1].get("id"),
+                         "factorId": over[1].get("facId"),
                          "kf": over[2], "line": line}
-            o["under"] = {"outcomeId": under[0], "factorId": under[1].get("facId"),
+            o["under"] = {"outcomeId": under[1].get("id"),
+                          "factorId": under[1].get("facId"),
                           "kf": under[2], "line": line}
 
     def _parse_handicap(self, part_id, set_key, set_markets, outcome_ids):
@@ -666,7 +671,7 @@ class LigaStavokHandler(BookmakerHandler):
                     .setdefault("handicap", {}) \
                     .setdefault(side, {}) \
                     .update({
-                        "outcomeId": oid,
+                        "outcomeId": o.get("id"),
                         "factorId":  o.get("facId"),
                         "kf":        kf,
                         "line":      adv,
@@ -717,9 +722,11 @@ class LigaStavokHandler(BookmakerHandler):
             o = outcome_ids.setdefault(set_key, {}) \
                 .setdefault("it", {}) \
                 .setdefault(player, {})
-            o["over"] = {"outcomeId": over[0], "factorId": over[1].get("facId"),
+            o["over"] = {"outcomeId": over[1].get("id"),
+                         "factorId": over[1].get("facId"),
                          "kf": over[2], "line": line}
-            o["under"] = {"outcomeId": under[0], "factorId": under[1].get("facId"),
+            o["under"] = {"outcomeId": under[1].get("id"),
+                          "factorId": under[1].get("facId"),
                           "kf": under[2], "line": line}
 
     def _parse_odd(self, part_id, set_key, set_markets, outcome_ids):
@@ -748,10 +755,10 @@ class LigaStavokHandler(BookmakerHandler):
             odd["even"] = even_out[2]
             odd["odd"]  = odd_out[2]
             o = outcome_ids.setdefault(set_key, {}).setdefault("odd", {})
-            o["even"] = {"outcomeId": even_out[0],
+            o["even"] = {"outcomeId": even_out[1].get("id"),
                          "factorId":  even_out[1].get("facId"),
                          "kf":        even_out[2]}
-            o["odd"]  = {"outcomeId": odd_out[0],
+            o["odd"]  = {"outcomeId": odd_out[1].get("id"),
                          "factorId":  odd_out[1].get("facId"),
                          "kf":        odd_out[2]}
 
@@ -987,19 +994,6 @@ class LigaStavokHandler(BookmakerHandler):
                 return {{ success: false, error: 'bet/check отбит',
                           diag: {{ checkResp: checkFull }} }};
             }}
-
-            try {{
-                await fetch('https://api.ligastavok.ru/rest/bets/v1/getLimitsBatch', {{
-                    method: 'POST',
-                    headers: {{ ...commonHeaders, 'X-Req-Id': crypto.randomUUID() }},
-                    credentials: 'include',
-                    body: JSON.stringify({{
-                        currency: 'RUR',
-                        outcomeIds: [parseInt(data.outcomeId, 10)],
-                        sbp: true,
-                    }}),
-                }});
-            }} catch(e) {{ /* ignore */ }}
 
             try {{
                 const payload = {{

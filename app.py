@@ -25,11 +25,37 @@ for _name in (
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 # Наши модули — подробно, пока отлаживаем
-logging.getLogger('ui.after_goal_engine').setLevel(logging.DEBUG)
-logging.getLogger('ui.after_goal.betcity').setLevel(logging.DEBUG)
-#logging.getLogger('ui.after_goal.olimp').setLevel(logging.DEBUG)
-logging.getLogger('ui.after_goal.ligastavok').setLevel(logging.DEBUG)
+# Наши модули — обычный уровень. DEBUG включаем только при отладке
+# конкретной проблемы.
+logging.getLogger('ui.after_goal_engine').setLevel(logging.INFO)
+logging.getLogger('ui.after_goal.betcity').setLevel(logging.INFO)
+logging.getLogger('ui.after_goal.ligastavok').setLevel(logging.INFO)
 
+# ── Фильтр SPA-шума Marathon ──
+# Оставляем полезное (listener готов, hook installed, SSE-хук),
+# убираем весь JS-хлам (MARATHON_HOOK, REQ/RESP, mindbox, webpush).
+class _MarathonNoiseFilter(logging.Filter):
+    NOISE = (
+        "MARATHON_HOOK",
+        "MARATHON_XHR_SSE",
+        "Marathon REQ:",
+        "Marathon RESP:",
+        "Marathon SSE hook",
+        "Marathon MODELS_DUMP",
+        "Marathon console[log]",
+        "Marathon console[info]",
+        "Marathon console[debug]",
+        "Marathon console[warning]",
+        "mindbox",
+        "Banner not shown",
+        "already closed",
+        "webpush",
+    )
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(n in msg for n in self.NOISE)
+
+logging.getLogger('ui.after_goal.marathon').addFilter(_MarathonNoiseFilter())
 
 def main():
 
@@ -37,9 +63,6 @@ def main():
     app.setStyle("Fusion")
     app.setPalette(create_dark_palette())
     app.setStyleSheet(APP_STYLE)
-
-    # ── Автозапуск AdsPower в headless ──
-    _try_start_adspower_headless(app)
 
     # ---- Single-instance через QLockFile ----
     # Не даём запустить второй экземпляр, пока жив первый.
@@ -55,6 +78,8 @@ def main():
 
     # ---- qasync: интеграция PyQt5 и asyncio (для Playwright) ----
     # Без qasync asyncio.create_task не заработает из Qt-слотов.
+    # ВАЖНО: ставим loop ДО autostart AdsPower, иначе
+    # asyncio.ensure_future привяжет задачу к мёртвому дефолтному loop.
     try:
         import qasync
         loop = qasync.QEventLoop(app)
@@ -63,6 +88,9 @@ def main():
         print("❌ Не установлен qasync — автоставки работать не будут.")
         print("   Установите командой: pip install qasync")
         loop = None
+
+    # ── Автозапуск AdsPower в headless (после qasync!) ──
+    _try_start_adspower_headless(app)
 
     # ---- Окно входа ----
     login_win = LoginWindow()

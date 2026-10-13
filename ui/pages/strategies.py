@@ -453,6 +453,20 @@ class StrategiesPage(QWidget):
         )
         lv_form.addRow("Минимальный edge:", self.lv_min_edge)
 
+        self.lv_max_edge = QDoubleSpinBox()
+        self.lv_max_edge.setRange(1.0, 999.0)
+        self.lv_max_edge.setSingleStep(1.0)
+        self.lv_max_edge.setSuffix(" %")
+        self.lv_max_edge.setValue(20.0)
+        self.lv_max_edge.setToolTip(
+            "Максимальный edge. Всё выше — мусор:\n"
+            "  - slow догнал fast, но ещё не прислал апдейт\n"
+            "  - рынок закрывается\n"
+            "  - рассинхрон данных\n\n"
+            "Реальные live-value — 5–20%."
+        )
+        lv_form.addRow("Максимальный edge:", self.lv_max_edge)
+
         lv_hint = QLabel(
             "Сравниваются внутриматчевые кэфы (партии) fast и slow.\n"
             "Fast-БК берётся автоматически из сигнала бэкенда."
@@ -460,6 +474,27 @@ class StrategiesPage(QWidget):
         lv_hint.setWordWrap(True)
         lv_hint.setProperty("class", "hintLabel")
         lv_form.addRow("", lv_hint)
+
+        # ── Режим детекции value ──
+        self.lv_mode_combo = QComboBox()
+        self.lv_mode_combo.addItem(
+            "Кэфы + задержка по счёту (консервативно)",
+            "odds_with_score",
+        )
+        self.lv_mode_combo.addItem(
+            "Только кэфы (больше сигналов)",
+            "odds_only",
+        )
+        self.lv_mode_combo.setToolTip(
+            "Кэфы + задержка по счёту:\n"
+            "  fast должен отставать от slow по sub-счёту.\n"
+            "  Ставок меньше, но каждая надёжнее.\n\n"
+            "Только кэфы:\n"
+            "  ставим всегда, когда edge slow/fast > min_edge.\n"
+            "  Задержка по счёту НЕ требуется.\n"
+            "  Ставок больше, но винрейт может быть ниже."
+        )
+        lv_form.addRow("Способ детекции value:", self.lv_mode_combo)
 
         markets_label = QLabel("Рынки для сравнения:")
         markets_label.setStyleSheet(
@@ -759,6 +794,17 @@ class StrategiesPage(QWidget):
         except (ValueError, TypeError):
             self.lv_min_edge.setValue(5.0)
 
+        try:
+            self.lv_max_edge.setValue(float(st.get("max_edge_percent", 20.0)))
+        except (ValueError, TypeError):
+            self.lv_max_edge.setValue(20.0)
+            
+        lv_mode = st.get("lv_mode", "odds_with_score")
+        idx = self.lv_mode_combo.findData(lv_mode)
+        if idx < 0:
+            idx = 0
+        self.lv_mode_combo.setCurrentIndex(idx)            
+
         only = set(st.get("only_markets") or ["winner", "total", "handicap"])
         for code, cb in self.lv_market_cbs.items():
             cb.setChecked(code in only)
@@ -857,9 +903,21 @@ class StrategiesPage(QWidget):
 
         # ── Live-value поля ──
         st["min_edge_percent"] = self.lv_min_edge.value()
+        st["max_edge_percent"] = self.lv_max_edge.value()
+        st["lv_mode"] = self.lv_mode_combo.currentData() or "odds_with_score"        
         st["only_markets"] = [
             code for code, cb in self.lv_market_cbs.items() if cb.isChecked()
         ] or ["winner"]
+
+        # Защита: max не может быть меньше min
+        if st["max_edge_percent"] < st["min_edge_percent"]:
+            log_bus.warning(
+                "Стратегия",
+                f"«{st.get('name')}»: максимальный edge "
+                f"({st['max_edge_percent']:.1f}%) меньше минимального "
+                f"({st['min_edge_percent']:.1f}%) — поднял max до min"
+            )
+            st["max_edge_percent"] = st["min_edge_percent"]
 
         # ставка
         st["bet_size"] = self.bet_size.value()
@@ -877,6 +935,31 @@ class StrategiesPage(QWidget):
         self.store.save()
         self.strategies_changed.emit()
         self._rebuild_cards()
+
+        # ── Проверка: на пару (bk, profile_id) должна быть ОДНА
+        # активная стратегия — иначе в движке они используют один key
+        # и вторая молча перезапишет первую. ──
+        try:
+            from ui.strategy_store import _normalize_bk
+            if st.get("enabled") and st.get("profile_id") and st.get("bk"):
+                my_bk = _normalize_bk(st.get("bk"))
+                my_pid = st.get("profile_id")
+                for i, other in enumerate(self.store.strategies):
+                    if i == self.selected:
+                        continue
+                    if not other.get("enabled"):
+                        continue
+                    if (_normalize_bk(other.get("bk", "")) == my_bk
+                            and other.get("profile_id") == my_pid):
+                        log_bus.warning(
+                            "Стратегия",
+                            f"На пару «{my_bk} / {my_pid}» уже назначена "
+                            f"активная стратегия «{other.get('name')}». "
+                            f"Включённой останется только последняя."
+                        )
+                        break
+        except Exception as e:
+            logger.warning(f"duplicate check on save: {e}", exc_info=True)
 
         # ── Проверка рынков против возможностей БК ──
         try:

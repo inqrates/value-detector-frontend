@@ -19,10 +19,21 @@ Betcity handler — instance-based.
   - block W:   победитель партии (P1, P2)
   - block T1..T5: тоталы партии (5 линий: Tm=меньше, Tot=линия, Tb=больше)
   - block TEO: чёт/нечёт партии (E=Even=Чёт, O=Odd=Нечёт)
+
+ИТ (mid=913) — ключи блоков:
+  - IT1_T1, IT1_T2 → ИТ ИГРОКА 1
+  - IT2_T1, IT2_T2 → ИТ ИГРОКА 2
+  Игрок определяется ПРЕФИКСОМ (IT1/IT2), а не суффиксом (_T1/_T2).
+
+СТАВКИ (2026-10-08): порядок строго как у SPA Betcity.
+  1. basket/add → получаем reply.bsks[0] с t/s/kf/lv/id_pos + reply.ts
+  2. basket/checkout с этими СВЕЖИМИ полями (t, s, kf, fora) и ts=reply.ts.
+  ver=91 (не 88!). Settings в add — полный с clear_cart:true.
 """
 import json
 import logging
 import re
+import time
 from typing import Optional, Dict, List, Callable
 from playwright.async_api import Page, Response
 from .base import BookmakerHandler
@@ -221,9 +232,6 @@ class BetcityHandler(BookmakerHandler):
         if not set_markets:
             return None
 
-        # phase_num = номер текущей партии/четверти.
-        # Приоритет — длина sc_inter (сыгранные партии).
-        # Fallback — арифметика score для НТ/волейбола.
         phase_num = 0
         if sport_key == "table_tennis":
             phase_num = score1 + score2 + 1
@@ -275,9 +283,7 @@ class BetcityHandler(BookmakerHandler):
                     blocks = block.get('blocks') or {}
 
                     # ── mid=35: Исходы по партиям ──
-                    # Содержит W (winner), T1..T5 (тоталы), TEO (чёт/нечёт)
                     if market_id == _NT_WINNER:
-                        # ── W: победитель партии ──
                         w = blocks.get('W') or {}
                         for side, key in (('1', 'P1'), ('2', 'P2')):
                             if key in w:
@@ -292,7 +298,6 @@ class BetcityHandler(BookmakerHandler):
                                             'id': match_id, 'pos': ps, 'kf': odd,
                                         }
 
-                        # ── T1: тотал партии (первая линия) ──
                         t1 = blocks.get('T1') or {}
                         if t1:
                             try:
@@ -324,7 +329,6 @@ class BetcityHandler(BookmakerHandler):
                                     'lv': tm_info.get('lv', line),
                                 }
 
-                        # ── TEO: чёт/нечёт партии (E=Even=Чёт, O=Odd=Нечёт) ──
                         teo = blocks.get('TEO') or {}
                         if teo:
                             e_info = teo.get('E') or {}
@@ -349,7 +353,7 @@ class BetcityHandler(BookmakerHandler):
                                     'kf': odd_odd,
                                 }
 
-                    # ── mid=905: форы партии (4 линии) ──
+                    # ── mid=905: форы партии ──
                     elif market_id == _NT_HANDICAP:
                         for f_key, f_block in blocks.items():
                             if not f_key.startswith('F'):
@@ -377,11 +381,29 @@ class BetcityHandler(BookmakerHandler):
                                             'kf': odd, 'lv': lv,
                                         }
 
-                    # ── mid=913: ИТ партии (IT1, IT2 для игроков 1/2) ──
+                    # ── mid=913: ИТ партии ──
+                    # Игрок по префиксу IT1/IT2
                     elif market_id == _NT_IT:
                         for it_key, it_block in blocks.items():
                             if 'Tm' not in it_block or 'Tb' not in it_block:
                                 continue
+
+                            # ── Betcity-специфика ──
+                            # У Betcity блок IT1 = ИТ игрока 1 (name_ht),
+                            # блок IT2 = ИТ игрока 2 (name_at).
+                            #
+                            # Проверено 2026-10-13 по скриншоту Betcity:
+                            #   бот выбрал "it_1_over" (Севальнев, name_ht)
+                            #   Betcity отобразил "ИТБ2(3.5)" (Скоблов, name_at)
+                            #   → блок IT2 Betcity = ИТ игрока 2.
+                            # Инверсии НЕТ.
+                            if it_key.startswith('IT1'):
+                                player = '1'
+                            elif it_key.startswith('IT2'):
+                                player = '2'
+                            else:
+                                continue
+
                             line = float(it_block.get('Tot', 0) or 0)
                             for side, kkey in (('under', 'Tm'), ('over', 'Tb')):
                                 info = it_block[kkey]
@@ -389,8 +411,6 @@ class BetcityHandler(BookmakerHandler):
                                 ps = info.get('ps')
                                 lv = info.get('lv', line)
                                 if odd > 0:
-                                    player = ('1' if '_T1' in it_key
-                                              or 'IT1_T1' in it_key else '2')
                                     set_markets.setdefault(set_key, {}) \
                                         .setdefault('it', {}) \
                                         .setdefault(player, {})[side] = odd
@@ -410,8 +430,6 @@ class BetcityHandler(BookmakerHandler):
     @staticmethod
     def _parse_phase_markets(match_id: str, ev_data: dict,
                              set_markets: dict, outcome_ids: dict):
-        # Только ext — фазовые рынки.
-        # main содержит матчевые тоталы/форы — они нам не нужны.
         sources = []
         ext = ev_data.get('ext') or {}
         for m_id, m_data in ext.items():
@@ -515,6 +533,14 @@ class BetcityHandler(BookmakerHandler):
                             continue
                         if 'Tm' not in it_block or 'Tb' not in it_block:
                             continue
+
+                        if it_key.startswith('IT1'):
+                            player = '1'
+                        elif it_key.startswith('IT2'):
+                            player = '2'
+                        else:
+                            continue
+
                         line = float(it_block.get('Tot', 0) or 0)
                         for side, kkey in (('under', 'Tm'), ('over', 'Tb')):
                             info = it_block[kkey]
@@ -522,12 +548,6 @@ class BetcityHandler(BookmakerHandler):
                             ps = info.get('ps')
                             lv = info.get('lv', line)
                             if odd > 0:
-                                if 'IT1_T1' in it_key or '_T1' in it_key:
-                                    player = '1'
-                                elif 'IT1_T2' in it_key or '_T2' in it_key:
-                                    player = '2'
-                                else:
-                                    continue
                                 set_markets.setdefault(set_key, {}) \
                                     .setdefault('it', {}) \
                                     .setdefault(player, {})[side] = odd
@@ -550,28 +570,33 @@ class BetcityHandler(BookmakerHandler):
         if not page or page.is_closed() or not event_id:
             return None
 
+        # Точечный запрос вместо полного снапшота.
+        js_targeted = f"""
+            (async () => {{
+                try {{
+                    const r = await fetch(
+                        'https://ad.betcity.ru/d/on_air/bets'
+                        + '?rev=8&add=dep_event&ids={event_id}'
+                        + '&stat=1&ver=91&csn=ooca9s&lng=0',
+                        {{ credentials: 'include' }}
+                    );
+                    return await r.json();
+                }} catch(e) {{ return null; }}
+            }})()
+        """
         try:
-            data = await page.evaluate("""
-                (async () => {
-                    try {
-                        const r = await fetch(
-                            'https://ad.betcity.ru/d/on_air/bets'
-                            + '?rev=8&add=dep_events&ver=88&csn=ooca9s&lng=0',
-                            { credentials: 'include' }
-                        );
-                        return await r.json();
-                    } catch(e) { return null; }
-                })()
-            """)
+            data = await page.evaluate(js_targeted)
         except Exception as e:
-            logger.debug(f"Betcity refresh fetch: {e}")
-            return None
+            logger.debug(f"Betcity refresh (targeted): {e}")
+            data = None
 
-        if not isinstance(data, dict):
-            return None
+        parsed = None
+        if isinstance(data, dict):
+            all_events = BetcityHandler._extract_all_events(data)
+            parsed = all_events.get(event_id)
 
-        all_events = BetcityHandler._extract_all_events(data)
-        parsed = all_events.get(event_id)
+
+
         if not parsed:
             logger.debug(f"Betcity refresh: матч {event_id} не найден в payload")
             return None
@@ -584,21 +609,47 @@ class BetcityHandler(BookmakerHandler):
 
         if set_num and market and side:
             set_key = f"set_{set_num}"
-            info = (outcome_ids.get(set_key, {})
-                    .get(market, {})
-                    .get(side))
-            if info and info.get('pos') is not None:
-                return info
+
+            if market == 'it':
+                parts = str(side).split('_', 1)
+                if len(parts) == 2:
+                    player, direction = parts
+                    info = (outcome_ids.get(set_key, {})
+                            .get('it', {})
+                            .get(player, {})
+                            .get(direction))
+                    if info and info.get('pos') is not None:
+                        return info
+            else:
+                info = (outcome_ids.get(set_key, {})
+                        .get(market, {})
+                        .get(side))
+                if info and info.get('pos') is not None:
+                    return info
 
         old_pos = bet_data.get('pos')
         if old_pos is not None:
             for set_key, sets in outcome_ids.items():
-                for market_name, sides in sets.items():
-                    for side_name, info in sides.items():
-                        if not isinstance(info, dict):
-                            continue
-                        if str(info.get('pos')) == str(old_pos):
-                            return info
+                if not isinstance(sets, dict):
+                    continue
+                for market_name, market_val in sets.items():
+                    if not isinstance(market_val, dict):
+                        continue
+                    if market_name == 'it':
+                        for player_name, dirs in market_val.items():
+                            if not isinstance(dirs, dict):
+                                continue
+                            for side_name, info in dirs.items():
+                                if not isinstance(info, dict):
+                                    continue
+                                if str(info.get('pos')) == str(old_pos):
+                                    return info
+                    else:
+                        for side_name, info in market_val.items():
+                            if not isinstance(info, dict):
+                                continue
+                            if str(info.get('pos')) == str(old_pos):
+                                return info
 
         logger.debug(
             f"Betcity refresh: не нашли исход (event={event_id} "
@@ -607,7 +658,7 @@ class BetcityHandler(BookmakerHandler):
         return None
 
     # ============================================================
-    # Отправка ставки
+    # Отправка ставки (порядок строго как у SPA Betcity)
     # ============================================================
     async def place_bet(self, page: Page, bet_data: dict) -> dict:
         # ── 1) Refresh pos/kf/lv ──
@@ -634,13 +685,52 @@ class BetcityHandler(BookmakerHandler):
                 f"kf={bet_data.get('kf')})"
             )
 
+        # ═══════════════════════════════════════════════════════════
+        # GUARD: если после refresh edge пропал — отменяем ставку.
+        # Betcity с настройкой «соглашаться всегда» примет по любой
+        # цене, поэтому защита должна быть здесь.
+        # ═══════════════════════════════════════════════════════════
+        fast_odd = float(bet_data.get('fast_odd') or 0.0)
+        min_edge = float(bet_data.get('min_edge') or 0.05)
+        current_kf = float(bet_data.get('kf') or 0.0)
+
+        if fast_odd > 1.01 and current_kf > 1.01:
+            edge_now = current_kf / fast_odd - 1.0
+            if edge_now < min_edge:
+                logger.warning(
+                    f"Betcity: ❌ EDGE GONE after refresh — "
+                    f"current_kf={current_kf:.2f} / fast_odd={fast_odd:.2f} "
+                    f"= {edge_now*100:.1f}% < min_edge={min_edge*100:.1f}% "
+                    f"— отменяем"
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"Betcity: edge gone after refresh "
+                        f"({edge_now*100:.1f}% < {min_edge*100:.1f}%)"
+                    ),
+                    "diag": "edge_gone_after_refresh",
+                }
+            else:
+                logger.info(
+                    f"Betcity: ✓ edge OK после refresh "
+                    f"({edge_now*100:.1f}% ≥ {min_edge*100:.1f}%)"
+                )
+
         logger.warning(
             f"BETCITY BET_REQUEST: event_id={bet_data.get('event_id')} "
             f"pos={bet_data.get('pos')} kf={bet_data.get('kf')} "
             f"lv={bet_data.get('lv')} amount={bet_data.get('amount')}"
         )
 
-        # ── 2) basket/add → basket/checkout ──
+        # ── 2) add → checkout ──
+        #
+        # Строго по SPA Betcity (2026-10-08):
+        #   1. basket/add — body cart + settings (clear_cart: true)
+        #   2. из reply.bsks[0] берём: t, s, kf, id_pos, lv, max + reply.ts
+        #   3. basket/checkout — data[id_ev_ps] с этими свежими полями,
+        #      itemData.fora=lv (если lv>0), URL ts = reply.ts из add
+        #   ver=91 везде!
         script = f"""
         (async function() {{
             const data = {json.dumps(bet_data)};
@@ -654,32 +744,57 @@ class BetcityHandler(BookmakerHandler):
                     return {{ success: false, error: 'Betcity: cookie tk не найден' }};
                 }}
 
+                const nowSec = Math.floor(Date.now() / 1000);
                 const tum = Date.now() + '_' + Math.floor(Math.random() * 1000000);
+
+                // ═════════════════════════════════════════════════════
+                // 1) basket/add
+                // ═════════════════════════════════════════════════════
+                const addSettings = {{
+                    remember_bet: true,
+                    clear_cart: true,
+                    auto_vip_tg: false,
+                    fsum_1: 100,
+                    fsum_2: 500,
+                    bets_kf_type: 'koeff',
+                    show_warning: false,
+                    cart_kf_type: '6'
+                }};
+
                 let addUrl = 'https://hdr.betcity.ru/d/basket/add'
                     + '?sys=1'
                     + '&id=' + encodeURIComponent(data.event_id)
                     + '&pos=' + encodeURIComponent(data.pos)
                     + '&k=' + encodeURIComponent(data.kf)
-                    + '&ts=0'
+                    + '&ts=' + nowSec
                     + '&is_live=1';
-                if (data.lv !== undefined && data.lv !== null && data.lv > 0) {{
+                if (data.lv !== undefined && data.lv !== null && Number(data.lv) > 0) {{
                     addUrl += '&lv=' + encodeURIComponent(data.lv);
                 }}
                 addUrl += '&token=' + encodeURIComponent(token)
                        + '&tum=' + tum
-                       + '&ver=88&csn=ooca9s';
+                       + '&ver=91'
+                       + '&csn=ooca9s';
+
+                const addBody = 'cart=%7B%7D&settings='
+                    + encodeURIComponent(JSON.stringify(addSettings));
 
                 const addResp = await fetch(addUrl, {{
                     method: 'POST',
                     headers: {{
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Origin': 'https://betcity.ru',
-                        'Referer': 'https://betcity.ru/'
+                        'accept': 'application/json, text/plain, */*',
+                        'content-type': 'application/x-www-form-urlencoded'
                     }},
                     credentials: 'include',
-                    body: 'cart=%7B%7D&settings=%7B%7D'
+                    referrer: 'https://betcity.ru/',
+                    body: addBody
                 }});
                 const addResult = await addResp.json();
+
+                try {{
+                    console.log('BETCITY_ADD_RESP',
+                                JSON.stringify(addResult).slice(0, 700));
+                }} catch (e) {{}}
 
                 if (!addResult.ok
                     || !addResult.reply
@@ -688,28 +803,36 @@ class BetcityHandler(BookmakerHandler):
                     return {{
                         success: false,
                         error: 'Betcity basket/add: '
-                            + JSON.stringify(addResult).slice(0, 400)
+                            + JSON.stringify(addResult).slice(0, 500)
                     }};
                 }}
 
                 const bsk = addResult.reply.bsks[0];
-                const ts = addResult.reply.ts;
-                const s = bsk.s;
-                const t = bsk.t;
-                const maxBet = bsk.max || 100000;
+                const serverTs = addResult.reply.ts;
 
-                const itemKey = data.event_id + '_' + data.pos;
-                const checkoutData = {{}};
-                checkoutData[itemKey] = {{
-                    id_ev: data.event_id,
-                    ps: data.pos,
-                    kf: data.kf,
+                // ═════════════════════════════════════════════════════
+                // 2) basket/checkout — используем СВЕЖИЕ поля из add
+                // ═════════════════════════════════════════════════════
+                const freshPos = bsk.id_pos || data.pos;
+                const freshKf  = bsk.kf    || data.kf;
+                const itemKey  = String(data.event_id) + '_' + String(freshPos);
+
+                const itemData = {{
+                    id_ev: bsk.id_ev || data.event_id,
+                    ps: freshPos,
+                    kf: freshKf,
                     is_live: 1,
-                    t: t,
-                    s: s
+                    t: bsk.t,
+                    s: bsk.s
                 }};
+                if (bsk.lv !== undefined && bsk.lv !== null && Number(bsk.lv) > 0) {{
+                    itemData.fora = String(bsk.lv);
+                }}
 
-                const settings = {{
+                const checkoutData = {{}};
+                checkoutData[itemKey] = itemData;
+
+                const checkoutSettings = {{
                     remember_bet: true,
                     clear_cart: false,
                     show_warning: false,
@@ -722,7 +845,8 @@ class BetcityHandler(BookmakerHandler):
                     show_rec_sum: false
                 }};
 
-                const context = {{
+                const maxBet = bsk.max || 100000;
+                const checkoutContext = {{
                     api_method: 'checkout',
                     max_bet: maxBet,
                     shown_balance: maxBet,
@@ -738,37 +862,51 @@ class BetcityHandler(BookmakerHandler):
                         return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
                     }});
 
-                const body = [
+                const checkoutBody = [
                     'data=' + encodeURIComponent(JSON.stringify(checkoutData)),
-                    'settings=' + encodeURIComponent(JSON.stringify(settings)),
-                    'context=' + encodeURIComponent(JSON.stringify(context)),
+                    'settings=' + encodeURIComponent(JSON.stringify(checkoutSettings)),
+                    'context=' + encodeURIComponent(JSON.stringify(checkoutContext)),
                     'uuid=' + encodeURIComponent(uuid),
                     'bets[' + itemKey + ']=' + encodeURIComponent(data.amount)
                 ].join('&');
 
                 const checkoutUrl = 'https://hdr.betcity.ru/d/basket/checkout'
                     + '?type=6'
-                    + '&ts=' + encodeURIComponent(ts)
+                    + '&ts=' + encodeURIComponent(serverTs)
                     + '&token=' + encodeURIComponent(token)
                     + '&tum=' + tum
-                    + '&ver=88&csn=ooca9s';
+                    + '&ver=91'
+                    + '&csn=ooca9s';
+
+                try {{
+                    console.log('BETCITY_CHECKOUT_REQ',
+                                'pos=' + freshPos + ' kf=' + freshKf
+                                + ' ts=' + serverTs);
+                }} catch (e) {{}}
 
                 const checkoutResp = await fetch(checkoutUrl, {{
                     method: 'POST',
                     headers: {{
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Origin': 'https://betcity.ru',
-                        'Referer': 'https://betcity.ru/'
+                        'accept': 'application/json, text/plain, */*',
+                        'content-type': 'application/x-www-form-urlencoded'
                     }},
                     credentials: 'include',
-                    body: body
+                    referrer: 'https://betcity.ru/',
+                    body: checkoutBody
                 }});
                 const checkoutResult = await checkoutResp.json();
 
+                try {{
+                    console.log('BETCITY_CHECKOUT_RESP',
+                                JSON.stringify(checkoutResult).slice(0, 800));
+                }} catch (e) {{}}
+
                 if (checkoutResult.ok
                     && checkoutResult.reply
-                    && checkoutResult.reply.status === 0) {{
-                    const info = (checkoutResult.reply.bsks_out_bets || [])[0] || {{}};
+                    && checkoutResult.reply.status === 0
+                    && checkoutResult.reply.bsks_out_bets
+                    && checkoutResult.reply.bsks_out_bets.length > 0) {{
+                    const info = checkoutResult.reply.bsks_out_bets[0];
                     return {{
                         success: true,
                         betId: info.ids || info.item || 'N/A'
@@ -778,10 +916,10 @@ class BetcityHandler(BookmakerHandler):
                 return {{
                     success: false,
                     error: 'Betcity checkout: '
-                        + JSON.stringify(checkoutResult).slice(0, 400)
+                        + JSON.stringify(checkoutResult).slice(0, 500)
                 }};
             }} catch(e) {{
-                return {{ success: false, error: e.message }};
+                return {{ success: false, error: 'network: ' + e.message }};
             }}
         }})();
         """

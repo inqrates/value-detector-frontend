@@ -202,7 +202,14 @@ def _default(name, stype, enabled, profile_id="", bk="", sport="table_tennis"):
 
         # ── Live-value ──
         "min_edge_percent": 5.0,
+        "max_edge_percent": 20.0,
         "only_markets": ["winner", "total", "handicap"],
+        # ── LV: способ детекции value ──
+        # "odds_with_score" — кэфы + обязательная задержка по счёту
+        #                     (текущее поведение, консервативно)
+        # "odds_only"       — только сравнение кэфов fast/slow
+        #                     (больше сигналов, менее надёжно)
+        "lv_mode": "odds_with_score",
     }
 
 
@@ -360,13 +367,28 @@ class StrategyStore:
                 except (ValueError, TypeError):
                     s['min_edge_percent'] = 5.0
 
+            if 'max_edge_percent' not in s:
+                s['max_edge_percent'] = 20.0
+            else:
+                try:
+                    s['max_edge_percent'] = max(1.0, min(999.0,
+                        float(s['max_edge_percent'])))
+                except (ValueError, TypeError):
+                    s['max_edge_percent'] = 20.0
+
+            # Защита: max >= min
+            if s['max_edge_percent'] < s['min_edge_percent']:
+                s['max_edge_percent'] = s['min_edge_percent']
+
             if 'only_markets' not in s or not isinstance(s['only_markets'], list):
                 s['only_markets'] = ["winner", "total", "handicap"]
             else:
                 s['only_markets'] = [
                     m for m in s['only_markets'] if m in LIVE_VALUE_MARKETS
                 ] or ["winner"]
-
+            # ── LV режим ──
+            if s.get('lv_mode') not in ("odds_with_score", "odds_only"):
+                s['lv_mode'] = "odds_with_score"
             # Проверка типа
             t = (s.get('type') or '').lower()
             if t not in VALID_TYPES:
@@ -431,11 +453,15 @@ class StrategyStore:
             return True
         return False
 
-    def get_matching_strategy(self, payload: dict) -> Optional[dict]:
+    def get_matching_strategies(self, payload: dict) -> List[dict]:
+        """
+        Возвращает ВСЕ подходящие стратегии для сигнала.
+        Нужно, когда на одну БК работают несколько профилей.
+        """
+        result = []
         for s in self.strategies:
             if not s.get('enabled'):
                 continue
-            # Сигнал релевантен и для Послегола, и для Лайв-Валуя
             if (s.get('type') or '').lower() not in ('after-goal', 'live-value'):
                 continue
             if _normalize_bk(s.get('bk', '')) != _normalize_bk(payload.get('slow_bk', '')):
@@ -447,8 +473,13 @@ class StrategyStore:
                 continue
             if s.get('ignore_repeats', False) and not payload.get('is_new', False):
                 continue
-            return s
-        return None
+            result.append(s)
+        return result
+
+    def get_matching_strategy(self, payload: dict) -> Optional[dict]:
+        """Оставлен для совместимости. Возвращает ПЕРВУЮ подходящую."""
+        matches = self.get_matching_strategies(payload)
+        return matches[0] if matches else None
 
     def get_matching_strategies_by_type(self, stype: str, bk: str = None) -> List[Dict]:
         result = []

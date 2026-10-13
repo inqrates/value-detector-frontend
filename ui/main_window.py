@@ -285,20 +285,20 @@ class MainWindow(QMainWindow):
 
     # ---------- Обработчики WebSocket ----------
     def _on_signal(self, payload):
-        # 1) Всегда пытаемся преоткрыть матч, если стратегия подходит
-        if self.strategy_store.is_signal_relevant(payload):
-            strategy = self.strategy_store.get_matching_strategy(payload)
-            if strategy:
-                profile_id = strategy.get('profile_id')
-                if profile_id:
-                    asyncio.create_task(
-                        self.after_goal_engine.preopen_match_with_profile(payload, strategy)
-                    )
-                else:
-                    log_bus.warning(
-                        "Стратегия",
-                        f"'{strategy.get('name')}' — не указан profile_id для {payload.get('slow_bk')}"
-                    )
+        # 1) Преоткрываем матч для КАЖДОЙ подходящей стратегии.
+        #    Нужно, когда у одной БК несколько профилей.
+        strategies = self.strategy_store.get_matching_strategies(payload)
+        for strategy in strategies:
+            profile_id = strategy.get('profile_id')
+            if not profile_id:
+                log_bus.warning(
+                    "Стратегия",
+                    f"'{strategy.get('name')}' — не указан profile_id для {payload.get('slow_bk')}"
+                )
+                continue
+            asyncio.create_task(
+                self.after_goal_engine.preopen_match_with_profile(payload, strategy)
+            )
 
         # 2) Логируем и считаем только НОВЫЕ сигналы
         if not payload.get("is_new", False):
@@ -404,12 +404,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_preopen(self, payload):
-        strategy = self.strategy_store.get_matching_strategy(payload)
-        if not strategy:
-            return
-        profile_id = strategy.get('profile_id')
-        if not profile_id:
-            return
-        asyncio.create_task(
-            self.after_goal_engine.preopen_match_with_profile(payload, strategy)
-        )
+        strategies = self.strategy_store.get_matching_strategies(payload)
+        for strategy in strategies:
+            profile_id = strategy.get('profile_id')
+            if not profile_id:
+                continue
+            asyncio.create_task(
+                self.after_goal_engine.preopen_match_with_profile(payload, strategy)
+            )

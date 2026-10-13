@@ -88,7 +88,15 @@ class PariHandler(BookmakerHandler):
             return
 
         # ── Live-парсинг ──
-        if not ('/events/list' in url or '/events/listLight' in url):
+        #  Pari использует три эндпоинта:
+        #    /events/list       — полный live-список
+        #    /events/listLight  — облегчённый список
+        #    /events/event      — ОДИН матч (это дёргает фронт при заходе)
+        if not (
+            '/events/list' in url
+            or '/events/listLight' in url
+            or '/events/event' in url
+        ):
             return
 
         try:
@@ -108,33 +116,54 @@ class PariHandler(BookmakerHandler):
     @staticmethod
     def _resolve_active_phase(data: dict, root_id: str):
         """
-        Приоритет 1: liveEventInfos.subscores с ненулевым счётом
-        Приоритет 2 (fallback): ПЕРВАЯ партия среди children.
+        Возвращает (phase_num, phase_event_id, phase_name, sub1, sub2).
+
+        sub1/sub2 берутся из liveEventInfos.subscores — структурированный
+        источник от Pari (kindName="N-й сет", c1/c2 = точный счёт активной
+        партии). Если subscores нет — возвращаем sub1=sub2=0,
+        caller сделает fallback на comment.
         """
+        children = [ev for ev in data.get('events', []) or []
+                    if str(ev.get('parentId')) == str(root_id)]
+        children.sort(key=lambda e: e.get('sortOrder', ''))
+
+        children_by_kind = {}
+        for ch in children:
+            k = ch.get('kind')
+            if k is not None and k not in children_by_kind:
+                children_by_kind[k] = ch
+
+        # ── Приоритет 1: subscore с ненулевым счётом ──
         for info in data.get('liveEventInfos', []) or []:
             if str(info.get('eventId')) != str(root_id):
                 continue
-            subs = info.get('subscores') or []
-            for sub in subs:
+            for sub in info.get('subscores') or []:
                 kind_id = sub.get('kindId')
-                kind_name = sub.get('kindName', '')
                 c1 = int(sub.get('c1', 0) or 0)
                 c2 = int(sub.get('c2', 0) or 0)
-                if c1 > 0 or c2 > 0:
-                    m = re.search(r'(\d+)', kind_name)
-                    if m:
-                        return int(m.group(1)), kind_id, kind_name
-        children = [ev for ev in data.get('events', []) or []
-                    if str(ev.get('parentId')) == str(root_id)]
+                if c1 <= 0 and c2 <= 0:
+                    continue
+
+                ch = children_by_kind.get(kind_id)
+                if not ch:
+                    continue
+
+                name = ch.get('name', '') or sub.get('kindName', '')
+                m = re.search(r'(\d+)', name)
+                if not m:
+                    continue
+
+                # ← возвращаем sub1/sub2 из subscores
+                return int(m.group(1)), str(ch.get('id')), name, c1, c2
+
+        # ── Приоритет 2: первая партия (без sub) ──
         if children:
-            children.sort(key=lambda e: e.get('sortOrder', ''))
-            # ── Fallback: ПЕРВАЯ партия ──
             first = children[0]
             name = first.get('name', '')
             m = re.search(r'(\d+)', name)
             if m:
-                return int(m.group(1)), str(first.get('id')), name
-        return 0, None, ''
+                return int(m.group(1)), str(first.get('id')), name, 0, 0
+        return 0, None, '', 0, 0
 
     @staticmethod
     def _parse_phase_factors(factors: list, set_key: str,
@@ -280,7 +309,8 @@ class PariHandler(BookmakerHandler):
         if not event:
             return None
 
-        phase_num, phase_event_id, phase_name = \
+        (phase_num, phase_event_id, phase_name,
+         sub_from_subs1, sub_from_subs2) = \
             PariHandler._resolve_active_phase(data, match_id)
 
         misc = None
@@ -298,13 +328,43 @@ class PariHandler(BookmakerHandler):
         elif event:
             comment = event.get('comment', '') or ''
 
+        # ── Приоритет 1: sub1/sub2 из subscores ──
+        #  Структурированный источник, всегда синхронен с реальной
+        #  активной партией. Устраняет баг "phase_num=2, sub=от партии 1".
         sub1, sub2 = 0, 0
-        if comment:
-            pairs = re.findall(r'(\d+)[-:](\d+)', comment)
+        if sub_from_subs1 > 0 or sub_from_subs2 > 0:
+            sub1 = sub_from_subs1
+            sub2 = sub_from_subs2
+        elif comment:
+            # ── Приоритет 2: fallback через comment ──
+            #  Ищем пару со звёздочкой (активная партия).
+            #  Если звёздочки нет — берём pairs[-1] ТОЛЬКО когда
+            #  пар ровно столько, сколько ожидается по score.
+            pairs = re.findall(r'(\d+[*]?)-(\d+[*]?)', comment)
             if pairs:
-                last = pairs[-1]
-                sub1 = int(last[0])
-                sub2 = int(last[1])
+                active = None
+                for p in pairs:
+                    if '*' in p[0] or '*' in p[1]:
+                        active = p
+                        break
+
+                if active is None:
+                    expected = 0
+                    if misc:
+                        expected = (
+                            int(misc.get('score1', 0) or 0)
+                            + int(misc.get('score2', 0) or 0)
+                            + 1
+                        )
+                    if expected and len(pairs) == expected:
+                        active = pairs[-1]
+
+                if active is not None:
+                    a = active[0].replace('*', '')
+                    b = active[1].replace('*', '')
+                    if a.isdigit() and b.isdigit():
+                        sub1 = int(a)
+                        sub2 = int(b)
 
         set_markets = {}
         outcome_ids = {}
