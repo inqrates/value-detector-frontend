@@ -436,11 +436,13 @@ class MarathonHandler(BookmakerHandler):
             if not tree_id or not event_id:
                 return None
 
-            # У Marathon для баскетбола модели нумеруются со сдвигом +1:
+            # ── Сдвиг для баскетбола ──
+            # Marathon нумерует модели для баскетбола со сдвигом +1:
             #   MTCH_R1 = «весь матч»
             #   MTCH_R2 = Q1
             #   MTCH_R3 = Q2
-            # Для НТ такого сдвига нет — там MTCH_R1 = 1-я партия.
+            # Подтверждено логом 2026-10-13 19:42: partNumber=2 ↔ MTCH_R3.
+            # Для НТ сдвига нет — там MTCH_R1 = 1-я партия.
             sport_code = (data.get("sportCode") or "").lower()
             basket_shift = 1 if "basket" in sport_code else 0
 

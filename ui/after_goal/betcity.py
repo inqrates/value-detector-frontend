@@ -23,7 +23,9 @@ Betcity handler — instance-based.
 ИТ (mid=913) — ключи блоков:
   - IT1_T1, IT1_T2 → ИТ ИГРОКА 1
   - IT2_T1, IT2_T2 → ИТ ИГРОКА 2
-  Игрок определяется ПРЕФИКСОМ (IT1/IT2), а не суффиксом (_T1/_T2).
+  Игрок определяется ПРЕФИКСОМ (IT1/IT2), без инверсии.
+  Проверено 2026-10-13: Betcity IT1 = ИТ player1 (name_ht),
+  IT2 = ИТ player2 (name_at).
 
 СТАВКИ (2026-10-08): порядок строго как у SPA Betcity.
   1. basket/add → получаем reply.bsks[0] с t/s/kf/lv/id_pos + reply.ts
@@ -382,21 +384,13 @@ class BetcityHandler(BookmakerHandler):
                                         }
 
                     # ── mid=913: ИТ партии ──
-                    # Игрок по префиксу IT1/IT2
+                    # Без инверсии: IT1 = player1 (name_ht), IT2 = player2 (name_at).
+                    # Проверено 2026-10-13 по payload Betcity.
                     elif market_id == _NT_IT:
                         for it_key, it_block in blocks.items():
                             if 'Tm' not in it_block or 'Tb' not in it_block:
                                 continue
 
-                            # ── Betcity-специфика ──
-                            # У Betcity блок IT1 = ИТ игрока 1 (name_ht),
-                            # блок IT2 = ИТ игрока 2 (name_at).
-                            #
-                            # Проверено 2026-10-13 по скриншоту Betcity:
-                            #   бот выбрал "it_1_over" (Севальнев, name_ht)
-                            #   Betcity отобразил "ИТБ2(3.5)" (Скоблов, name_at)
-                            #   → блок IT2 Betcity = ИТ игрока 2.
-                            # Инверсии НЕТ.
                             if it_key.startswith('IT1'):
                                 player = '1'
                             elif it_key.startswith('IT2'):
@@ -534,6 +528,7 @@ class BetcityHandler(BookmakerHandler):
                         if 'Tm' not in it_block or 'Tb' not in it_block:
                             continue
 
+                        # Без инверсии: IT1 = player1, IT2 = player2
                         if it_key.startswith('IT1'):
                             player = '1'
                         elif it_key.startswith('IT2'):
@@ -594,8 +589,6 @@ class BetcityHandler(BookmakerHandler):
         if isinstance(data, dict):
             all_events = BetcityHandler._extract_all_events(data)
             parsed = all_events.get(event_id)
-
-
 
         if not parsed:
             logger.debug(f"Betcity refresh: матч {event_id} не найден в payload")

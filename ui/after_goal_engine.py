@@ -615,43 +615,21 @@ class AfterGoalEngine:
 
     def _get_fast_sub_for_after_goal(self, key: str, payload: dict):
         """
-        Возвращает (sub1, sub2, phase_num, source) для after-goal логики.
+        ЕДИНЫЙ источник fast-данных: только fast-client.
 
-        Приоритет:
-          1) fast-клиент (_get_fast_markets)      — свежие, ~100-500 мс
-          2) бэкенд (_get_fast_state)             — отстаёт на 0.5-2 сек
-          3) payload.fast_sub_score               — snapshot на момент сигнала
+        sub_score и phase_num берутся из ОДНОГО ответа fast-client,
+        поэтому согласованы по построению. Никакого fallback на бэкенд
+        или payload — они дают рассинхрон (sub от одного момента,
+        phase от другого), что приводило к ставкам не на ту фазу.
         """
-        # 1) fast-клиент
         fast_entry = self._get_fast_markets(key)
-        if fast_entry:
-            f_s1 = int(fast_entry.get("sub_score1", 0) or 0)
-            f_s2 = int(fast_entry.get("sub_score2", 0) or 0)
-            if f_s1 or f_s2:
-                return (
-                    f_s1, f_s2,
-                    int(fast_entry.get("phase_num", 0) or 0),
-                    "fast_client",
-                )
-
-        # 2) бэкенд
-        fast_bk = _normalize_bk(payload.get('fast_bk'))
-        fast_state = self._get_fast_state(key, fast_bk)
-        if fast_state:
-            return (
-                int(fast_state.get("sub_score1", 0) or 0),
-                int(fast_state.get("sub_score2", 0) or 0),
-                self._parse_phase_num(payload.get('fast_phase', '')),
-                "backend",
-            )
-
-        # 3) payload
-        ps = payload.get('fast_sub_score') or [0, 0]
+        if not fast_entry:
+            return (0, 0, 0, "none")
         return (
-            int(ps[0] or 0) if len(ps) > 0 else 0,
-            int(ps[1] or 0) if len(ps) > 1 else 0,
-            self._parse_phase_num(payload.get('fast_phase', '')),
-            "payload",
+            int(fast_entry.get("sub_score1", 0) or 0),
+            int(fast_entry.get("sub_score2", 0) or 0),
+            int(fast_entry.get("phase_num", 0) or 0),
+            "fast_client",
         )
 
     # ============================================================
@@ -2093,12 +2071,10 @@ class AfterGoalEngine:
         self._bets_enqueued.discard(key)
         self._last_ui_state.pop(key, None)
 
-        # ── Чистим счётчики ставок этого матча ──
-        # ВАЖНО: чистим ТОЛЬКО если по матчу НЕ было успешных ставок.
-        # Иначе новый сигнал по тому же match_id откроет новый монитор
-        # и поставит снова — а это нарушает max_bets_per_match.
-        # Баг «фантомное закрытие за 6с» относился к случаям, когда
-        # ставок не было — там счётчик действительно надо обнулять.
+        # ── Чистим счётчики ставок ТОЛЬКО если по матчу не было ставок ──
+        # Если ставка была (_bets_by_match[key] > 0) — счётчик оставляем,
+        # чтобы новый сигнал по тому же match_id не открывал монитор
+        # повторно (нарушал max_bets_per_match).
         if bets_count == 0:
             self._bets_by_match.pop(key, None)
             for pk in [k for k in list(self._bets_by_phase.keys())
@@ -2631,21 +2607,24 @@ class AfterGoalEngine:
                                  fast_state: Optional[dict],
                                  fast_sub_override: Optional[List[int]] = None,
                                  fast_phase_override: int = 0) -> Tuple[bool, str]:
+        """
+        ЕДИНЫЙ источник fast: fast_sub_override + fast_phase_override
+        из ОДНОГО ответа fast-client. Данные согласованы по построению,
+        поэтому Guard'ы не нужны.
+
+        Логика:
+          - slow не должен опережать fast (аномалия данных)
+          - fast не должен быть >1 фазы впереди (пропустили переход)
+          - если в одной фазе — сравниваем sub
+          - если fast впереди на 1 — валидный after-goal
+        """
         sport = payload.get('sport', 'table_tennis')
 
-        # ── ЕДИНЫЙ источник fast-данных: fast-client (override приоритетнее) ──
-        # fast_state из бэкенда отстаёт на 1-2 сек. В момент смены партии
-        # он даёт phase=4 + sub=12:10 (рассинхрон внутри пакета).
-        # _monitor_loop уже получает fast_sub из fast-client — передаём
-        # его сюда через fast_sub_override.
-        if fast_sub_override is not None:
-            fast_sub1 = int(fast_sub_override[0])
-            fast_sub2 = int(fast_sub_override[1])
-        elif fast_state:
-            fast_sub1 = int(fast_state.get("sub_score1") or 0)
-            fast_sub2 = int(fast_state.get("sub_score2") or 0)
-        else:
-            return False, "fast_sub отсутствует"
+        if fast_sub_override is None:
+            return False, "нет fast данных (fast-client не ответил)"
+
+        fast_sub1 = int(fast_sub_override[0])
+        fast_sub2 = int(fast_sub_override[1])
 
         slow_sub1 = int(data.get("sub_score1") or 0)
         slow_sub2 = int(data.get("sub_score2") or 0)
@@ -2653,113 +2632,41 @@ class AfterGoalEngine:
         if sport not in PHASE_END_BY_SCORE and sport not in PHASE_END_BY_TIME:
             return False, f"неизвестный sport={sport}"
 
-        # ── Защита: slow впереди fast по фазе ──
-        # Пример ложного сигнала из логов:
-        #   fast_phase=4, slow_phase_num=5, fast_sub=[4,10], slow_sub=[0,0]
-        #   diff = +10 → "Задержка подтверждена". Но это рассинхрон:
-        #   slow уже в 5-й партии, а fast ещё в 4-й. Такой сигнал
-        #   глушим здесь, чтобы не мусорить в UI и не гонять monitor
-        #   до таймаута на пустом best_bet.
-        # ── Единый источник фазы (согласовано с _choose_best_bet) ──
-        # Раньше для НТ фаза считалась из score, а _choose_best_bet
-        # брала fast_phase из payload — это давало расхождение.
-        if fast_phase_override > 0:
-            fast_phase_num = fast_phase_override
-        else:
-            fast_phase_num = self._parse_phase_num(payload.get('fast_phase', ''))
+        fast_phase_num = int(fast_phase_override or 0)
         slow_phase_num = int(data.get('phase_num') or 0)
 
-        # Fallback: если у fast нет phase (бывает у некоторых БК)
-        if not fast_phase_num and sport in PHASE_END_BY_SCORE and fast_state:
-            fast_phase_num = (
-                int(fast_state.get("score1") or 0)
-                + int(fast_state.get("score2") or 0)
-                + 1
-            )
-        if not slow_phase_num and sport in PHASE_END_BY_SCORE:
-            slow_phase_num = (
-                int(data.get("score1") or 0)
-                + int(data.get("score2") or 0)
-                + 1
+        if fast_phase_num <= 0 or slow_phase_num <= 0:
+            return False, (
+                f"нет фазы (fast={fast_phase_num}, slow={slow_phase_num})"
             )
 
-        if fast_phase_num > 0 and slow_phase_num > 0 \
-                and slow_phase_num > fast_phase_num:
+        # Slow не должен опережать fast — это аномалия данных
+        if slow_phase_num > fast_phase_num:
             return False, (
                 f"slow впереди fast "
                 f"(fast={fast_phase_num}, slow={slow_phase_num})"
             )
 
-        # ── Guard: slow_sub = 0:0, но fast уже много набрал ──
-        # Marathon часто отдаёт sub=0:0 после перехода на новую
-        # партию — данные parts[] ещё не подгрузились. Это не задержка,
-        # а потеря данных. Иначе бот ставит winner/under по очкам
-        # fast, а slow вообще не знает про эту партию.
-        # Пример: fast 12:10 (4-я партия), slow 0:0 (всё ещё 4-я
-        # по счёту, но очки не пришли). Ставка ставилась на "4-ю партию",
-        # а по факту только что закончилась 3-я.
-        slow_sub_sum = slow_sub1 + slow_sub2
-        fast_sub_sum = fast_sub1 + fast_sub2
-        if slow_sub_sum == 0 and fast_sub_sum >= 5:
+        # Fast слишком далеко (>1 фазы) — пропускаем
+        if fast_phase_num > slow_phase_num + 1:
             return False, (
-                f"slow_sub=0:0 при fast_sub={fast_sub1}:{fast_sub2} "
-                f"— потеря данных, не задержка"
+                f"fast слишком далеко "
+                f"(fast={fast_phase_num}, slow={slow_phase_num})"
             )
 
-        # ── Guard 2: переходный момент между партиями ──
-        # Завершённость партии проверяем ПО ПРАВИЛАМ ВИДА СПОРТА,
-        # а не по сумме очков (сумма >= 11 глушит 6:5, 7:4 — это баг).
-        def _phase_is_done(s1, s2, pnum):
-            if sport == 'table_tennis':
-                return (s1 >= 11 and s1 - s2 >= 2) or \
-                       (s2 >= 11 and s2 - s1 >= 2)
-            if sport in ('volleyball', 'beach_volleyball'):
-                thr = 15 if (pnum or 1) >= 5 else 25
-                return (s1 >= thr and s1 - s2 >= 2) or \
-                       (s2 >= thr and s2 - s1 >= 2)
-            return False
+        # Обе в одной фазе — сравниваем sub
+        if fast_phase_num == slow_phase_num:
+            diff = max(fast_sub1 - slow_sub1, fast_sub2 - slow_sub2)
+            min_t = self._get_min_threshold(strategy)
+            if diff >= min_t:
+                return True, f"sub fast-slow: +{diff} (min={min_t})"
+            return False, f"sub diff={diff} < {min_t}"
 
-        if fast_phase_num > 0 and slow_phase_num > 0 \
-                and fast_phase_num == slow_phase_num:
-            fast_done = _phase_is_done(fast_sub1, fast_sub2, fast_phase_num)
-            slow_done = _phase_is_done(slow_sub1, slow_sub2, slow_phase_num)
-
-            if fast_done and not slow_done and slow_sub_sum < 4:
-                return False, (
-                    f"переходный момент: fast завершил партию "
-                    f"({fast_sub1}:{fast_sub2}) vs slow "
-                    f"({slow_sub1}:{slow_sub2}) — разные партии"
-                )
-            if slow_done and not fast_done and fast_sub_sum < 4:
-                return False, (
-                    f"переходный момент: slow завершил партию "
-                    f"({slow_sub1}:{slow_sub2}) vs fast "
-                    f"({fast_sub1}:{fast_sub2}) — разные партии"
-                )
-
-        # ── Guard 3: целостность fast-пакета ──
-        # Fast показал sub завершённой партии, но phase_num при этом
-        # равен текущей (не следующей). Это внутреннее противоречие:
-        #   phase=4, sub=12:10
-        # Возможно, sub от 3-й партии, а phase уже переключился на 4-ю.
-        # Проверяем: если fast завершил партию по очкам И у slow < 4 очков —
-        # это явный рассинхрон fast-пакета, не валидный сигнал.
-        if fast_phase_num > 0 and _phase_is_done(fast_sub1, fast_sub2,
-                                                  fast_phase_num) \
-                and slow_sub_sum < 4:
-            return False, (
-                f"fast-пакет нецелостный: fast_sub={fast_sub1}:{fast_sub2} "
-                f"(партия {fast_phase_num} завершена), но "
-                f"slow_sub={slow_sub1}:{slow_sub2} (<4) — "
-                f"это данные предыдущей партии"
-            )
-
-        diff = max(fast_sub1 - slow_sub1, fast_sub2 - slow_sub2)
-        min_t = self._get_min_threshold(strategy)
-
-        if diff >= min_t:
-            return True, f"sub fast-slow: +{diff} (min={min_t})"
-        return False, f"sub diff={diff} < {min_t}"
+        # Fast впереди на 1 фазу — валидный after-goal
+        return True, (
+            f"fast на фазу впереди "
+            f"(fast={fast_phase_num}, slow={slow_phase_num})"
+        )
 
     # ============================================================
     # Подтверждённые исходы (послегол)
@@ -3897,6 +3804,7 @@ class AfterGoalEngine:
             nonlocal on_update_count, last_callback_at, monitor_deadline
             on_update_count += 1
             last_callback_at = time.time()
+            best_bet = None
 
             if not self._monitoring_active.get(key, False):
                 logger.info(f"⏹ on_update: мониторинг {key} неактивен")
@@ -3919,37 +3827,27 @@ class AfterGoalEngine:
             fast_sub = [fast_sub_tuple[0], fast_sub_tuple[1]]
             fast_phase_from_client = int(fast_sub_tuple[2] or 0)
 
-            # fast_score (счёт партий) пока берём из бэкенда — fast-client
-            # не всегда его отдаёт корректно. После парсинга sub из fast-client,
-            # score можно тоже уточнить (в _fast_markets есть score1/score2).
+            # fast_score — только из fast-client (согласован с sub/phase)
             fast_entry = self._get_fast_markets(key)
             if fast_entry:
                 fast_score = [int(fast_entry.get("score1") or 0),
                               int(fast_entry.get("score2") or 0)]
             else:
-                fast_state = self._get_fast_state(key, fast_bk)
-                if fast_state:
-                    fast_score = [int(fast_state.get("score1") or 0),
-                                  int(fast_state.get("score2") or 0)]
-                else:
-                    fast_score = [0, 0]
-
-            # Для передачи в _verify_delay_still_open оставляем fast_state
-            # (там тоже нужно будет обновить — но это следующая итерация)
-            fast_state = self._get_fast_state(key, fast_bk)
+                fast_score = [0, 0]
 
             slow_sub = [data.get("sub_score1", 0) or 0,
                         data.get("sub_score2", 0) or 0]
             slow_score = [data.get("score1", 0) or 0,
                           data.get("score2", 0) or 0]
 
+            fast_available = (fast_phase_from_client > 0)
             logger.info(
                 f"🎬 on_update #{on_update_count} key={key} "
                 f"slow_bk={slow_bk} fast_bk={fast_bk} "
                 f"fast_score={fast_score} slow_score={slow_score} "
                 f"fast_sub={fast_sub} slow_sub={slow_sub} "
-                f"fast_available={bool(fast_state)} "
-                f"fast_phase={payload.get('fast_phase')!r} "
+                f"fast_available={fast_available} "
+                f"fast_phase_num={fast_phase_from_client} "
                 f"fast_prev_phase={payload.get('fast_prev_phase')!r} "
                 f"slow_phase_num={data.get('phase_num')} "
                 f"set_markets_keys={list((data.get('set_markets') or {}).keys())}"
@@ -3983,13 +3881,13 @@ class AfterGoalEngine:
             teams_ui = current_payload.get('match_teams', ['?', '?'])
 
             if strategy_type == 'live-value':
+                # ── LIVE-VALUE ──
                 best_bet = self._choose_live_value_bet(
                     key, data, current_strategy, current_payload
                 )
                 if not best_bet:
                     return
 
-                # Продлеваем монитор, пока есть валидный edge
                 monitor_deadline = time.time() + MONITOR_MAX_LIFETIME
 
                 log_key = (
@@ -4009,14 +3907,14 @@ class AfterGoalEngine:
                         level="success",
                     )
             else:
+                # ── AFTER-GOAL ──
                 is_open, reason = self._verify_delay_still_open(
-                    data, current_payload, current_strategy, fast_state,
+                    data, current_payload, current_strategy, None,
                     fast_sub_override=fast_sub,
                     fast_phase_override=fast_phase_from_client,
                 )
                 logger.info(f"🔍 delay_still_open={is_open} ({reason})")
 
-                # Продлеваем монитор, пока задержка жива
                 if is_open:
                     monitor_deadline = time.time() + MONITOR_MAX_LIFETIME
 
@@ -4064,6 +3962,10 @@ class AfterGoalEngine:
                     level="success",
                 )
 
+            if not best_bet:
+                # Сюда не должны попадать — все ветки выше делают return
+                # если best_bet не найден. Но на всякий случай.
+                return
             phase_key = (key, best_bet['set_number'])
             if self._bets_by_phase.get(phase_key, 0) >= max_bets_per_phase:
                 logger.info(f"⏭ on_update: лимит ставок в фазе "
