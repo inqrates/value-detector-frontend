@@ -41,6 +41,15 @@ AFTER_GOAL_TIMEOUT = 25
 MONITOR_MAX_LIFETIME = 40.0
 AFTER_GOAL_COOLDOWN = 10
 
+# ── Максимальная реалистичная задержка fast→slow в очках ──
+# Реальная задержка: НТ 1-3 очка, волейбол 2-4, баскетбол 4-8.
+# Если diff БОЛЬШЕ этой величины — это не задержка, а устаревший
+# кэш slow (WS не обновился, HTTP-снапшот не пришёл).
+# После такой "ставки" BK отвечает 51091 "Недоступен исход".
+# Значение 5 покрывает 99% валидных задержек в НТ/волейболе;
+# для баскетбола можно поставить 8, если будут пропускаться.
+MAX_PLAUSIBLE_DELAY_POINTS = 5
+
 logger = logging.getLogger(__name__)
 
 _aux_logger = logging.getLogger('ui.after_goal_engine.aux')
@@ -62,6 +71,18 @@ def _match_id_from_key(key: str) -> str:
         return key.split("__", 1)[0]
     return key
 
+def _normalize_key_name(name: str) -> str:
+    """Точная копия core.normalizer.normalize_name, чтобы не тащить импорт с бекенда."""
+    if not name:
+        return ""
+    text = re.sub(r'\(.*?\)', '', name)
+    text = re.sub(r'\d+', '', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = text.lower()
+    words = [w for w in text.split() if len(w) > 1]
+    if not words:
+        words = text.split()
+    return max(words, key=len) if words else ""
 
 HANDLERS = {
     "fonbet": FonbetHandler,
@@ -222,7 +243,10 @@ class AfterGoalEngine:
     PROFILE_LAUNCH_COOLDOWN = 30.0
     PREOPEN_COOLDOWN = 15.0
 
-    def __init__(self):
+    def __init__(self, signal_client=None):
+        # ── НОВОЕ: WS-клиент для получения match_state пушем ──
+        self._signal_client = signal_client
+
         # ── ВАЖНО: все state-словари (кроме _profile_active_matches,
         # _profile_locks, _profile_launch_attempts, _bet_queues,
         # _queue_workers) ключуются СОСТАВНЫМ ключом
@@ -251,6 +275,10 @@ class AfterGoalEngine:
         self._profile_locks: Dict[str, asyncio.Lock] = {}
         self._preopen_last_attempt: Dict[str, float] = {}
         self._preopen_in_flight: set = set()
+        # ── ФИКС 2026-10-29: Winline — 1 активный матч на профиль.
+        # Один сигнал "уже открыт", второй — "навигация в процессе"
+        # (защита от race condition при 2 сигналах подряд).
+        self._winline_preopen_in_progress: set = set()
 
         self._profile_active_matches: Dict[str, int] = {}
         self._bet_queues: Dict[str, asyncio.Queue] = {}
@@ -259,6 +287,7 @@ class AfterGoalEngine:
 
         self._fast_state: Dict[str, dict] = {}
         self._fast_poll_tasks: Dict[str, asyncio.Task] = {}
+        self._ws_key_to_internal: Dict[str, str] = {}
         self._fast_markets_poll_tasks: Dict[str, asyncio.Task] = {}
 
         # ── Fast-профиль AdsPower (для БК без HTTP-клиента: LigaStavok, Zenit) ──
@@ -269,6 +298,9 @@ class AfterGoalEngine:
         self._fast_monitor_tasks: Dict[str, asyncio.Task] = {}
 
         self._last_ui_state: Dict[str, tuple] = {}
+        self._bets_diag_count = 0
+        self._recent_bets: Dict[tuple, float] = {}
+        self._recent_bets_ttl = 30.0   # секунд — окно защиты от дублей        
 
     # ============================================================
     # Активация стратегии
@@ -534,27 +566,84 @@ class AfterGoalEngine:
                     # Мержим в _fast_state, не перетирая данные счёта
                     state = self._fast_state.setdefault(key, {})
 
-                    # ── НЕ перетираем ненулевые sub/score нулями ──
                     new_sub1 = int(result.get("sub_score1", 0) or 0)
                     new_sub2 = int(result.get("sub_score2", 0) or 0)
-                    old_sub1 = int(state.get("markets_sub1", 0) or 0)
-                    old_sub2 = int(state.get("markets_sub2", 0) or 0)
-                    if (new_sub1 or new_sub2) or not (old_sub1 or old_sub2):
-                        state["markets_sub1"] = new_sub1
-                        state["markets_sub2"] = new_sub2
-
                     new_score1 = int(result.get("score1", 0) or 0)
                     new_score2 = int(result.get("score2", 0) or 0)
-                    old_score1 = int(state.get("markets_score1", 0) or 0)
-                    old_score2 = int(state.get("markets_score2", 0) or 0)
-                    if (new_score1 or new_score2) or not (old_score1 or old_score2):
+                    new_phase = int(result.get("phase_num", 0) or 0)
+                    old_phase = int(state.get("markets_phase", 0) or 0)
+
+                    # ── SANITY: не принимать пару (новая фаза + sub от
+                    #    завершённой партии). Это признак того, что
+                    #    fast-клиент прислал промежуточный фрейм, где
+                    #    parts.length уже N+1, а parts[-1] ещё старый.
+                    #    Такой фрейм дал бы: phase=3, sub=13:11 → движок
+                    #    поставил бы winner на уже завершённую партию. ──
+                    if (new_phase != old_phase and new_phase > 0
+                            and old_phase > 0):
+                        sport_low = (sport or "").lower()
+                        thr = 0
+                        if sport_low == "table_tennis":
+                            thr = 11
+                        elif sport_low in ("volleyball", "beach_volleyball"):
+                            thr = 15 if new_phase >= 5 else 25
+                        if thr > 0:
+                            s1_done = (new_sub1 >= thr
+                                       and new_sub1 - new_sub2 >= 2)
+                            s2_done = (new_sub2 >= thr
+                                       and new_sub2 - new_sub1 >= 2)
+                            if s1_done or s2_done:
+                                logger.info(
+                                    f"⏭ FAST_MARKETS[{key}] {fast_bk}: "
+                                    f"смена фазы {old_phase}→{new_phase}, "
+                                    f"но sub={new_sub1}:{new_sub2} — "
+                                    f"похоже на завершённую партию. "
+                                    f"Пропускаю фрейм."
+                                )
+                                await asyncio.sleep(1)
+                                continue
+
+                    # ── СМЕНА ФАЗЫ: обновляем ВСЁ принудительно, даже нулями ──
+                    # Если phase_num изменился — значит началась новая партия.
+                    # Её sub = 0:0 (или маленький), и это ПРАВИЛЬНО.
+                    # Логика "не перетирать нулями" здесь ломала бы картину:
+                    # phase=7, sub=11:7 (от завершённой 6-й партии).
+                    if new_phase != old_phase and new_phase > 0:
+                        state["markets_sub1"] = new_sub1
+                        state["markets_sub2"] = new_sub2
                         state["markets_score1"] = new_score1
                         state["markets_score2"] = new_score2
+                        logger.info(
+                            f"🔄 FAST_MARKETS[{key}] смена фазы "
+                            f"{old_phase} → {new_phase}: "
+                            f"sub={new_sub1}:{new_sub2} "
+                            f"score={new_score1}:{new_score2}"
+                        )
+                    else:
+                        # ── Та же фаза: старая логика с защитой от нулей ──
+                        old_sub1 = int(state.get("markets_sub1", 0) or 0)
+                        old_sub2 = int(state.get("markets_sub2", 0) or 0)
+                        if (new_sub1 or new_sub2) or not (old_sub1 or old_sub2):
+                            state["markets_sub1"] = new_sub1
+                            state["markets_sub2"] = new_sub2
+
+                        old_score1 = int(state.get("markets_score1", 0) or 0)
+                        old_score2 = int(state.get("markets_score2", 0) or 0)
+                        if (new_score1 or new_score2) or not (old_score1 or old_score2):
+                            state["markets_score1"] = new_score1
+                            state["markets_score2"] = new_score2
 
                     state["markets"] = result.get("set_markets", {})
-                    state["markets_phase"] = result.get("phase_num", 0)
+                    state["markets_phase"] = new_phase
                     state["markets_match_id"] = result.get("match_id")
                     state["markets_fetched_at"] = time.time()
+                    # ── НОВОЕ: prev_sub из fast-клиента ──
+                    state["markets_prev_sub1"] = int(
+                        result.get("prev_sub_score1", 0) or 0)
+                    state["markets_prev_sub2"] = int(
+                        result.get("prev_sub_score2", 0) or 0)
+                    state["markets_prev_phase"] = int(
+                        result.get("prev_phase_num", 0) or 0)
 
                     logger.debug(
                         f"📡 FAST_MARKETS[{key}] {fast_bk} "
@@ -563,6 +652,31 @@ class AfterGoalEngine:
                     )
                 else:
                     fail_count += 1
+
+                    # ── ФИКС: fast-клиент вернул None (партия завершена) —
+                    #    инвалидируем кэш, чтобы _get_fast_markets не
+                    #    отдал устаревшую рассогласованную пару
+                    #    (phase=3, sub=13:11 от завершённой 2-й). ──
+                    state = self._fast_state.get(key)
+                    if state is not None:
+                        _old_phase = state.get("markets_phase", 0)
+                        _old_sub1 = state.get("markets_sub1", 0)
+                        _old_sub2 = state.get("markets_sub2", 0)
+                        if _old_phase or _old_sub1 or _old_sub2:
+                            logger.info(
+                                f"⚠️ FAST_MARKETS[{key}] {fast_bk}: "
+                                f"fast-клиент вернул None — сбрасываю кэш "
+                                f"(было phase={_old_phase} "
+                                f"sub={_old_sub1}:{_old_sub2})"
+                            )
+                        state["markets"] = {}
+                        state["markets_phase"] = 0
+                        state["markets_sub1"] = 0
+                        state["markets_sub2"] = 0
+                        state["markets_score1"] = 0
+                        state["markets_score2"] = 0
+                        state["markets_fetched_at"] = 0
+
                     if fail_count == 5:
                         logger.warning(
                             f"⚠️ FAST_MARKETS[{key}] {fast_bk}: "
@@ -591,7 +705,7 @@ class AfterGoalEngine:
         fetched_at = entry.get("markets_fetched_at", 0)
         if not fetched_at:
             return None
-        if time.time() - fetched_at > 5.0:
+        if time.time() - fetched_at > 2.0:
             return None
         return {
             "set_markets": entry.get("markets") or {},
@@ -601,7 +715,101 @@ class AfterGoalEngine:
             "sub_score1":  entry.get("markets_sub1", 0),
             "sub_score2":  entry.get("markets_sub2", 0),
             "match_id":    entry.get("markets_match_id"),
+            # ── НОВОЕ ──
+            "prev_sub_score1": entry.get("markets_prev_sub1", 0),
+            "prev_sub_score2": entry.get("markets_prev_sub2", 0),
+            "prev_phase_num":  entry.get("markets_prev_phase", 0),
         }
+
+
+    # ============================================================
+    # WS-пуш: подписка на match_state вместо REST polling
+    # ============================================================
+    def _make_ws_key(self, payload: dict) -> str:
+        sport = (payload.get('sport') or 'table_tennis').lower()
+        teams = payload.get('match_teams') or ['', '']
+        
+        # Используем ЛОКАЛЬНУЮ функцию нормализации
+        p1 = _normalize_key_name(teams[0])
+        p2 = _normalize_key_name(teams[1])
+        
+        if p1 > p2:
+            p1, p2 = p2, p1
+        return f"{sport}::{p1}||{p2}"
+
+    def _subscribe_fast_state(self, key: str):
+        if self._signal_client is not None:
+            payload = self._monitoring_payloads.get(key)
+            if not payload:
+                return
+            ws_key = self._make_ws_key(payload)
+            self._ws_key_to_internal[ws_key] = key
+            try:
+                self._signal_client.subscribe_match(ws_key)
+                logger.info(f"🔔 Подписка на WS по ключу: {ws_key}")
+            except Exception as e:
+                logger.debug(f"subscribe_match({ws_key}): {e}")
+
+    def _monitoring_key_for_match(self, payload: dict) -> Optional[str]:
+        mid = payload.get('match_id')
+        if not mid:
+            return None
+        for k, p in self._monitoring_payloads.items():
+            if p.get('match_id') == mid:
+                return k
+        return None
+
+    def _unsubscribe_fast_state(self, key: str):
+        if self._signal_client is not None:
+            for ws_key, int_key in list(self._ws_key_to_internal.items()):
+                if int_key == key:
+                    self._ws_key_to_internal.pop(ws_key, None)
+                    try:
+                        self._signal_client.unsubscribe_match(ws_key)
+                    except Exception as e:
+                        logger.debug(f"unsubscribe_match({ws_key}): {e}")
+
+    def on_match_state(self, data: dict):
+        ws_key = data.get("key")
+        if not ws_key:
+            return
+            
+        key = self._ws_key_to_internal.get(ws_key)
+        if not key:
+            return
+
+        if not self._monitoring_active.get(key, False):
+            return
+            
+        bks = data.get("bks") or {}
+        state = self._fast_state.setdefault(key, {})
+        
+        # ── КЭШИРУЕМ PREV_SUB ДЛЯ AFTER-GOAL ──
+        payload = self._monitoring_payloads.get(key, {})
+        fast_bk = _normalize_bk(payload.get('fast_bk'))
+        
+        if fast_bk and fast_bk in bks:
+            new_bk_data = bks[fast_bk]
+            old_bks = state.get("bks", {})
+            old_bk_data = old_bks.get(fast_bk, {})
+            
+            old_phase = (old_bk_data.get("raw_time") or "").strip()
+            new_phase = (new_bk_data.get("raw_time") or "").strip()
+            
+            # Если фаза изменилась — запоминаем счет СТАРОЙ партии
+            if old_phase and new_phase and old_phase != new_phase:
+                old_sub1 = int(old_bk_data.get("sub_score1") or 0)
+                old_sub2 = int(old_bk_data.get("sub_score2") or 0)
+                if old_sub1 > 0 or old_sub2 > 0:
+                    state["ws_prev_sub1"] = old_sub1
+                    state["ws_prev_sub2"] = old_sub2
+                    logger.info(f"📡 WS: Смена фазы '{old_phase}' -> '{new_phase}'. Prev_sub: {old_sub1}:{old_sub2}")
+
+        state["bks"] = bks
+        state["fetched_at"] = time.time()
+        state["now_on_backend"] = data.get("now")
+        state.pop("not_found", None)
+
 
     def _get_fast_state(self, key: str, fast_bk: str) -> Optional[dict]:
         entry = self._fast_state.get(key)
@@ -615,22 +823,30 @@ class AfterGoalEngine:
 
     def _get_fast_sub_for_after_goal(self, key: str, payload: dict):
         """
-        ЕДИНЫЙ источник fast-данных: только fast-client.
-
-        sub_score и phase_num берутся из ОДНОГО ответа fast-client,
-        поэтому согласованы по построению. Никакого fallback на бэкенд
-        или payload — они дают рассинхрон (sub от одного момента,
-        phase от другого), что приводило к ставкам не на ту фазу.
+        Берет данные ТОЛЬКО из WS-пуша (без HTTP клиентов).
+        Возвращает: (sub1, sub2, phase_num, prev_sub1, prev_sub2)
         """
-        fast_entry = self._get_fast_markets(key)
-        if not fast_entry:
-            return (0, 0, 0, "none")
-        return (
-            int(fast_entry.get("sub_score1", 0) or 0),
-            int(fast_entry.get("sub_score2", 0) or 0),
-            int(fast_entry.get("phase_num", 0) or 0),
-            "fast_client",
-        )
+        fast_bk = _normalize_bk(payload.get("fast_bk"))
+        state = self._fast_state.get(key, {})
+        bk_data = (state.get("bks") or {}).get(fast_bk)
+        
+        if not bk_data:
+            return (0, 0, 0, 0, 0)
+            
+        sub1 = int(bk_data.get("sub_score1") or 0)
+        sub2 = int(bk_data.get("sub_score2") or 0)
+        
+        raw_time = (bk_data.get("raw_time") or "").strip()
+        phase_num = self._parse_phase_num(raw_time)
+        if phase_num <= 0:
+            s1 = int(bk_data.get("score1") or 0)
+            s2 = int(bk_data.get("score2") or 0)
+            phase_num = s1 + s2 + 1
+            
+        prev1 = int(state.get("ws_prev_sub1") or 0)
+        prev2 = int(state.get("ws_prev_sub2") or 0)
+        
+        return (sub1, sub2, phase_num, prev1, prev2)
 
     # ============================================================
     # Пороги отставания по рынкам
@@ -724,104 +940,65 @@ class AfterGoalEngine:
     # ============================================================
     def _verify_delay_now(self, key: str, strategy: dict,
                           market: Optional[str] = None) -> Tuple[bool, str]:
+        # Получаем данные ИЗ WS-ПУША (единый источник)
+        state = self._fast_state.get(key, {})
+        bks = state.get("bks", {})
+        
         payload = self._monitoring_payloads.get(key)
         if not payload:
             return False, "нет payload"
 
-        slow_data = self._last_slow_data.get(key)
-        if not slow_data:
-            return False, "нет slow_data"
+        fast_bk = _normalize_bk(payload.get('fast_bk'))
+        slow_bk = _normalize_bk(payload.get('slow_bk'))
+        
+        fast_data = bks.get(fast_bk)
+        slow_data = bks.get(slow_bk)
 
-        slow_age = time.time() - self._last_update_time.get(key, 0)
-        if slow_age > SLOW_DATA_STALE_SEC:
-            return False, f"slow_data старше {slow_age:.1f}с"
+        if not fast_data or not slow_data:
+            missing = []
+            if not fast_data:
+                missing.append(f"fast={fast_bk}")
+            if not slow_data:
+                missing.append(f"slow={slow_bk}")
+            return False, f"retryable: нет WS-данных ({', '.join(missing)})"
 
-        sport = payload.get('sport', 'table_tennis')
+        # Берем счет из WS
+        f_score1 = int(fast_data.get("score1") or 0)
+        f_score2 = int(fast_data.get("score2") or 0)
+        f_sub1 = int(fast_data.get("sub_score1") or 0)
+        f_sub2 = int(fast_data.get("sub_score2") or 0)
+        
+        s_score1 = int(slow_data.get("score1") or 0)
+        s_score2 = int(slow_data.get("score2") or 0)
+        s_sub1 = int(slow_data.get("sub_score1") or 0)
+        s_sub2 = int(slow_data.get("sub_score2") or 0)
 
-        # ── Fast-счёт: fast-клиент → бэкенд → payload ──
-        fast_sub1, fast_sub2, _, _src = \
-            self._get_fast_sub_for_after_goal(key, payload)
+        # Считаем прогресс партии (Fast vs Slow)
+        f_phase = self._parse_phase_num(fast_data.get("raw_time", ""))
+        if f_phase <= 0:
+            f_phase = f_score1 + f_score2 + 1
+            
+        s_phase = self._parse_phase_num(slow_data.get("raw_time", ""))
+        if s_phase <= 0:
+            s_phase = s_score1 + s_score2 + 1
 
-        # Логируем источник — для отладки и сравнения
-        backend_bk = _normalize_bk(payload.get('fast_bk'))
-        backend_s = self._get_fast_state(key, backend_bk)
-        if backend_s:
-            b_s1 = int(backend_s.get("sub_score1") or 0)
-            b_s2 = int(backend_s.get("sub_score2") or 0)
-            if (b_s1 != fast_sub1 or b_s2 != fast_sub2):
-                logger.info(
-                    f"📊 FAST_SRC key={key}: "
-                    f"used={_src} {fast_sub1}:{fast_sub2} "
-                    f"| backend {b_s1}:{b_s2} "
-                    f"| diff={fast_sub1-b_s1:+d}:{fast_sub2-b_s2:+d}"
-                )
+        if f_phase < s_phase:
+            return False, f"fast отстает от slow по фазе (f={f_phase}, s={s_phase})"
 
-        slow_sub1 = int(slow_data.get("sub_score1") or 0)
-        slow_sub2 = int(slow_data.get("sub_score2") or 0)
+        # Если партии разные — отличная задержка (смена сета/партии)
+        if f_phase > s_phase:
+            return True, f"Задержка по фазе: fast={f_phase}, slow={s_phase}"
 
-        # Счёт партий берём из бэкенда (он ок для определения фазы)
-        fast_score1 = 0
-        fast_score2 = 0
-        if backend_s := self._get_fast_state(key, _normalize_bk(payload.get('fast_bk'))):
-            fast_score1 = int(backend_s.get("score1") or 0)
-            fast_score2 = int(backend_s.get("score2") or 0)
-        slow_score1 = int(slow_data.get("score1") or 0)
-        slow_score2 = int(slow_data.get("score2") or 0)
+        # Если партия одна — сравниваем очки
+        diff = max(f_sub1 - s_sub1, f_sub2 - s_sub2)
+        min_t = self._get_market_threshold(strategy, market) if market else self._get_min_threshold(strategy)
+        
+        if diff >= min_t:
+            return True, f"Задержка по очкам: +{diff} (fast {f_sub1}:{f_sub2} / slow {s_sub1}:{s_sub2})"
+            
+        return False, f"Задержки нет (diff={diff} < {min_t})"
 
-        # ── Определяем фазу ──
-        if sport in PHASE_END_BY_SCORE:
-            fast_phase_num = fast_score1 + fast_score2 + 1
-            slow_phase_num = slow_score1 + slow_score2 + 1
-        else:
-            fast_phase_num = self._parse_phase_num(
-                payload.get('fast_phase', '')
-            )
-            slow_phase_num = int(slow_data.get('phase_num') or 0)
-
-        # ── Случай 1: fast на партию впереди (валидный after-goal) ──
-        if (fast_phase_num > 0 and slow_phase_num > 0
-                and fast_phase_num == slow_phase_num + 1):
-            logger.debug(
-                f"verify_delay_now: fast на партию впереди "
-                f"(fast={fast_phase_num}, slow={slow_phase_num}) — delay OK"
-            )
-            return True, (
-                f"fast на партию впереди "
-                f"(fast {fast_score1}:{fast_score2}, "
-                f"slow {slow_score1}:{slow_score2})"
-            )
-
-        # ── Случай 2: рассинхрон фаз — не сравниваем sub_score ──
-        if (fast_phase_num > 0 and slow_phase_num > 0
-                and fast_phase_num != slow_phase_num):
-            return False, (
-                f"фазы рассинхронизированы "
-                f"(fast={fast_phase_num}, slow={slow_phase_num}) — "
-                f"sub_score несравним"
-            )
-
-        # ── Случай 3: обе в одной фазе — сравниваем sub_score ──
-        diff = max(fast_sub1 - slow_sub1, fast_sub2 - slow_sub2)
-        if market:
-            threshold = self._get_market_threshold(strategy, market)
-        else:
-            threshold = self._get_min_threshold(strategy)
-
-        if diff >= threshold:
-            return True, (
-                f"fast {fast_sub1}:{fast_sub2} vs slow {slow_sub1}:{slow_sub2} "
-                f"(+{diff}, порог={threshold})"
-            )
-        return False, (
-            f"fast {fast_sub1}:{fast_sub2} vs slow {slow_sub1}:{slow_sub2} "
-            f"(diff={diff} < {threshold})"
-        )
-
-    def _verify_live_value_now(self, key: str,
-                                strategy: dict) -> Tuple[bool, str]:
-        """
-        Проверка для live-value перед ставкой.
-        """
+    def _verify_live_value_now(self, key: str, strategy: dict) -> Tuple[bool, str]:
         payload = self._monitoring_payloads.get(key)
         if not payload:
             return False, "нет payload"
@@ -829,7 +1006,7 @@ class AfterGoalEngine:
         # 1) Свежие fast_markets
         fast_entry = self._get_fast_markets(key)
         if not fast_entry:
-            return False, "fast_markets протухли (>5с)"
+            return False, "fast_markets протухли (>2с)"
 
         # 2) Свежий slow_data
         slow_data = self._last_slow_data.get(key)
@@ -840,11 +1017,9 @@ class AfterGoalEngine:
         if slow_age > SLOW_DATA_STALE_SEC:
             return False, f"slow_data старше {slow_age:.1f}с"
 
-        # 3) Пересчитываем edge на свежих данных
+        # 3) Пересчитываем edge
         try:
-            fresh_best = self._choose_live_value_bet(
-                key, slow_data, strategy, payload
-            )
+            fresh_best = self._choose_live_value_bet(key, slow_data, strategy, payload)
         except Exception as e:
             logger.debug(f"_verify_live_value_now: recalc: {e}")
             return False, f"ошибка пересчёта: {e}"
@@ -852,11 +1027,7 @@ class AfterGoalEngine:
         if not fresh_best:
             return False, "edge пропал (кэфы сошлись)"
 
-        return True, (
-            f"edge +{fresh_best['edge']*100:.1f}% "
-            f"({fresh_best['market']} {fresh_best['side']}, "
-            f"slow {fresh_best['odd']:.2f} / fast {fresh_best['fast_odd']:.2f})"
-        )
+        return True, f"edge +{fresh_best['edge']*100:.1f}%"
 
     # ============================================================
     # REFRESH outcome_id для retry
@@ -998,10 +1169,17 @@ class AfterGoalEngine:
             logger.error(f"[FAST-TAB] не удалось открыть вкладку: {e}")
             return None
 
-        handler = handler_cls(
-            target_match_id=match_id,
-            target_teams=[player1, player2],
-        )
+        # ── ФИКС 2026-10-19: только LigaStavokHandler принимает sport=.
+        # Для всех остальных (Leon, Zenit, Marathon, Winline, …) это
+        # был TypeError → fast-tab падал с "unexpected keyword argument 'sport'"
+        # и live-value на этих БК вообще не запускался.
+        handler_kwargs = {
+            "target_match_id": match_id,
+            "target_teams": [player1, player2],
+        }
+        if handler_cls is LigaStavokHandler:
+            handler_kwargs["sport"] = sport
+        handler = handler_cls(**handler_kwargs)
         self._fast_handlers[key] = handler
 
         # prepare_page ДО goto (для LigaStavok — установка fetch-хука)
@@ -1187,6 +1365,19 @@ class AfterGoalEngine:
 
         sport = (payload.get('sport') or 'table_tennis').lower()
         slow_bk_early = _normalize_bk(payload.get('slow_bk'))
+        
+        # ── ЖЁСТКАЯ ПРОВЕРКА СПОРТА ИЗ СТРАТЕГИИ ──
+        # Если в настройках стратегии выбран конкретный вид спорта
+        # (например, "table_tennis"), мы не имеем права открывать
+        # матчи других видов (basketball, cyber_basketball и т.д.)
+        strat_sport = (strategy.get('sport') or 'any').lower()
+        if strat_sport != 'any' and strat_sport != sport:
+            logger.info(
+                f"🔴 PREOPEN SKIP {key}: спорт сигнала '{sport}' "
+                f"не совпадает со спортом стратегии '{strat_sport}'"
+            )
+            return
+        
         allowed = AUTOBET_ENABLED_SPORTS_BY_BK.get(slow_bk_early, set())
         if sport not in allowed:
             logger.info(
@@ -1226,6 +1417,35 @@ class AfterGoalEngine:
             logger.error(f"🔴 PREOPEN SKIP {key}: нет handler для {slow_bk}")
             return
 
+        # ── ФИКС 2026-10-29: Winline разлогинивает при ЛЮБОЙ второй
+        # вкладке. Матч открываем в ГЛАВНОЙ вкладке профиля — значит
+        # второй одновременный матч её перезапишет → убьёт первый.
+        # Держим: 1 активный матч + защиту от race condition (пока
+        # первый ещё не установил _monitoring_profiles, второй может
+        # проскочить по winline_active==0).
+        if slow_bk == "winline":
+            winline_active = sum(
+                1 for k, pid in self._monitoring_profiles.items()
+                if pid == profile_id
+                and _normalize_bk(
+                    self._monitoring_payloads.get(k, {}).get('slow_bk') or ''
+                ) == 'winline'
+            )
+            if winline_active >= 1:
+                logger.warning(
+                    f"🔴 PREOPEN SKIP {key}: Winline уже открыт в профиле "
+                    f"{profile_id} (1 матч за раз). Новый матч откроется, "
+                    f"когда текущий завершится."
+                )
+                return
+            if profile_id in self._winline_preopen_in_progress:
+                logger.warning(
+                    f"🔴 PREOPEN SKIP {key}: Winline в профиле {profile_id} "
+                    f"уже открывается (навигация в процессе)"
+                )
+                return
+            self._winline_preopen_in_progress.add(profile_id)
+
         max_parallel = 5 if handler_cls in INSTANCE_BASED_HANDLERS else 1
         active = self._profile_active_matches.get(profile_id, 0)
         if active >= max_parallel:
@@ -1244,21 +1464,47 @@ class AfterGoalEngine:
                 "Стратегия",
                 f"Профиль {profile_id} не открыт. Выключите и включите стратегию заново."
             )
+            # ── ФИКС 2026-10-29: снять флаг Winline, иначе при
+            # следующем сигнале сработает "уже открывается" навсегда.
+            if slow_bk == "winline":
+                self._winline_preopen_in_progress.discard(profile_id)
             return
 
-        try:
-            page = await browser_wrapper.new_page()
-            logger.info(f"📄 Открыта отдельная вкладка для key={key}")
-        except Exception as e:
-            logger.error(f"Не удалось открыть новую вкладку: {e} — используем главную")
+        # ── ФИКС 2026-10-29: Winline разлогинивает при открытии
+        # ЛЮБОЙ второй вкладки в профиле (даже матчевой). Поэтому
+        # для Winline используем ТОЛЬКО главную вкладку профиля —
+        # ту, что AdsPower открыл при activate_strategy. Никаких
+        # new_page(). После матча возвращаем её на live-раздел.
+        if slow_bk == 'winline':
             page = browser_wrapper.page
+            setattr(page, '_is_main_page', True)
+            logger.info(
+                f"📄 Winline: используем главную вкладку профиля key={key}"
+            )
+        else:
+            try:
+                page = await browser_wrapper.new_page()
+                logger.info(f"📄 Открыта отдельная вкладка для key={key}")
+            except Exception as e:
+                logger.error(f"Не удалось открыть новую вкладку: {e} — используем главную")
+                page = browser_wrapper.page
+
+        # ── ДОБАВИТЬ ЭТО: резервируем слот СРАЗУ, чтобы бот не открывал новые ──
+        self._monitoring_profiles[key] = profile_id
+        self._profile_active_matches[profile_id] = active + 1
 
         player1, player2 = payload.get('match_teams', ['', ''])
 
-        handler = handler_cls(
-            target_match_id=match_id,
-            target_teams=[player1, player2],
-        )
+        # ── sport принимает ТОЛЬКО LigaStavokHandler ──
+        # У остальных handler'ов нет такого параметра — если передать,
+        # будет TypeError и вкладка останется на about:blank.
+        handler_kwargs = {
+            "target_match_id": match_id,
+            "target_teams": [player1, player2],
+        }
+        if handler_cls is LigaStavokHandler:
+            handler_kwargs["sport"] = sport
+        handler = handler_cls(**handler_kwargs)
         self._handlers[key] = handler
 
         if hasattr(handler, "prepare_page"):
@@ -1266,11 +1512,33 @@ class AfterGoalEngine:
                 await handler.prepare_page(page)
             except Exception as e:
                 logger.error(f"prepare_page для {slow_bk} упал: {e}")
-                try:
-                    await page.close()
-                except Exception:
-                    pass
                 self._handlers.pop(key, None)
+                # ── Winline: не закрываем главную, вернём на live ──
+                if getattr(page, '_is_main_page', False):
+                    try:
+                        _live_url_p = (
+                            LIVE_URLS.get(slow_bk, {}).get('any')
+                            or LIVE_URLS.get(slow_bk, {}).get('table_tennis')
+                        )
+                        if _live_url_p and not page.is_closed():
+                            await page.goto(
+                                _live_url_p,
+                                wait_until="domcontentloaded",
+                                timeout=15000,
+                            )
+                            logger.info(
+                                f"↩️ [{slow_bk}] prepare_page упал — "
+                                f"главная возвращена на live"
+                            )
+                    except Exception as _e:
+                        logger.warning(f"Возврат главной [{slow_bk}]: {_e}")
+                else:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if slow_bk == "winline":
+                    self._winline_preopen_in_progress.discard(profile_id)
                 return
 
         match_url = payload.get('match_url') or build_match_url(slow_bk, payload)
@@ -1279,35 +1547,91 @@ class AfterGoalEngine:
         if slow_bk == "ligastavok" and match_url:
             try:
                 cookies = await page.context.cookies()
-                has_qrator = any(
-                    "qrator" in (c.get("name") or "").lower()
-                    for c in cookies
+                cookie_names = {
+                    (c.get("name") or "").lower() for c in cookies
                     if "ligastavok" in (c.get("domain") or "")
-                )
-                if not has_qrator:
-                    logger.info("LigaStavok: нет Qrator cookies — прогреваю через /live")
+                }
+                has_qrator_jsr = "qrator_jsr" in cookie_names
+                if not has_qrator_jsr:
+                    logger.info(
+                        "LigaStavok: нет qrator_jsr cookie — "
+                        "прогреваю через /live (до 24с)"
+                    )
                     try:
-                        await page.goto("https://www.ligastavok.ru/live",
-                                        wait_until="domcontentloaded",
-                                        timeout=20000)
-                        await page.wait_for_timeout(2500)
+                        await page.goto(
+                            "https://www.ligastavok.ru/live",
+                            wait_until="domcontentloaded",
+                            timeout=25000,
+                        )
+                        # ── ФИКС 2026-10-19: ждём не фикс 2.5с, а пока
+                        # Qrator реально не выдаст qrator_jsr. Иначе
+                        # страница приходит пустой (body_len=0), игроки
+                        # не находятся, preopen падает.
+                        passed = False
+                        for attempt in range(8):  # 8 × 2с = 16с (достаточно, чтобы прогрузился WS)
+                            await page.wait_for_timeout(2000)
+                            cur = await page.context.cookies()
+                            cur_names = {
+                                (c.get("name") or "").lower() for c in cur
+                                if "ligastavok" in (c.get("domain") or "")
+                            }
+                            if "qrator_jsr" in cur_names:
+                                logger.info(
+                                    f"LigaStavok: Qrator пройден "
+                                    f"за {(attempt + 1) * 2}с"
+                                )
+                                passed = True
+                                break
+                            cur_names = {
+                                (c.get("name") or "").lower() for c in cur
+                                if "ligastavok" in (c.get("domain") or "")
+                            }
+                            if "qrator_jsr" in cur_names:
+                                logger.info(
+                                    f"LigaStavok: Qrator пройден "
+                                    f"за {(attempt + 1) * 2}с"
+                                )
+                                passed = True
+                                break
+                        if not passed:
+                            logger.warning(
+                                "LigaStavok: Qrator не пройден за 60с — "
+                                "страница может быть пустой"
+                            )
                     except Exception as e:
                         logger.warning(f"LigaStavok: прогрев не удался: {e}")
                 else:
-                    logger.debug("LigaStavok: Qrator cookies уже есть")
+                    logger.debug("LigaStavok: qrator_jsr уже есть")
             except Exception as e:
                 logger.debug(f"LigaStavok: проверка cookies: {e}")
 
         if match_url:
             try:
+                # ── Betcity: прогрев через главную (SPA иногда отдаёт
+                # пустое body при прямом заходе по URL) ──
+                if slow_bk == "betcity":
+                    try:
+                        await page.goto(
+                            "https://betcity.ru/ru/live/table-tennis",
+                            wait_until="domcontentloaded", timeout=15000,
+                        )
+                        await page.wait_for_timeout(2500)
+                    except Exception as e:
+                        logger.debug(f"Betcity: прогрев главной: {e}")
+
                 await page.goto(match_url, wait_until="domcontentloaded",
                                 timeout=AFTER_GOAL_TIMEOUT * 1000)
 
                 load_wait_ms = LOAD_WAIT_BY_BK.get(slow_bk, LOAD_WAIT_DEFAULT)
+                if slow_bk == "betcity":
+                    load_wait_ms = max(load_wait_ms, 5000)
                 await page.wait_for_timeout(load_wait_ms)
 
                 found_players = False
-                for _ in range(40):
+                max_attempts = 40 if slow_bk != "betcity" else 100
+                for _ in range(max_attempts):
+                    if page.is_closed():
+                        return
                     if await self._check_players_on_page(page, player1, player2):
                         found_players = True
                         break
@@ -1315,7 +1639,12 @@ class AfterGoalEngine:
 
                 if found_players:
                     logger.info(f"✅ Перешли по URL: {match_url}")
-                    log_bus.info("Матч", f"Открыт по URL · {player1} vs {player2}")
+                    log_bus.match_event(
+                        bk=slow_bk, match_id=match_id,
+                        teams=[player1, player2],
+                        message="Открыт по URL",
+                        level="info",
+                    )
                     url_ok = True
                 else:
                     try:
@@ -1345,44 +1674,85 @@ class AfterGoalEngine:
                         f"   В body найдены: p1={found_p1}, p2={found_p2}\n"
                         f"   body[:500]={body_snippet!r}"
                     )
-                    log_bus.warning(
-                        "Матч",
-                        f"Игроки не найдены в DOM (body_len={body_len}) — ищем кликом"
+                    log_bus.match_event(
+                        bk=slow_bk, match_id=match_id,
+                        teams=[player1, player2],
+                        message=f"Игроки не найдены в DOM (body_len={body_len}) — ищем кликом",
+                        level="warning",
                     )
             except Exception as e:
                 logger.warning(f"⚠️ URL не сработал ({e}), пробуем клик")
-                log_bus.warning("Матч", f"URL не сработал ({e}), ищем кликом")
+                log_bus.match_event(
+                    bk=slow_bk, match_id=match_id,
+                    teams=[player1, player2],
+                    message=f"URL не сработал ({e}), ищем кликом",
+                    level="warning",
+                )
 
         if not url_ok:
             found = await self._click_match_on_page(page, player1, player2)
             if not found:
                 logger.error(f"❌ Не удалось открыть матч {player1} vs {player2}")
-                log_bus.error("Матч", f"Не удалось открыть {player1} vs {player2}")
+                log_bus.match_event(
+                    bk=slow_bk, match_id=match_id,
+                    teams=[player1, player2],
+                    message="Не удалось открыть матч",
+                    level="error",
+                )
                 self._handlers.pop(key, None)
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                if getattr(page, '_is_main_page', False):
+                    try:
+                        _live_url_ret = (
+                            LIVE_URLS.get(slow_bk, {}).get('any')
+                            or LIVE_URLS.get(slow_bk, {}).get('table_tennis')
+                        )
+                        if _live_url_ret and not page.is_closed():
+                            await page.goto(
+                                _live_url_ret,
+                                wait_until="domcontentloaded",
+                                timeout=15000,
+                            )
+                            logger.info(
+                                f"↩️ [{slow_bk}] матч не найден — "
+                                f"главная возвращена на live"
+                            )
+                    except Exception as _e:
+                        logger.warning(f"Возврат главной [{slow_bk}]: {_e}")
+                else:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                
+                # ── ДОБАВИТЬ ЭТО: освобождаем слот при ошибке ──
+                self._profile_active_matches[profile_id] = max(0, self._profile_active_matches.get(profile_id, 1) - 1)
+                self._monitoring_profiles.pop(key, None)
+                # ─────────────────────────────────────────────────
+                
+                if slow_bk == "winline":
+                    self._winline_preopen_in_progress.discard(profile_id)
                 return
             else:
-                log_bus.info("Матч", f"Найден кликом · {player1} vs {player2}")
+                log_bus.match_event(
+                    bk=slow_bk, match_id=match_id,
+                    teams=[player1, player2],
+                    message="Найден кликом",
+                    level="info",
+                )
 
         # ═══════════════════════════════════════════════════════
         # Marathon: SPA создаёт SSE-подписку ТОЛЬКО после reload.
         # ═══════════════════════════════════════════════════════
         if slow_bk == "marathon":
-            await page.wait_for_timeout(2500)
-            got = False
             try:
+                await page.wait_for_timeout(2500)
+                got = False
                 if hasattr(handler, "has_received_sse"):
                     got = handler.has_received_sse()
-            except Exception as e:
-                logger.debug(f"Marathon has_received_sse: {e}")
-            logger.info(f"Marathon: SSE после первой навигации = {got}")
+                logger.info(f"Marathon: SSE после первой навигации = {got}")
 
-            if not got:
-                logger.info("Marathon: 🔄 reload для активации SSE")
-                try:
+                if not got:
+                    logger.info("Marathon: 🔄 reload для активации SSE")
                     await page.reload(
                         wait_until="domcontentloaded",
                         timeout=AFTER_GOAL_TIMEOUT * 1000,
@@ -1391,84 +1761,78 @@ class AfterGoalEngine:
                     if hasattr(handler, "has_received_sse"):
                         got = handler.has_received_sse()
                     logger.info(f"Marathon: SSE после reload = {got}")
-                    log_bus.info(
-                        "Матч",
-                        f"Marathon: SSE {'активирован' if got else 'НЕ пришёл'} "
-                        f"после reload",
+                    log_bus.match_event(
+                        bk=slow_bk, match_id=match_id,
+                        teams=[player1, player2],
+                        message=f"Marathon: SSE {'активирован' if got else 'НЕ пришёл'} после reload",
+                        level="info",
                     )
-                except Exception as e:
-                    logger.warning(f"Marathon reload: {e}")
+            except Exception as e:
+                logger.warning(f"Marathon: ошибка SSE (возможно page closed): {e}")
 
         self._pages[key] = page
         self._monitoring_active[key] = True
         self._monitoring_payloads[key] = payload
         self._monitoring_strategies[key] = strategy
-        self._monitoring_profiles[key] = profile_id
         self._monitoring_signal_time[key] = time.time()
-        self._profile_active_matches[profile_id] = active + 1
 
-        fast_bk = _normalize_bk(payload.get('fast_bk'))
-        self._fast_poll_tasks[key] = asyncio.create_task(
-            self._poll_fast_state(
-                key=key,
-                match_id=match_id,
-                sport=sport,
-                player1=player1,
-                player2=player2,
-                fast_bk=fast_bk,
-                slow_bk=slow_bk,
-            )
-        )
+        fast_bk = _normalize_bk(payload.get('fast_bk'))   # ← ДОБАВИТЬ ЭТУ СТРОКУ
 
-        # ── Fast-кэфы ──
-        #   Есть HTTP-клиент → быстрый polling, без вкладок.
-        #   Нет клиента, но есть хендлер (LigaStavok, Zenit) → вкладка в fast-профиле.
-        if fast_bk and fast_bk != slow_bk and has_fast_client(fast_bk):
-            logger.info(
-                f"📊 FAST_MARKETS: key={key} "
-                f"slow={slow_bk} fast={fast_bk} (HTTP)"
-            )
-            self._fast_markets_poll_tasks[key] = asyncio.create_task(
-                self._poll_fast_markets(
-                    key=key, match_id=match_id, sport=sport,
-                    player1=player1, player2=player2,
-                    fast_bk=fast_bk,
-                )
-            )
-        elif (fast_bk and fast_bk != slow_bk
-                and fast_bk in HANDLERS
-                and is_fast_configured()
-                and (strategy.get('type') or '').lower() == 'live-value'):
-            logger.info(
-                f"📊 FAST_MARKETS: key={key} "
-                f"slow={slow_bk} fast={fast_bk} (TAB в fast-профиле)"
-            )
-            try:
-                fast_page = await self._open_fast_match(
+        if self._signal_client is not None:
+            # ── WS-пуш: подписываемся на матч (быстрее REST polling) ──
+            self._subscribe_fast_state(key)
+            logger.info(f"🔔 Подписка на match_state: key={key}")
+        else:
+            # ── Fallback: старый REST polling (dry_run_test и т.п.) ──
+            self._fast_poll_tasks[key] = asyncio.create_task(
+                self._poll_fast_state(
                     key=key,
                     match_id=match_id,
-                    fast_bk=fast_bk,
-                    payload=payload,
                     sport=sport,
+                    player1=player1,
+                    player2=player2,
+                    fast_bk=fast_bk,
+                    slow_bk=slow_bk,
                 )
-                if fast_page:
-                    task = asyncio.create_task(
-                        self._monitor_fast_markets_via_handler(
-                            key=key,
-                            match_id=match_id,
-                            fast_bk=fast_bk,
-                            payload=payload,
-                            strategy=strategy,
-                        )
-                    )
-                    self._fast_monitor_tasks[key] = task
-            except Exception as e:
-                logger.warning(f"[FAST-TAB] {fast_bk}: {e}")
-        else:
-            logger.info(
-                f"📊 FAST_MARKETS: {fast_bk or '—'} — live-value пропущен "
-                f"(нет HTTP-клиента и вкладка не открыта)"
             )
+
+        # ── Fast-кэфы ──
+        # Для After-goal HTTP-клиент НЕ НУЖЕН, данные идут по WS.
+        # Для Live-Value HTTP-клиент ОБЯЗАТЕЛЕН (нужны кэфы).
+        strategy_type = (strategy.get('type') or '').lower()
+        
+        if strategy_type == 'live-value':
+            if fast_bk and fast_bk != slow_bk and has_fast_client(fast_bk):
+                logger.info(f"📊 FAST_MARKETS: key={key} slow={slow_bk} fast={fast_bk} (HTTP для LV)")
+                self._fast_markets_poll_tasks[key] = asyncio.create_task(
+                    self._poll_fast_markets(
+                        key=key, match_id=match_id, sport=sport,
+                        player1=player1, player2=player2,
+                        fast_bk=fast_bk,
+                    )
+                )
+            elif (fast_bk and fast_bk != slow_bk and fast_bk in HANDLERS and is_fast_configured()):
+                logger.info(f"📊 FAST_MARKETS: key={key} slow={slow_bk} fast={fast_bk} (TAB в fast-профиле)")
+                try:
+                    fast_page = await self._open_fast_match(
+                        key=key, match_id=match_id, fast_bk=fast_bk,
+                        payload=payload, sport=sport,
+                    )
+                    if fast_page:
+                        task = asyncio.create_task(
+                            self._monitor_fast_markets_via_handler(
+                                key=key, match_id=match_id, fast_bk=fast_bk,
+                                payload=payload, strategy=strategy,
+                            )
+                        )
+                        self._fast_monitor_tasks[key] = task
+                except Exception as e:
+                    logger.warning(f"[FAST-TAB] {fast_bk}: {e}")
+            else:
+                logger.info(f"📊 FAST_MARKETS: {fast_bk or '—'} — LV пропущен")
+        else:
+            # Для After-goal ничего не запускаем, данные придут по WS
+            logger.info(f"📊 FAST_MARKETS: key={key} fast={fast_bk} (WS-пуш, polling не нужен)")
 
         task = asyncio.create_task(
             self._monitor_loop(key, match_id, payload, strategy, handler)
@@ -1484,6 +1848,12 @@ class AfterGoalEngine:
             message=f"👁 Преоткрыт матч · delay {delay_in_signal:.1f}с · {sport}",
             level="info",
         )
+
+        # ── Сброс флага "Winline в процессе": матч уже в
+        # _monitoring_profiles, дальше будет блокировать
+        # winline_active >= 1.
+        if slow_bk == "winline":
+            self._winline_preopen_in_progress.discard(profile_id)
 
     async def stop_monitoring(self, key_or_match_id: str):
         """
@@ -1511,14 +1881,66 @@ class AfterGoalEngine:
             self._bet_worker(profile_id)
         )
 
+    @staticmethod
+    def _bet_signature(bet_data: dict) -> tuple:
+        """
+        Сигнатура ставки для защиты от дублей.
+        Две ставки с одинаковой сигнатурой в течение TTL — это дубль.
+        """
+        return (
+            str(bet_data.get("event_id") or ""),
+            str(bet_data.get("coefficient_id")
+                or bet_data.get("pos") or ""),
+            str(bet_data.get("selection_id") or ""),
+            str(bet_data.get("line") or ""),
+            str(bet_data.get("side") or ""),
+            str(bet_data.get("market") or ""),
+            str(bet_data.get("set_num") or bet_data.get("set_number") or ""),
+        )
+
     async def _enqueue_bet(self, profile_id: str, key: str, match_id: str,
                            handler, page, bet_data: dict,
                            bk: str, amount: float, bet_info: dict,
-                           signal_time: float = None):
+                           signal_time: float = None) -> bool:
+        """
+        Возвращает True, если ставка реально попала в очередь.
+        False — если отбита (уже в очереди / дубль / TTL истёк).
+        Это нужно, чтобы _monitor_loop мог отличать в bets_diag.log
+        реально отправленные ставки от отбитых.
+        """
         if key in self._bets_enqueued:
             logger.info(f"⏭ Матч {key} уже в очереди — не дублируем")
-            return
+            return False
         self._bets_enqueued.add(key)
+
+        # ── ФИКС 2026-10-14: защита от дублей одинаковых ставок ──
+        # Если такая же ставка уже отправлялась < TTL секунд назад —
+        # это дубль от повторного on_update (пока ключ был снят,
+        # но _bets_by_match ещё не увеличился). Пример: diag 4-5-6
+        # в bets_diag.log — 3 одинаковых ставки подряд с разницей 2с.
+        try:
+            _sig = self._bet_signature(bet_data)
+            _now = time.time()
+            _last = self._recent_bets.get(_sig, 0.0)
+            if _now - _last < self._recent_bets_ttl:
+                logger.warning(
+                    f"⏭ ДУБЛЬ ставки [{bk}] {match_id}: "
+                    f"sig={_sig[:3]} уже слали "
+                    f"{_now - _last:.1f}с назад — пропускаю"
+                )
+                self._bets_enqueued.discard(key)
+                return False
+            self._recent_bets[_sig] = _now
+
+            # Чистка старых
+            if len(self._recent_bets) > 500:
+                _cutoff = _now - self._recent_bets_ttl * 2
+                self._recent_bets = {
+                    k: v for k, v in self._recent_bets.items()
+                    if v > _cutoff
+                }
+        except Exception as _e:
+            logger.debug(f"dup-guard: {_e}")
 
         self._ensure_queue_worker(profile_id)
         q = self._bet_queues.get(profile_id)
@@ -1537,7 +1959,7 @@ class AfterGoalEngine:
                 f"сигнал уже стар ({time.time() - signal_time:.0f}с)"
             )
             self._bets_enqueued.discard(key)
-            return
+            return False
 
         teams = (self._monitoring_payloads
                  .get(key, {})
@@ -1559,6 +1981,7 @@ class AfterGoalEngine:
             f"📥 В очередь [{bk}/{profile_id}] поставлен key={key} "
             f"(в очереди: {q.qsize()}, возраст {time.time() - signal_time:.1f}с)"
         )
+        return True
 
     async def _bet_worker(self, profile_id: str):
         q = self._bet_queues.setdefault(profile_id, asyncio.Queue())
@@ -1607,13 +2030,40 @@ class AfterGoalEngine:
                         f"— следующая попытка при следующем on_update"
                     )
                 elif page and not page.is_closed():
-                    try:
-                        await page.close()
-                        logger.debug(
-                            f"Страница матча {key} закрыта после ставки"
+                    # ── ФИКС: главную вкладку профиля (Winline) не
+                    # закрываем — возвращаем на live-раздел. Иначе
+                    # профиль останется без вкладки и следующий матч
+                    # будет некуда открыть.
+                    if getattr(page, '_is_main_page', False):
+                        _payload_bw = self._monitoring_payloads.get(key) or {}
+                        _bk_bw = _normalize_bk(_payload_bw.get('slow_bk') or '')
+                        _live_url = (
+                            LIVE_URLS.get(_bk_bw, {}).get('any')
+                            or LIVE_URLS.get(_bk_bw, {}).get('table_tennis')
                         )
-                    except Exception:
-                        pass
+                        if _live_url:
+                            try:
+                                await page.goto(
+                                    _live_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=15000,
+                                )
+                                logger.info(
+                                    f"↩️ [{_bk_bw}] главная вкладка "
+                                    f"возвращена на live после ставки"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Возврат главной [{_bk_bw}] после ставки: {e}"
+                                )
+                    else:
+                        try:
+                            await page.close()
+                            logger.debug(
+                                f"Страница матча {key} закрыта после ставки"
+                            )
+                        except Exception:
+                            pass
 
                 if key:
                     self._bets_enqueued.discard(key)
@@ -1691,6 +2141,10 @@ class AfterGoalEngine:
                 message=f"⏭ Ставка отменена: {why}",
                 level="warning",
             )
+            # ── ФИКС: сигнал пропал → больше не пытаемся по этому матчу ──
+            _strat = self._monitoring_strategies.get(key) or {}
+            max_bets = _strat.get('max_bets_per_match', 1)
+            self._bets_by_match[key] = max_bets
             return
 
         logger.info(
@@ -1796,6 +2250,7 @@ class AfterGoalEngine:
                 "корзин",
                 "clear_basket",
                 "not ready",
+                "retryable",
             )
             if any(kw in err_lower for kw in retryable_keywords):
                 item["_retryable"] = True
@@ -1950,6 +2405,7 @@ class AfterGoalEngine:
         self._profile_active_matches.clear()
         self._bets_enqueued.clear()
         self._last_ui_state.clear()
+        self._recent_bets.clear()        
 
         for profile_id, wrapper in list(self._browsers.items()):
             try:
@@ -1976,6 +2432,10 @@ class AfterGoalEngine:
             except asyncio.CancelledError:
                 pass
 
+        # Отписка от WS-пуша
+        self._unsubscribe_fast_state(key)
+
+        # Fallback polling (если был — упадёт в None если использовался WS)
         poll_t = self._fast_poll_tasks.pop(key, None)
         if poll_t and not poll_t.done():
             poll_t.cancel()
@@ -2041,10 +2501,37 @@ class AfterGoalEngine:
             )
         else:
             if page and not page.is_closed():
-                try:
-                    await page.close()
-                except Exception as e:
-                    logger.warning(f"close page {key}: {e}")
+                # ── ФИКС: главную вкладку профиля (Winline) НЕ закрываем.
+                # Возвращаем на live-раздел, чтобы следующий матч мог
+                # в ней открыться. Закрытие = потеря профиля = повторный
+                # AdsPower launch (30 сек cooldown).
+                if getattr(page, '_is_main_page', False):
+                    _payload_cleanup = self._monitoring_payloads.get(key) or {}
+                    _bk_cleanup = _normalize_bk(_payload_cleanup.get('slow_bk') or '')
+                    _live_url = (
+                        LIVE_URLS.get(_bk_cleanup, {}).get('any')
+                        or LIVE_URLS.get(_bk_cleanup, {}).get('table_tennis')
+                    )
+                    if _live_url:
+                        try:
+                            await page.goto(
+                                _live_url,
+                                wait_until="domcontentloaded",
+                                timeout=15000,
+                            )
+                            logger.info(
+                                f"↩️ [{_bk_cleanup}] главная вкладка "
+                                f"возвращена на {_live_url}"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Возврат главной [{_bk_cleanup}] на live: {e}"
+                            )
+                else:
+                    try:
+                        await page.close()
+                    except Exception as e:
+                        logger.warning(f"close page {key}: {e}")
 
         # Гарантированно убираем страницу из _pages — запись больше
         # не нужна, а в мультипрофиле такие «повисшие» ссылки
@@ -2223,11 +2710,18 @@ class AfterGoalEngine:
         if result.get('success'):
             self._last_bet_time[key] = time.time()
             logger.info(f"✅ Value-ставка отправлена! ID: {result.get('bet_id', 'N/A')}")
-            log_bus.success("Ставка",
-                            f"Value · {bk} · {amount}₽ · ID {result.get('bet_id', 'N/A')}")
+            log_bus.success(
+                "Ставка",
+                f"Value · {amount}₽ · ID {result.get('bet_id', 'N/A')}",
+                bk=bk, match_id=match_id,
+            )
         else:
             logger.error(f"❌ Ошибка Value-ставки: {result.get('error')}")
-            log_bus.error("Ставка", f"Value · {bk} · {result.get('error')}")
+            log_bus.error(
+                "Ставка",
+                f"Value · {result.get('error')}",
+                bk=bk, match_id=match_id,
+            )
 
         try:
             await page.close()
@@ -2360,12 +2854,36 @@ class AfterGoalEngine:
                 return wrapper
         except Exception:
             pass
-        logger.warning(f"_get_existing_browser: {profile_id} мёртв — закрываем wrapper")
+
+        logger.warning(
+            f"_get_existing_browser: {profile_id} мёртв — "
+            f"закрываем wrapper и чистим стейт"
+        )
         try:
             await wrapper.stop()
         except Exception as e:
             logger.debug(f"wrapper.stop: {e}")
         del self._browsers[profile_id]
+
+        # ── ФИКС 2026-10-19: чистим все мониторинги этого профиля.
+        # Раньше при падении браузера (TargetClosedError) _cleanup_monitoring
+        # не успевал отработать, _profile_active_matches[profile_id]
+        # застревал на 5, и ВСЕ новые preopen отбивались
+        # "уже 5 активных (лимит 5)" — сигналов не было вообще.
+        keys = [
+            k for k, pid in list(self._monitoring_profiles.items())
+            if pid == profile_id
+        ]
+        for k in keys:
+            try:
+                await self._cleanup_monitoring(k)
+            except Exception as e:
+                logger.debug(f"cleanup {k} при мёртвом wrapper: {e}")
+
+        # Счётчики обнуляем принудительно — иначе preopen вечно отбивается
+        self._profile_active_matches.pop(profile_id, None)
+        self._profile_launch_attempts.pop(profile_id, None)
+
         return None
 
     # ============================================================
@@ -2375,11 +2893,18 @@ class AfterGoalEngine:
         if not player1 or not player2:
             return False
 
+        if page.is_closed():
+            return False
         try:
             await page.wait_for_load_state('domcontentloaded', timeout=3000)
         except Exception:
             pass
-        await page.wait_for_timeout(1500)
+        if page.is_closed():
+            return False
+        try:
+            await page.wait_for_timeout(1500)
+        except Exception:
+            return False
 
         def normalize(s: str) -> str:
             s = (s or "").lower()
@@ -2445,6 +2970,8 @@ class AfterGoalEngine:
     async def _check_players_on_page(self, page: Page,
                                      player1: str, player2: str) -> bool:
         if not player1 or not player2:
+            return False
+        if page.is_closed():
             return False
 
         def normalize(s: str) -> str:
@@ -2914,130 +3441,137 @@ class AfterGoalEngine:
                          prev_phase_name: str,
                          fast_score: List[int],
                          slow_score: List[int]):
+        
         set_markets = data.get('set_markets', {})
-        race_set_markets = data.get('race_set_markets') or {}
-        race_enabled = bool(strategy.get('race_enabled', False))
-
-        if not set_markets and not (race_enabled and race_set_markets):
+        if not set_markets:
             return None
 
         sport = payload.get('sport', 'table_tennis')
-
-        fast_phase_num, slow_phase_num = self._resolve_phase_context(
-            sport, payload, data, set_markets, fast_score, slow_score
-        )
-        if fast_phase_num <= 0 or slow_phase_num <= 0:
-            logger.debug(
-                f"best_bet: не удалось определить фазы "
-                f"fast={fast_phase_num} slow={slow_phase_num}"
-            )
+        
+        # slow_data (из браузера) содержит phase_num — номер ТЕКУЩЕЙ партии на Slow-БК
+        slow_phase_num = int(data.get('phase_num') or 0)
+        if slow_phase_num <= 0:
             return None
 
+        # ЖЕЛЕЗНОЕ ПРАВИЛО: Мы играем ТОЛЬКО рынки партии slow_phase_num
+        set_key = f"set_{slow_phase_num}"
+        current_markets = set_markets.get(set_key)
+        
+        if not current_markets:
+            logger.debug(f"best_bet: нет рынков для {set_key} (там, где висит Slow)")
+            return None
+
+        # Получаем фазу Fast (из payload, который заполнил on_update)
+        fast_phase_num = self._parse_phase_num(payload.get('fast_phase', ''))
+        if fast_phase_num <= 0:
+            f_s1 = payload.get("fast_score", [0,0])[0]
+            f_s2 = payload.get("fast_score", [0,0])[1]
+            fast_phase_num = f_s1 + f_s2 + 1
+        
         confirmed = []
-
+        
+        # СИТУАЦИЯ 1: Fast и Slow в одной партии (обычная задержка в очках)
         if fast_phase_num == slow_phase_num:
-            set_key = f"set_{slow_phase_num}"
-            current_markets = set_markets.get(set_key, {})
+            logger.info(f"best_bet: обе БК в {slow_phase_num}-й партии")
+            
+            # ── ЗАЩИТА ОТ БАГА FAST-БК ──
+            # Если Fast-БК показывает, что партия завершена (11+),
+            # но счет по партиям у Fast и Slow одинаковый (fast_score == slow_score),
+            # значит Fast-БК отдаёт устаревший fast_sub от ПРОШЛОЙ партии.
+            # Ставить на такой "завершенный" исход НЕЛЬЗЯ.
+            is_fast_set_done = False
+            if sport == 'table_tennis':
+                if fast_sub[0] >= 11 or fast_sub[1] >= 11:
+                    is_fast_set_done = True
+            elif sport in ('volleyball', 'beach_volleyball'):
+                thr = 15 if slow_phase_num >= 5 else 25
+                if fast_sub[0] >= thr or fast_sub[1] >= thr:
+                    is_fast_set_done = True
 
-            logger.info(
-                f"best_bet: фазы совпадают, играем set_{slow_phase_num}"
+            if is_fast_set_done:
+                if fast_score[0] == slow_score[0] and fast_score[1] == slow_score[1]:
+                    _gk = f"__ghost_count_{payload.get('match_id')}"
+                    _gcount = self.__dict__.get(_gk, 0) + 1
+                    self.__dict__[_gk] = _gcount
+                    if _gcount == 1 or _gcount % 20 == 0:
+                        logger.warning(
+                            f"⚠️ FAST sub={fast_sub} score={fast_score} "
+                            f"не сходится со slow={slow_score} "
+                            f"(ghost #{_gcount}). Пропускаем."
+                        )
+                    if _gcount == 5:
+                        _key = self._monitoring_key_for_match(payload)
+                        if _key:
+                            state = self._fast_state.get(_key) or {}
+                            state.pop("bks", None)
+                            state.pop("fetched_at", None)
+                            state.pop("markets", None)
+                            state.pop("markets_phase", None)
+                            state.pop("markets_fetched_at", None)
+                            logger.warning(
+                                f"🔄 [{_key}] 5 ghost-фреймов подряд — "
+                                f"сброс кэша fast, переподписка"
+                            )
+                            self._unsubscribe_fast_state(_key)
+                            self._subscribe_fast_state(_key)
+                    return None
+                else:
+                    _gk = f"__ghost_count_{payload.get('match_id')}"
+                    self.__dict__.pop(_gk, None)
+
+            confirmed = self._collect_confirmed_bets(
+                sport, payload, current_markets, slow_phase_num,
+                fast_sub, fast_score, slow_score
             )
 
-            if current_markets:
-                confirmed += self._collect_confirmed_bets(
-                    sport, payload, current_markets, slow_phase_num,
-                    fast_sub, fast_score, slow_score
-                )
-
-            if race_enabled:
-                race_markets = race_set_markets.get(set_key, {})
-                if race_markets:
-                    race_confirmed_raw = self._collect_confirmed_bets(
-                        sport, payload, race_markets, slow_phase_num,
-                        fast_sub, fast_score, slow_score
-                    )
-                    for (m, s, o, r, sn) in race_confirmed_raw:
-                        confirmed.append((
-                            f"race_{m}", s, o,
-                            f"[RACE] {r}",
-                            sn,
-                        ))
-                    logger.info(
-                        f"best_bet: RACE — собрано {len(race_confirmed_raw)} "
-                        f"исходов в {set_key}"
-                    )
-
-        elif fast_phase_num == slow_phase_num + 1:
-            set_key = f"set_{slow_phase_num}"
-            if set_key not in set_markets:
-                logger.debug(f"best_bet: нет рынков {set_key} для prev")
-                return None
-
-            logger.info(
-                f"best_bet: fast на партию впереди "
-                f"({fast_phase_num} vs {slow_phase_num}), играем prev "
-                f"set_{slow_phase_num}"
-            )
-
-            prev_num_from_name = self._parse_phase_num(prev_phase_name)
-            if prev_num_from_name != slow_phase_num:
-                logger.debug(
-                    f"best_bet: prev_phase_name={prev_phase_name!r} "
-                    f"не совпадает с slow_phase_num={slow_phase_num}, "
-                    f"используем номер из set_markets"
-                )
-                prev_phase_name = f"{slow_phase_num}-я партия"
-
-            confirmed += self._collect_prev_phase_bets(
-                sport, payload, set_markets, fast_prev_sub, prev_phase_name
-            )
-
+        # СИТУАЦИЯ 3: Fast ушел на 2+ партии вперед (Slow завис)
+        elif fast_phase_num > slow_phase_num + 1:
+            logger.info(f"best_bet: Fast ушел далеко ({fast_phase_num} vs {slow_phase_num}). Пропускаем.")
+            return None
+            
         else:
-            logger.info(
-                f"best_bet: расхождение фаз "
-                f"(fast={fast_phase_num}, slow={slow_phase_num}) — пропуск"
-            )
+            # Slow впереди Fast — аномалия
             return None
 
         if not confirmed:
             return None
 
-        # ── Фильтр по порогу рынка ──
+        # Фильтр по порогам (min_score_diff)
         slow_s1 = int(data.get("sub_score1") or 0)
         slow_s2 = int(data.get("sub_score2") or 0)
         fast_s1 = fast_sub[0] if fast_sub else 0
         fast_s2 = fast_sub[1] if fast_sub else 0
-        diff = max(fast_s1 - slow_s1, fast_s2 - slow_s2)
+        
+        diff = 0
+        if fast_phase_num == slow_phase_num:
+            diff = max(fast_s1 - slow_s1, fast_s2 - slow_s2)
 
         confirmed_filtered = []
         for c in confirmed:
             market = c[0]
             base_market = market.replace("race_", "", 1) if market.startswith("race_") else market
             threshold = self._get_market_threshold(strategy, base_market)
-            if diff >= threshold:
+            
+            if fast_phase_num > slow_phase_num or diff >= threshold:
                 confirmed_filtered.append(c)
 
         if not confirmed_filtered:
-            logger.debug(
-                f"best_bet: все исходы отсеяны порогами (diff={diff})"
-            )
             return None
 
-        confirmed = confirmed_filtered
-
-        # ── Фильтр по manual_markets / auto_criterion ──
-        confirmed = self._filter_confirmed_by_strategy(confirmed, strategy, payload)
-        if not confirmed:
+        # Фильтр по manual_markets / auto_criterion
+        confirmed_filtered = self._filter_confirmed_by_strategy(confirmed_filtered, strategy, payload)
+        if not confirmed_filtered:
             return None
 
+        # Фильтр по коэффициентам
         min_odds = strategy.get('min_odds', 1.0)
         max_odds = strategy.get('max_odds', 5.0)
-        valid = [c for c in confirmed if min_odds <= c[2] <= max_odds]
+        valid = [c for c in confirmed_filtered if min_odds <= c[2] <= max_odds]
         if not valid:
             return None
 
+        # Приоритеты (Виннер > Тотал > Фора)
         PRIORITY = {'winner': 3, 'total': 2, 'handicap': 1, 'it': 0}
-
         def _priority(market_name: str) -> float:
             base = market_name.replace("race_", "", 1) if market_name.startswith("race_") else market_name
             race_penalty = 0.5 if market_name.startswith("race_") else 0
@@ -3056,27 +3590,24 @@ class AfterGoalEngine:
             'market': market,
             'side': side,
             'odd': odd,
-            'set_number': set_number,
+            'set_number': set_number, # Всегда равен slow_phase_num
             'reason': reason,
         }
-        if market.startswith("race_"):
-            mk = race_set_markets.get(f"set_{set_number}", {})
-        else:
-            mk = set_markets.get(f"set_{set_number}", {})
-
+        
         base_market = market.replace("race_", "", 1) if market.startswith("race_") else market
         if base_market == 'total':
-            result['line'] = mk.get('total', {}).get('line', 0)
+            result['line'] = current_markets.get('total', {}).get('line', 0)
         elif base_market == 'handicap':
-            result['line'] = mk.get('handicap', {}).get(side, {}).get('line', 0)
+            result['line'] = current_markets.get('handicap', {}).get(side, {}).get('line', 0)
         elif base_market == 'it':
             parts = side.split('_', 1)
             if len(parts) == 2:
                 player, dirn = parts
                 result['player'] = player
                 result['direction'] = dirn
-                it_m = mk.get('it', {}).get(player, {})
+                it_m = current_markets.get('it', {}).get(player, {})
                 result['line'] = it_m.get('line', 0)
+                
         return result
 
 
@@ -3250,6 +3781,7 @@ class AfterGoalEngine:
         if fast_phase_num <= 0 or slow_phase_num <= 0:
             return None
 
+        # ── ЖЕЛЕЗНАЯ СИНХРОНИЗАЦИЯ ФАЗ ──
         if fast_phase_num != slow_phase_num:
             logger.debug(
                 f"live_value: фазы разные fast={fast_phase_num} "
@@ -3262,6 +3794,10 @@ class AfterGoalEngine:
         fast_markets = fast_set_markets.get(set_key, {}) or {}
 
         if not slow_markets or not fast_markets:
+            logger.info(
+                f"LV: skip — пустые рынки для {set_key} "
+                f"(slow={bool(slow_markets)}, fast={bool(fast_markets)})"
+            )
             return None
 
         # ═══════════════════════════════════════════════════════════
@@ -3352,8 +3888,19 @@ class AfterGoalEngine:
                 return '2' if k == '1' else '1'
             return k
 
+        # ── ФИКС swap (2026-10-26): приводим fast-очки к порядку slow.
+        # При swap fast.player1 == slow.player2, поэтому «очки игрока 1
+        # в терминах slow» — это fast.sub_score2, и наоборот.
+        # Без этого _fast_favors / _is_outcome_dead / _ind ниже смотрят
+        # не на того игрока и:
+        #   - либо отсеивают валидные value (fast подтверждает, а фильтр
+        #     говорит «нет»),
+        #   - либо пропускают ложные (fast опровергает, а фильтр «да»).
+        # Кэфы через _s() уже flipped — их не трогаем.
         _fast_sub1 = int(fast_entry.get("sub_score1") or 0)
         _fast_sub2 = int(fast_entry.get("sub_score2") or 0)
+        if swap:
+            _fast_sub1, _fast_sub2 = _fast_sub2, _fast_sub1
 
         phase_done = False
         if sport == 'table_tennis':
@@ -3366,15 +3913,31 @@ class AfterGoalEngine:
                (_fast_sub2 >= _thr and _fast_sub2 - _fast_sub1 >= 2):
                 phase_done = True
 
+        # ═══════════════════════════════════════════════════════════
+        # ЗАЩИТА ОТ "GHOST FRAME" (баг Olimp)
+        # Если партия завершена, но счет по партиям не изменился,
+        # значит данные устарели. Пропускаем.
+        # ═══════════════════════════════════════════════════════════
+        if phase_done:
+            # ФИКС swap: при swap счёт по партиям у fast перевёрнут
+            # относительно slow. Без этого проверка «fast и slow
+            # показывают то же состояние» никогда не срабатывает,
+            # и мы можем поставить на уже завершённую партию.
+            _fp1, _fp2 = (f_p2, f_p1) if swap else (f_p1, f_p2)
+            if _fp1 == s_p1 and _fp2 == s_p2:
+                logger.warning(
+                    f"LV: skip — GHOST FRAME: phase_done=True, "
+                    f"но score не изменился "
+                    f"(fast={_fp1}:{_fp2}, slow={s_p1}:{s_p2}, swap={swap})"
+                )
+                return None
+
         only = strategy.get('only_markets') or ['winner', 'total', 'handicap']
         min_edge = float(strategy.get('min_edge_percent', 5.0)) / 100.0
         max_edge = float(strategy.get('max_edge_percent', 20.0)) / 100.0
         min_odds = float(strategy.get('min_odds', 1.30))
         max_odds = float(strategy.get('max_odds', 5.0))
 
-        # ── LV режим: требуем ли задержку по счёту ──
-        # "odds_with_score" — старая логика (консервативно)
-        # "odds_only"       — только сравнение кэфов
         lv_mode = strategy.get('lv_mode', 'odds_with_score')
         require_score_lag = (lv_mode == 'odds_with_score')
         if not require_score_lag:
@@ -3400,13 +3963,12 @@ class AfterGoalEngine:
                 if require_score_lag:
                     _thr = self._get_market_threshold(strategy, 'winner')
                     if sub_diff < _thr and parts_diff < _thr:
-                        logger.debug(
-                            f"LV: skip winner — delay sub={sub_diff} "
-                            f"parts={parts_diff} < thr={_thr}"
+                        logger.info(
+                            f"LV: skip winner — маленькая задержка "
+                            f"(sub={sub_diff}, parts={parts_diff} < порога {_thr})"
                         )
                         continue
 
-                # ── Guard D: партия завершена и победил НЕ наш игрок ──
                 if self._is_outcome_dead(
                     'winner', side, 0.0,
                     _fast_sub1, _fast_sub2, phase_done
@@ -3418,7 +3980,6 @@ class AfterGoalEngine:
                     )
                     continue
 
-                # ── Guard E: fast должен подтверждать наш исход ──
                 if not self._fast_favors(
                     'winner', side, 0.0,
                     _fast_sub1, _fast_sub2, phase_done,
@@ -3660,9 +4221,6 @@ class AfterGoalEngine:
                 if not (min_odds <= so <= max_odds):
                     continue
 
-                # ── Guard E: odd/even гарантируется только при
-                #    завершённой партии. Иначе следующее очко
-                #    перевернёт чётность — ставка «на угад».
                 if not self._fast_favors(
                     'odd', side, 0.0,
                     _fast_sub1, _fast_sub2, phase_done,
@@ -3702,8 +4260,6 @@ class AfterGoalEngine:
                 if not (min_odds <= so <= max_odds):
                     continue
 
-                # ── Guard E: point — «следующее очко» не гарантируется.
-                #    _fast_favors всегда False → point не будет ставиться.
                 if not self._fast_favors(
                     'point', side, 0.0,
                     _fast_sub1, _fast_sub2, phase_done,
@@ -3732,18 +4288,12 @@ class AfterGoalEngine:
                     })
 
         if not candidates:
-            logger.debug(
-                f"live_value: нет кандидатов (phase={slow_phase_num}, "
-                f"only={only}, swap={swap}, "
+            logger.info(
+                f"LV: нет кандидатов для ставки (phase={slow_phase_num}, "
                 f"min_edge={min_edge*100:.1f}%)"
             )
             return None
 
-        # ── Верхний порог edge ──
-        # Всё выше max_edge — не value, а:
-        #   - slow догнал fast, но ещё не прислал апдейт
-        #   - рынок закрывается
-        #   - рассинхрон данных
         clean = [c for c in candidates if c['edge'] <= max_edge]
         if not clean:
             logger.info(
@@ -3818,22 +4368,35 @@ class AfterGoalEngine:
             self._last_update_time[key] = time.time()
             self._last_slow_data[key] = data
 
-            # ── Единый источник fast-данных: fast-client (приоритет), бэкенд (fallback) ──
-            # Раньше тут был только _get_fast_state (бэкенд, отстаёт на 1-2 сек).
-            # В момент смены партии бэкенд ещё отдавал sub=12:10 (3-я),
-            # а fast-client уже 0:0 (4-я). _choose_best_bet на бэкенде
-            # видел "партия завершена" → ставил неправильно.
-            fast_sub_tuple = self._get_fast_sub_for_after_goal(key, payload)
-            fast_sub = [fast_sub_tuple[0], fast_sub_tuple[1]]
-            fast_phase_from_client = int(fast_sub_tuple[2] or 0)
+            # ── ЕДИНЫЙ ИСТОЧНИК FAST ДЛЯ AFTER-GOAL ──
+            current_payload = self._monitoring_payloads.get(key, payload)
+            current_strategy = self._monitoring_strategies.get(key, strategy)
+            strategy_type = (current_strategy.get('type') or '').lower()
 
-            # fast_score — только из fast-client (согласован с sub/phase)
-            fast_entry = self._get_fast_markets(key)
-            if fast_entry:
-                fast_score = [int(fast_entry.get("score1") or 0),
-                              int(fast_entry.get("score2") or 0)]
+            if strategy_type == 'live-value':
+                # Для LV используем HTTP-клиент (как раньше)
+                fast_entry = self._get_fast_markets(key)
+                if fast_entry:
+                    fast_sub = [int(fast_entry.get("sub_score1") or 0), int(fast_entry.get("sub_score2") or 0)]
+                    fast_phase_from_client = int(fast_entry.get("phase_num") or 0)
+                    fast_score = [int(fast_entry.get("score1") or 0), int(fast_entry.get("score2") or 0)]
+                else:
+                    return
             else:
-                fast_score = [0, 0]
+                # ── ДЛЯ ПОСЛЕГОЛА БЕРЕМ ВСЁ ИЗ WS ──
+                s1, s2, ph, pv1, pv2 = self._get_fast_sub_for_after_goal(key, payload)
+                fast_sub = [s1, s2]
+                fast_phase_from_client = ph
+                
+                # Корректный score из WS
+                # ВАЖНО: НЕ используем имя fast_bk здесь, чтобы не
+                # переопределять переменную из внешней области видимости.
+                ws_fast_bk = _normalize_bk(current_payload.get('fast_bk'))
+                bk_data = (self._fast_state.get(key, {}).get("bks") or {}).get(ws_fast_bk)
+                if bk_data:
+                    fast_score = [int(bk_data.get("score1") or 0), int(bk_data.get("score2") or 0)]
+                else:
+                    fast_score = [0, 0]
 
             slow_sub = [data.get("sub_score1", 0) or 0,
                         data.get("sub_score2", 0) or 0]
@@ -3865,9 +4428,6 @@ class AfterGoalEngine:
                 )
                 return
 
-            current_payload = self._monitoring_payloads.get(key, payload)
-            current_strategy = self._monitoring_strategies.get(key, strategy)
-            strategy_type = (current_strategy.get('type') or '').lower()
 
             # ── Синхронизация фазы: если fast-client дал свежую фазу — используем её ──
             # Иначе _choose_best_bet сравнивает sub из fast-client с phase
@@ -3942,9 +4502,28 @@ class AfterGoalEngine:
                 if not is_open:
                     return
 
-                prev_phase_name = (current_payload.get('fast_prev_phase') or '').strip()
-                fast_prev_sub = current_payload.get('fast_prev_sub_score') or [0, 0]
+                # ── ФИКС: prev_sub ТОЛЬКО из fast-клиента или WS ──
+                slow_phase_num = int(data.get('phase_num') or 0)
+                
+                if strategy_type == 'live-value':
+                    fast_prev_sub = [0, 0]
+                    prev_phase_name = ""
+                    if fast_entry:
+                        _fp1 = int(fast_entry.get("prev_sub_score1") or 0)
+                        _fp2 = int(fast_entry.get("prev_sub_score2") or 0)
+                        _fpn = int(fast_entry.get("prev_phase_num") or 0)
+                        if _fp1 > 0 or _fp2 > 0:
+                            fast_prev_sub = [_fp1, _fp2]
+                            if _fpn > 0:
+                                prev_phase_name = f"{_fpn}-я партия"
+                else:
+                    fast_prev_sub = [pv1, pv2]
+                    prev_phase_name = f"{slow_phase_num - 1}-я партия" if slow_phase_num > 1 else ""
 
+                # ── ФИКС 2026-10-14 v2 ──
+                # prev_sub проверяем ВНУТРИ _choose_best_bet — только
+                # для случая "fast на фазу впереди". Для "обе в одной
+                # фазе" prev_sub не нужен (играем текущую партию).
                 best_bet = self._choose_best_bet(
                     data, current_strategy, current_payload,
                     fast_sub, fast_prev_sub, prev_phase_name,
@@ -4025,6 +4604,11 @@ class AfterGoalEngine:
             elif bk == 'sportbet':
                 bet_data['outcome_id'] = outcome_info.get('id')
             elif bk == 'betcity':
+                if page.is_closed():
+                    logger.warning(f"⏭ on_update: страница {key} закрыта — дропаем")
+                    event.set()
+                    return
+
                 bet_data['event_id'] = data.get('match_id')
                 bet_data['pos'] = outcome_info.get('pos')
                 bet_data['kf'] = best_bet['odd']
@@ -4037,10 +4621,16 @@ class AfterGoalEngine:
                 bet_data['min_edge'] = float(
                     current_strategy.get('min_edge_percent', 5.0)
                 ) / 100.0
-                token = await page.evaluate(
-                    "() => document.cookie.match(/tk=([^;]+)/)?.[1] || ''"
-                )
-                bet_data['token'] = token
+                
+                try:
+                    token = await page.evaluate(
+                        "() => document.cookie.match(/tk=([^;]+)/)?.[1] || ''"
+                    )
+                    bet_data['token'] = token
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось получить tk токен (page closed?): {e}")
+                    event.set()  # закрываем мониторинг
+                    return
             elif bk == 'olimp':
                 bet_data['market_data'] = outcome_info.get('market_data')
                 bet_data['kf'] = best_bet['odd']
@@ -4076,7 +4666,63 @@ class AfterGoalEngine:
 
             logger.info(f"📤 bet_data={bet_data}")
 
-            await self._enqueue_bet(
+            # ═══════════ ДИАГ-ЛОГ СТАВКИ (2026-10-15) ═══════════
+            # ФИКС: пишем diag ТОЛЬКО после _enqueue_bet — с полем
+            # enqueued=True/False. Иначе в лог попадают отбитые
+            # dup-guard'ом ставки (см. diag 2 и 3 от 2026-10-14 —
+            # одна и та же ставка 2 раза подряд).
+            import os as _os
+            from datetime import datetime as _dt
+
+            fast_entry_diag = self._get_fast_markets(key) or {}
+            from ui.log_paths import get_log_path
+            _diag_path = get_log_path("bets_diag.log")
+            _diag = {
+                "ts": _dt.now().isoformat(timespec="milliseconds"),
+                "key": key,
+                "match_id": match_id,
+                "teams": current_payload.get("match_teams"),
+                "sport": current_payload.get("sport"),
+                "slow_bk": slow_bk,
+                "fast_bk": fast_bk,
+                "strategy": current_strategy.get("name"),
+                "strategy_type": strategy_type,
+                # ── ФАЗЫ ──
+                "fast_phase_num": fast_phase_from_client,
+                "slow_phase_num": data.get("phase_num"),
+                # ── SCORE / SUB ──
+                "fast_sub": fast_sub,
+                "slow_sub": slow_sub,
+                "fast_score": fast_score,
+                "slow_score": slow_score,
+                "fast_prev_sub": current_payload.get("fast_prev_sub_score"),
+                "fast_prev_phase": current_payload.get("fast_prev_phase"),
+                # ── ЧТО ИЗ FAST-CLIENT ──
+                "fast_client_phase": fast_entry_diag.get("phase_num"),
+                "fast_client_sub1": fast_entry_diag.get("sub_score1"),
+                "fast_client_sub2": fast_entry_diag.get("sub_score2"),
+                "fast_client_prev_sub1": fast_entry_diag.get("prev_sub_score1"),
+                "fast_client_prev_sub2": fast_entry_diag.get("prev_sub_score2"),
+                "fast_client_prev_phase": fast_entry_diag.get("prev_phase_num"),
+                "fast_client_score1": fast_entry_diag.get("score1"),
+                "fast_client_score2": fast_entry_diag.get("score2"),
+                # ── ЧТО ВЫБРАЛИ ──
+                "best_bet": best_bet,
+                # ── ЧТО ОТПРАВИЛИ ──
+                "bet_data": {
+                    k: (v[:80] + "…" if isinstance(v, str) and len(v) > 80 else v)
+                    for k, v in (bet_data or {}).items()
+                },
+                # ── КАКИЕ РЫНКИ В SLOW ──
+                "slow_set_markets_keys": list(
+                    (data.get("set_markets") or {}).keys()
+                ),
+                "slow_outcome_ids_keys": list(
+                    (data.get("outcome_ids") or {}).keys()
+                ),
+            }
+
+            _enqueued = await self._enqueue_bet(
                 profile_id=profile_id,
                 key=key,
                 match_id=match_id,
@@ -4088,6 +4734,20 @@ class AfterGoalEngine:
                 bet_info=best_bet,
                 signal_time=time.time(),
             )
+            _diag["enqueued"] = bool(_enqueued)
+
+            try:
+                self._bets_diag_count += 1
+                _diag["diag_num"] = self._bets_diag_count
+                with open(_diag_path, "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps(_diag, ensure_ascii=False) + "\n")
+                logger.info(
+                    f"💾 BET DIAG #{self._bets_diag_count} "
+                    f"(enqueued={_enqueued}) → bets_diag.log"
+                )
+            except Exception as _de:
+                logger.debug(f"bet diag: {_de}")
+            # ═══════════ КОНЕЦ ДИАГ-ЛОГА ═══════════
 
             if self._bets_by_match.get(key, 0) >= max_bets:
                 event.set()

@@ -384,7 +384,22 @@ class MarathonHandler(BookmakerHandler):
                             and path[0].get("inObj") == "matchScore"
                             and isinstance(value, dict)
                             and self._snapshot is not None):
-                        self._snapshot["matchScore"] = value
+                        # ── ФИКС: Marathon шлёт matchScore ЧАСТИЧНО ──
+                        # В одних фреймах это полный объект (main+parts+...),
+                        # в других — только отдельные поля (только parts).
+                        # Полная замена сломала бы score1/score2 (main),
+                        # от которых зависит определение fast_phase_num.
+                        # Делаем merge по ключам.
+                        existing_ms = self._snapshot.get("matchScore") or {}
+                        if not isinstance(existing_ms, dict):
+                            existing_ms = {}
+                        merged_ms = {**existing_ms}
+                        # Обновляем только те поля, что реально пришли
+                        for _k in ("main", "parts", "penalty",
+                                   "currentServe", "view", "scoreType"):
+                            if _k in value:
+                                merged_ms[_k] = value[_k]
+                        self._snapshot["matchScore"] = merged_ms
                         score_changed = True
 
                 if score_changed and self._snapshot is not None:
@@ -419,12 +434,45 @@ class MarathonHandler(BookmakerHandler):
         if missing:
             new_missing = set(missing) - self._warned_missing
             if new_missing:
-                logger.warning(
+                logger.debug(
                     f"Marathon: отсутствуют рынки для фазы {phase}: "
-                    f"{', '.join(sorted(new_missing))}. "
-                    f"У Marathon может не быть этих рынков в стриме."
+                    f"{', '.join(sorted(new_missing))}"
                 )
                 self._warned_missing.update(new_missing)
+
+    # ============================================================
+    # Проверка: партия завершена по правилам вида спорта
+    # ============================================================
+    @staticmethod
+    def _is_set_done(sport_code: str, p1: int, p2: int,
+                     set_num: int) -> bool:
+        """
+        НТ:        11 очков + разрыв 2
+        Волейбол:  25 (5-я партия — 15) + разрыв 2
+        Баскетбол: не применимо — партия заканчивается по времени → False
+
+        Работает и для растянутых партий (12:10, 15:13, 27:25, 30:28) —
+        благодаря '>=' и проверке разрыва.
+        """
+        sc = (sport_code or "").lower()
+
+        # Баскет и кибер — по очкам партию не определяем
+        if "basket" in sc or "e-sport" in sc:
+            return False
+
+        # Волейбол и пляжный
+        if "volley" in sc:
+            threshold = 15 if set_num >= 5 else 25
+            return (
+                (p1 >= threshold and p1 - p2 >= 2) or
+                (p2 >= threshold and p2 - p1 >= 2)
+            )
+
+        # Дефолт (НТ, большой теннис и т.п.) — порог 11
+        return (
+            (p1 >= 11 and p1 - p2 >= 2) or
+            (p2 >= 11 and p2 - p1 >= 2)
+        )
 
     # ============================================================
     # Парсер события
@@ -444,7 +492,14 @@ class MarathonHandler(BookmakerHandler):
             # Подтверждено логом 2026-10-13 19:42: partNumber=2 ↔ MTCH_R3.
             # Для НТ сдвига нет — там MTCH_R1 = 1-я партия.
             sport_code = (data.get("sportCode") or "").lower()
-            basket_shift = 1 if "basket" in sport_code else 0
+            is_basket = ("basket" in sport_code or "e-sport" in sport_code)
+            # ФИКС 2026-10-19: сдвига НЕТ. Проверено дампом Marathon:
+            #   MTCH_TTLG2 → name="Тотал очков, 2-я четверть"
+            #   MTCH_TTLG3 → name="Тотал очков, 3-я четверть"
+            #   MTCH_HB2/HB3 — аналогично.
+            # Раньше basket_shift=1 сдвигал Q3-рынки в set_2, из-за чего
+            # after-goal ставил total over на СЛЕДУЮЩУЮ четверть.
+            basket_shift = 0
 
             if self._sse_json_count <= 8:
                 raw_markets = data.get("markets", {}) or {}
@@ -491,29 +546,82 @@ class MarathonHandler(BookmakerHandler):
                 score1 = score2 = 0
 
             phase = data.get("phase", {}) or {}
-            set_num = int(phase.get("partNumber") or 1)
-
             parts = ms.get("parts", []) or []
-            if not set_num and parts:
-                for i in range(len(parts) - 1, -1, -1):
-                    p = parts[i] or {}
-                    try:
-                        if int(p.get("home", 0)) > 0 or int(p.get("away", 0)) > 0:
-                            set_num = i + 1
-                            break
-                    except Exception:
-                        pass
-            if not set_num:
+
+            # ── ПРИОРИТЕТ: parts.length над phase.partNumber ──
+            # В момент смены партии Marathon обновляет parts РАНЬШЕ,
+            # чем phase.partNumber. Если брать phase — получим
+            # set_num=старая, а sub=из ЗАВЕРШЁННОЙ партии.
+            # parts.length всегда актуален.
+            phase_part = int(phase.get("partNumber") or 0)
+            if parts:
+                set_num = len(parts)
+            elif phase_part > 0:
+                set_num = phase_part
+            else:
                 set_num = 1
 
+            # ── ЗАЩИТА ОТ ЗАГЛУШКИ (2026-10-14) ──
+            # Marathon иногда добавляет пустой {0,0} в конец parts
+            # ДО того, как начнётся новая партия. Тогда len(parts)=N+1,
+            # а реально играет ещё N. Сдвигаем set_num на 1 назад,
+            # если parts[-1]={0,0}, а parts[-2] ещё не завершён.
+            if len(parts) >= 2:
+                _last = parts[-1]
+                _prev = parts[-2]
+                try:
+                    _lp1 = int(_last.get("home", 0) or 0)
+                    _lp2 = int(_last.get("away", 0) or 0)
+                    _pp1 = int(_prev.get("home", 0) or 0)
+                    _pp2 = int(_prev.get("away", 0) or 0)
+                except (ValueError, TypeError):
+                    _lp1 = _lp2 = _pp1 = _pp2 = 0
+
+                if _lp1 == 0 and _lp2 == 0:
+                    _sc_low = (data.get("sportCode") or "").lower()
+                    _is_bk = ("basket" in _sc_low or "e-sport" in _sc_low)
+                    _prev_done = False
+                    if not _is_bk:
+                        if "volley" in _sc_low:
+                            _thr = 15 if (set_num - 1) >= 5 else 25
+                        else:
+                            _thr = 11
+                        _prev_done = (
+                            (_pp1 >= _thr and _pp1 - _pp2 >= 2) or
+                            (_pp2 >= _thr and _pp2 - _pp1 >= 2)
+                        )
+                    if not _prev_done:
+                        set_num = len(parts) - 1
+                        logger.info(
+                            f"Marathon: parts[-1]={_lp1}:{_lp2} заглушка, "
+                            f"parts[-2]={_pp1}:{_pp2} не завершён → "
+                            f"set_num={set_num} (было {len(parts)})"
+                        )
+
+            # ── sub активной партии — по индексу set_num-1 ──
             sub1, sub2 = 0, 0
-            if parts and len(parts) >= set_num:
+            if parts and 0 <= set_num - 1 < len(parts):
                 p = parts[set_num - 1] or {}
                 try:
                     sub1 = int(p.get("home", 0))
                     sub2 = int(p.get("away", 0))
-                except Exception:
+                except (ValueError, TypeError):
                     pass
+
+            # ── prev_sub — счёт ЗАВЕРШЁННОЙ партии (parts[set_num-2]) ──
+            # Это тот самый счёт, по которому движок строит after-goal
+            # (когда fast на 1 фазу впереди slow).
+            prev_sub1 = prev_sub2 = 0
+            prev_phase_num = 0
+            if parts and set_num >= 2 and (set_num - 2) < len(parts):
+                _pp = parts[set_num - 2] or {}
+                try:
+                    prev_sub1 = int(_pp.get("home", 0) or 0)
+                    prev_sub2 = int(_pp.get("away", 0) or 0)
+                    prev_phase_num = set_num - 1
+                except (ValueError, TypeError):
+                    pass
+
 
             markets = data.get("markets", {}) or {}
             set_markets: Dict[str, dict] = {}
@@ -565,13 +673,26 @@ class MarathonHandler(BookmakerHandler):
                         kind = "odd"
                         m_set = int(mm6.group(1))
 
-                # ← Сдвиг для баскетбола
-                if kind and m_set and basket_shift:
-                    m_set -= basket_shift
-
                 if not kind or not m_set:
                     continue
                 if m_set < 1 or m_set > 10:
+                    continue
+
+                # ── ФИЛЬТР БУДУЩИХ ЧЕТВЕРТЕЙ (баскет / кибер) ──
+                # Marathon присылает рынки ВСЕХ четвертей сразу.
+                # Например, в Q1 в markets будут:
+                #   MTCH_R2 (= Q1), MTCH_R3 (= Q2), MTCH_R4 (= Q3)
+                # После сдвига -1: m_set = 1, 2, 3.
+                # Но активна только Q1 (set_num=1).
+                # Без этого фильтра парсер создаёт set_1, set_2, set_3
+                # одновременно. И если sub берётся из parts[-1] (это
+                # данные Q1), движок может решить, что счёт Q2 уже
+                # подтверждён, и поставить на победителя 2-й четверти.
+                if is_basket and m_set > set_num:
+                    logger.debug(
+                        f"Marathon basket: пропускаю m_set={m_set} "
+                        f"(будущая четверть, активна {set_num})"
+                    )
                     continue
 
                 set_key = f"set_{m_set}"
@@ -712,8 +833,84 @@ class MarathonHandler(BookmakerHandler):
                             om["even"] = odds
                             oi["even"] = outcome
 
+            # ── SANITY (basket): линия total/IT не должна быть
+            # сильно ниже уже набранного счёта в этой четверти ──
+            # Если line на 10+ меньше sub_sum — это рынок будущей
+            # четверти (или закрытый рынок), а не текущей. Отбрасываем.
+            # Порог 10 выбран так: реальная задержка Marathon↔fast
+            # 2–5 сек, баскетбольный темп ~2 очка/сек в среднем →
+            # fast редко обгоняет slow больше чем на 8 очков.
+            if is_basket and set_markets:
+                for _sk, _mks in list(set_markets.items()):
+                    try:
+                        _sn = int(_sk.split("_", 1)[1])
+                    except (ValueError, IndexError):
+                        continue
+                    if not parts or not (0 < _sn <= len(parts)):
+                        continue
+                    _p = parts[_sn - 1] or {}
+                    try:
+                        _sub_h = int(_p.get("home", 0) or 0)
+                        _sub_a = int(_p.get("away", 0) or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    _sub_sum = _sub_h + _sub_a
+                    if _sub_sum <= 0:
+                        continue
+
+                    _t = _mks.get("total") or {}
+                    _ln = _t.get("line", 0) or 0
+                    if _ln > 0 and (_sub_sum - _ln) > 10:
+                        logger.warning(
+                            f"Marathon basket: set_{_sn} total line={_ln} "
+                            f"vs sub={_sub_h}:{_sub_a} (sum={_sub_sum}, "
+                            f"diff={_sub_sum - _ln:.1f}) — рынок не этой "
+                            f"четверти, отбрасываю"
+                        )
+                        _mks.pop("total", None)
+
+                    _it = _mks.get("it") or {}
+                    for _pl in ("1", "2"):
+                        _pit = _it.get(_pl) or {}
+                        _il = _pit.get("line", 0) or 0
+                        if _il <= 0:
+                            continue
+                        _ind = _sub_h if _pl == "1" else _sub_a
+                        if (_ind - _il) > 10:
+                            logger.warning(
+                                f"Marathon basket: set_{_sn} it{_pl} "
+                                f"line={_il} vs ind={_ind} — рынок не "
+                                f"этой четверти, отбрасываю"
+                            )
+                            _it.pop(_pl, None)
+
             if not set_markets:
                 return None
+
+            # ── ЗАЩИТА: не отдавать счёт ЗАВЕРШЁННОЙ партии как активной ──
+            # Если последняя партия в parts завершена (>=11 и разрыв>=2),
+            # значит мы в нестабильном моменте смены партии — Marathon
+            # ещё не добавил новую партию в parts. Пропускаем snapshot,
+            # следующее SSE-обновление принесёт свежие данные.
+            sport_code_lower = (data.get("sportCode") or "").lower()
+            is_basket_low = ("basket" in sport_code_lower
+                             or "e-sport" in sport_code_lower)
+            if not is_basket_low and parts:
+                p_last = parts[-1] or {}
+                try:
+                    lp1 = int(p_last.get("home", 0) or 0)
+                    lp2 = int(p_last.get("away", 0) or 0)
+                except (ValueError, TypeError):
+                    lp1 = lp2 = 0
+                set_done = self._is_set_done(
+                    data.get("sportCode", ""), lp1, lp2, set_num
+                )
+                if set_done:
+                    logger.debug(
+                        f"Marathon: set {set_num} завершён "
+                        f"{lp1}:{lp2} — пропускаю snapshot"
+                    )
+                    return None
 
             return {
                 "match_id":   str(tree_id),
@@ -727,6 +924,10 @@ class MarathonHandler(BookmakerHandler):
                 "score2":     score2,
                 "sub_score1": sub1,
                 "sub_score2": sub2,
+                # ── НОВОЕ ──
+                "prev_sub_score1": prev_sub1,
+                "prev_sub_score2": prev_sub2,
+                "prev_phase_num":  prev_phase_num,
                 "set_markets": set_markets,
                 "outcome_ids": outcome_ids,
             }
@@ -762,6 +963,13 @@ class MarathonHandler(BookmakerHandler):
             // ═══════════════════════════════════════════════════════
             let freshCoeffId = d.coefficient_id;
             let freshOdds = d.odds;
+            // ── ФИКС 2026-10-16: держим РОДНУЮ дробь от Marathon ──
+            // Marathon в /betslip/choices отдаёт price как {{n, d}}
+            // (например {{n:3, d:5}} = 1.60). В place-bets он ожидает
+            // РОВНО ТУ ЖЕ дробь — сравнение поэлементное.
+            // Раньше мы генерили свою 60/100 → отбой.
+            let freshNum = null;
+            let freshDen = null;
             try {{
                 // ── AbortController с жёстким таймаутом на fetch ──
                 // Без него: если betslip/choices не отдал ответ —
@@ -782,7 +990,7 @@ class MarathonHandler(BookmakerHandler):
                                 'content-type': 'application/json',
                                 'x-pan-source': 'REDESIGN_WEB',
                                 'x-pan-target': 'BROWSER',
-                                'x-pan-version': 'MOBILE-SSR-2.7.8',
+                                'x-pan-version': 'MOBILE-SSR-2.8.2',
                                 'origin': 'https://new.marathonbet.ru',
                                 'referer': location.href
                             }},
@@ -853,10 +1061,13 @@ class MarathonHandler(BookmakerHandler):
                 if (parsedChoice && parsedChoice.coeff) {{
                     freshCoeffId = parsedChoice.coeff.id;
                     const price = parsedChoice.coeff.price || {{}};
-                    const n = price.n || 0;
-                    const dd = price.d || 1;
-                    if (dd > 0) {{
+                    const n = price.n;
+                    const dd = price.d;
+                    if (typeof n === 'number' && typeof dd === 'number' && dd > 0) {{
                         freshOdds = (n + dd) / dd;
+                        // Сохраняем РОДНУЮ дробь Marathon
+                        freshNum = n;
+                        freshDen = dd;
                     }}
 
                     // ── ДИАГНОСТИКА: полный parsedChoice ──
@@ -957,7 +1168,17 @@ class MarathonHandler(BookmakerHandler):
                 console.log('MARATHON_FRESH_COEFF_ERR', String(e));
             }}
 
-            const num = Math.round(den * (freshOdds - 1));
+            // ── ФИКС 2026-10-16: effectivePrice из родной дроби ──
+            let num;
+            let denFinal;
+            if (typeof freshNum === 'number' && typeof freshDen === 'number'
+                    && freshDen > 0) {{
+                num = freshNum;
+                denFinal = freshDen;
+            }} else {{
+                denFinal = den;
+                num = Math.round(den * (freshOdds - 1));
+            }}
 
             const punterHash = getCookie('punter-session-hash');
 
@@ -969,7 +1190,7 @@ class MarathonHandler(BookmakerHandler):
                 'referer': location.href,
                 'x-pan-source': 'REDESIGN_WEB',
                 'x-pan-target': 'BROWSER',
-                'x-pan-version': 'MOBILE-SSR-2.7.8'
+                'x-pan-version': 'MOBILE-SSR-2.8.2'
             }};
             if (punterHash) headers['punter-session-hash'] = punterHash;
 
@@ -978,12 +1199,15 @@ class MarathonHandler(BookmakerHandler):
                     type: 'SINGLE',
                     choices: [{{
                         coefficientId: freshCoeffId,
-                        effectivePrice: {{ denominator: den, numerator: num }},
+                        effectivePrice: {{ denominator: denFinal, numerator: num }},
                         selectionRef: {{ eventId: d.event_id, id: d.selection_id }}
                     }}],
                     betStake: d.amount
                 }}],
-                betPlacingMode: 'Any',
+                // ── ФИКС 2026-10-29: 'Higher' = принимать, если кэф вырос.
+                // Если кэф упал — Marathon отклонит ставку (вернёт ошибку).
+                // 'None' = вообще не принимать изменения (даже если вырос).
+                betPlacingMode: 'GreaterOrEqualsToCurrent',
                 oneClick: false
             }};
 

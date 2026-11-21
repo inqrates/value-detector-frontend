@@ -12,10 +12,54 @@ from ui.login_window import LoginWindow
 from ui.main_window import MainWindow
 
 import logging
+from ui.log_paths import get_log_path, cleanup_old_logs
+
+# ── Логи: консоль + файлы в %APPDATA%\ValueDetectorPro\logs\YYYY-MM-DD\ ──
+# Тестировщик присылает папку за нужный день — там всё для отладки.
+_FORMAT = logging.Formatter(
+    '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
+)
+
+# В windowed-сборке PyInstaller (console=False) sys.stdout = None.
+# StreamHandler(None) выбросит AttributeError при первой записи —
+# поэтому добавляем только если stdout реально живой.
+_handlers = []
+if sys.stdout is not None:
+    _handlers.append(logging.StreamHandler(sys.stdout))
+
+try:
+    _app_handler = logging.FileHandler(
+        get_log_path("app.log"), encoding="utf-8"
+    )
+    _app_handler.setLevel(logging.INFO)
+    _app_handler.setFormatter(_FORMAT)
+    _handlers.append(_app_handler)
+
+    _err_handler = logging.FileHandler(
+        get_log_path("errors.log"), encoding="utf-8"
+    )
+    _err_handler.setLevel(logging.WARNING)
+    _err_handler.setFormatter(_FORMAT)
+    _handlers.append(_err_handler)
+except Exception as _e:
+    print(f"⚠️ Не удалось открыть файл лога: {_e}")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    handlers=_handlers,
+    force=True,
 )
+
+# Чистим старые папки логов (retention 7 дней)
+try:
+    _removed = cleanup_old_logs(keep_days=7)
+    if _removed:
+        logging.getLogger(__name__).info(
+            f"🧹 Удалено старых папок логов: {_removed}"
+        )
+except Exception:
+    pass
 
 for _name in (
     'qasync', 'qasync._windows', 'qasync._windows._EventWorker',
@@ -58,6 +102,18 @@ class _MarathonNoiseFilter(logging.Filter):
 logging.getLogger('ui.after_goal.marathon').addFilter(_MarathonNoiseFilter())
 
 def main():
+
+    # Глобальный перехватчик: любое необработанное исключение
+    # попадёт в errors.log — иначе в console=False увидим только
+    # системный попап без деталей.
+    import traceback
+    def _excepthook(exc_type, exc_value, exc_tb):
+        logging.getLogger("unhandled").error(
+            "Необработанное исключение",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -120,14 +176,27 @@ def main():
     # ---- Основной цикл ----
     if loop is not None:
         app.aboutToQuit.connect(lambda: loop.stop())
-        with loop:
+        try:
             loop.run_forever()
+        except Exception as _e:
+            logging.getLogger(__name__).warning(f"Loop error: {_e}")
+        finally:
+            # ── ФИКС 2026-10-29: НЕ используем 'with loop:' ──
+            # 'with loop:' вызывает loop.close(), который ждёт
+            # завершения ВСЕХ потоков (asyncio.to_thread/Playwright/
+            # QWebSocket). Если хоть один висит — loop.close() виснет
+            # навсегда, и os._exit(0) НИКОГДА не вызывается.
+            # Поэтому мы выходим из run_forever() напрямую и сразу
+            # идём в os._exit(0), который убьёт всё вместе с процессами.
+            pass
     else:
         app.exec_()
 
     # ---- Форсированный выход ----
-    # После выхода из event loop любой оставшийся поток (Playwright,
-    # QWebSocket, AdsPower) убьётся вместе с процессом.
+    # os._exit(0) убивает процесс мгновенно, игнорируя все
+    # незакрытые потоки. Это ГАРАНТИРУЕТ, что процесс не останется
+    # висеть в диспетчере задач.
+    logging.getLogger(__name__).info("🛑 Форсированный выход (os._exit)")
     os._exit(0)
 
 def _try_start_adspower_headless(app):

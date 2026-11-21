@@ -116,12 +116,11 @@ class PariHandler(BookmakerHandler):
     @staticmethod
     def _resolve_active_phase(data: dict, root_id: str):
         """
-        Возвращает (phase_num, phase_event_id, phase_name, sub1, sub2).
+        Возвращает (phase_num, phase_event_id, phase_name,
+                    sub1, sub2, prev_sub1, prev_sub2).
 
-        sub1/sub2 берутся из liveEventInfos.subscores — структурированный
-        источник от Pari (kindName="N-й сет", c1/c2 = точный счёт активной
-        партии). Если subscores нет — возвращаем sub1=sub2=0,
-        caller сделает fallback на comment.
+        sub1/sub2 — счёт активной партии.
+        prev_sub1/2 — счёт ЗАВЕРШЁННОЙ партии (для after-goal).
         """
         children = [ev for ev in data.get('events', []) or []
                     if str(ev.get('parentId')) == str(root_id)]
@@ -137,6 +136,9 @@ class PariHandler(BookmakerHandler):
         for info in data.get('liveEventInfos', []) or []:
             if str(info.get('eventId')) != str(root_id):
                 continue
+
+            # ── ФИКС 2026-10-14: собираем ВСЕ валидные subscores ──
+            valid_subs = []
             for sub in info.get('subscores') or []:
                 kind_id = sub.get('kindId')
                 c1 = int(sub.get('c1', 0) or 0)
@@ -153,8 +155,29 @@ class PariHandler(BookmakerHandler):
                 if not m:
                     continue
 
-                # ← возвращаем sub1/sub2 из subscores
-                return int(m.group(1)), str(ch.get('id')), name, c1, c2
+                valid_subs.append({
+                    "phase_num": int(m.group(1)),
+                    "phase_id":  str(ch.get('id')),
+                    "name":      name,
+                    "c1":        c1,
+                    "c2":        c2,
+                })
+
+            if not valid_subs:
+                continue
+
+            active = valid_subs[-1]
+            prev_sub1 = prev_sub2 = 0
+            if len(valid_subs) >= 2:
+                prev = valid_subs[-2]
+                prev_sub1 = prev["c1"]
+                prev_sub2 = prev["c2"]
+
+            return (
+                active["phase_num"], active["phase_id"], active["name"],
+                active["c1"], active["c2"],
+                prev_sub1, prev_sub2,
+            )
 
         # ── Приоритет 2: первая партия (без sub) ──
         if children:
@@ -162,8 +185,8 @@ class PariHandler(BookmakerHandler):
             name = first.get('name', '')
             m = re.search(r'(\d+)', name)
             if m:
-                return int(m.group(1)), str(first.get('id')), name, 0, 0
-        return 0, None, '', 0, 0
+                return int(m.group(1)), str(first.get('id')), name, 0, 0, 0, 0
+        return 0, None, '', 0, 0, 0, 0
 
     @staticmethod
     def _parse_phase_factors(factors: list, set_key: str,
@@ -310,7 +333,8 @@ class PariHandler(BookmakerHandler):
             return None
 
         (phase_num, phase_event_id, phase_name,
-         sub_from_subs1, sub_from_subs2) = \
+         sub_from_subs1, sub_from_subs2,
+         prev_sub1, prev_sub2) = \
             PariHandler._resolve_active_phase(data, match_id)
 
         misc = None
@@ -342,13 +366,13 @@ class PariHandler(BookmakerHandler):
             #  пар ровно столько, сколько ожидается по score.
             pairs = re.findall(r'(\d+[*]?)-(\d+[*]?)', comment)
             if pairs:
-                active = None
-                for p in pairs:
+                active_idx = None
+                for i, p in enumerate(pairs):
                     if '*' in p[0] or '*' in p[1]:
-                        active = p
+                        active_idx = i
                         break
 
-                if active is None:
+                if active_idx is None:
                     expected = 0
                     if misc:
                         expected = (
@@ -357,14 +381,36 @@ class PariHandler(BookmakerHandler):
                             + 1
                         )
                     if expected and len(pairs) == expected:
-                        active = pairs[-1]
+                        active_idx = len(pairs) - 1
 
-                if active is not None:
+                if active_idx is not None:
+                    active = pairs[active_idx]
                     a = active[0].replace('*', '')
                     b = active[1].replace('*', '')
                     if a.isdigit() and b.isdigit():
                         sub1 = int(a)
                         sub2 = int(b)
+
+                    # ── ФИКС 2026-10-15 v2: активная партия vs. счёт партий ──
+                    # Проверяем, что индекс активной пары соответствует
+                    # счёту партий. score1+score2 = кол-во завершённых.
+                    # active_idx (0-based) должен быть равен score1+score2.
+                    # Если больше — значит comment уже содержит новую
+                    # партию, но score ещё не обновлён — берём score как
+                    # истину и сбрасываем sub.
+                    _expected_idx = (int(misc.get('score1', 0) or 0)
+                                     + int(misc.get('score2', 0) or 0)) if misc else 0
+                    if active_idx > _expected_idx:
+                        sub1 = sub2 = 0
+
+                    if (prev_sub1 == 0 and prev_sub2 == 0
+                            and active_idx >= 1):
+                        prev = pairs[active_idx - 1]
+                        pa = prev[0].replace('*', '')
+                        pb = prev[1].replace('*', '')
+                        if pa.isdigit() and pb.isdigit():
+                            prev_sub1 = int(pa)
+                            prev_sub2 = int(pb)
 
         set_markets = {}
         outcome_ids = {}
@@ -388,6 +434,10 @@ class PariHandler(BookmakerHandler):
             "score2": score2,
             "sub_score1": sub1,
             "sub_score2": sub2,
+            # ── НОВОЕ ──
+            "prev_sub_score1": prev_sub1,
+            "prev_sub_score2": prev_sub2,
+            "prev_phase_num":  (phase_num - 1) if phase_num > 1 else 0,
             "set_markets": set_markets,
             "outcome_ids": outcome_ids,
         }

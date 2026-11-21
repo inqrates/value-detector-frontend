@@ -23,20 +23,32 @@ class LogBus(QObject):
             "level3": bool(level3),
         })
 
-    def info(self, source, message, details=None):
-        self.log("info", source, message, details)
+    # ── Хелперы с поддержкой bk / match_id (для фильтра по БК) ──
 
-    def success(self, source, message, details=None):
-        self.log("success", source, message, details)
+    def info(self, source, message, details=None,
+             bk=None, match_id=None):
+        self.log("info", source, message, details,
+                 bk=bk, match_id=match_id)
 
-    def warning(self, source, message, details=None):
-        self.log("warning", source, message, details)
+    def success(self, source, message, details=None,
+                bk=None, match_id=None):
+        self.log("success", source, message, details,
+                 bk=bk, match_id=match_id)
 
-    def error(self, source, message, details=None):
-        self.log("error", source, message, details)
+    def warning(self, source, message, details=None,
+                bk=None, match_id=None):
+        self.log("warning", source, message, details,
+                 bk=bk, match_id=match_id)
 
-    def signal(self, source, message, details=None):
-        self.log("signal", source, message, details)
+    def error(self, source, message, details=None,
+              bk=None, match_id=None):
+        self.log("error", source, message, details,
+                 bk=bk, match_id=match_id)
+
+    def signal(self, source, message, details=None,
+               bk=None, match_id=None):
+        self.log("signal", source, message, details,
+                 bk=bk, match_id=match_id)
 
     def match_event(
         self,

@@ -238,6 +238,32 @@ class SportbetHandler(BookmakerHandler):
         # ── Счёт ──
         score1, score2, sub1, sub2 = SportbetHandler._parse_scores(event)
 
+        # ── ФИКС 2026-10-16: prev_sub зависит от того, есть ли активная партия ──
+        # Если в scores уже есть активная партия (последний элемент) —
+        # prev_sub = предпоследний. Если активной ещё нет (только что
+        # началась) — prev_sub = последний элемент.
+        prev_sub1 = prev_sub2 = 0
+        _scores_raw = (event.get("scores") or "").strip()
+        if _scores_raw:
+            _parts = [p for p in _scores_raw.split() if p.strip()]
+            _expected_phases = score1 + score2 + 1
+
+            if len(_parts) >= _expected_phases and len(_parts) >= 2:
+                # Активная партия есть — берём предпоследнюю
+                _prev_candidate = _parts[-2]
+            elif _parts:
+                # Активной ещё нет — последняя = завершённая
+                _prev_candidate = _parts[-1]
+            else:
+                _prev_candidate = None
+
+            if _prev_candidate and ":" in _prev_candidate:
+                try:
+                    _a, _b = _prev_candidate.split(":", 1)
+                    prev_sub1, prev_sub2 = int(_a), int(_b)
+                except (ValueError, IndexError):
+                    pass
+
         # ── Нужно ли запрашивать маркеты ──
         now = time.time()
         last = self._last_fetch_time.get(match_id, 0.0)
@@ -278,6 +304,10 @@ class SportbetHandler(BookmakerHandler):
             "score2":      score2,
             "sub_score1":  sub1,
             "sub_score2":  sub2,
+            # ── НОВОЕ ──
+            "prev_sub_score1": prev_sub1,
+            "prev_sub_score2": prev_sub2,
+            "prev_phase_num":  (phase_num - 1) if phase_num > 1 else 0,
             "set_markets": set_markets,
             "outcome_ids": outcome_ids,
         }
@@ -355,14 +385,25 @@ class SportbetHandler(BookmakerHandler):
             score1, score2 = map(int, score_str.split(":"))
         except Exception:
             score1 = score2 = 0
-        sub1 = sub2 = 0
+
         scores_str = event.get("scores", "") or ""
         parts = [p.strip() for p in scores_str.split() if p.strip()]
-        if parts and ":" in parts[-1]:
-            try:
-                sub1, sub2 = map(int, parts[-1].split(":"))
-            except Exception:
-                pass
+
+        # ── ФИКС 2026-10-16: активной партии может не быть в scores ──
+        # Sportbet отдаёт в event.scores только СТАРТОВАВШИЕ партии.
+        # В момент смены (2-я завершена, 3-я только началась) активной
+        # пары там ещё нет — parts[-1] = счёт 2-й ЗАВЕРШЁННОЙ партии.
+        # Раньше мы отдавали его как sub → движок видел «партия 3
+        # завершена» и ставил ложный послегол.
+        # Правило: если len(parts) < score1+score2+1 — активной ещё нет.
+        _expected_phases = score1 + score2 + 1
+        sub1 = sub2 = 0
+        if parts and len(parts) >= _expected_phases:
+            if ":" in parts[-1]:
+                try:
+                    sub1, sub2 = map(int, parts[-1].split(":"))
+                except Exception:
+                    pass
         return score1, score2, sub1, sub2
 
     @staticmethod

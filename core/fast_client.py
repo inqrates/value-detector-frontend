@@ -238,6 +238,10 @@ class FonbetFastClient(FastOddsClient):
             "score2": parsed.get("score2", 0),
             "sub_score1": parsed.get("sub_score1", 0),
             "sub_score2": parsed.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": parsed.get("prev_sub_score1", 0),
+            "prev_sub_score2": parsed.get("prev_sub_score2", 0),
+            "prev_phase_num":  parsed.get("prev_phase_num", 0),
             "set_markets": parsed.get("set_markets", {}),
         }
 
@@ -315,6 +319,10 @@ class PariFastClient(FastOddsClient):
             "score2": parsed.get("score2", 0),
             "sub_score1": parsed.get("sub_score1", 0),
             "sub_score2": parsed.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": parsed.get("prev_sub_score1", 0),
+            "prev_sub_score2": parsed.get("prev_sub_score2", 0),
+            "prev_phase_num":  parsed.get("prev_phase_num", 0),
             "set_markets": parsed.get("set_markets", {}),
         }
 
@@ -475,6 +483,10 @@ class OlimpFastClient(FastOddsClient):
             "score2": parsed.get("score2", 0),
             "sub_score1": parsed.get("sub_score1", 0),
             "sub_score2": parsed.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": parsed.get("prev_sub_score1", 0),
+            "prev_sub_score2": parsed.get("prev_sub_score2", 0),
+            "prev_phase_num":  parsed.get("prev_phase_num", 0),
             "set_markets": parsed.get("set_markets", {}),
         }
 
@@ -506,6 +518,10 @@ class OlimpFastClient(FastOddsClient):
                     "score2": parsed.get("score2", 0),
                     "sub_score1": parsed.get("sub_score1", 0),
                     "sub_score2": parsed.get("sub_score2", 0),
+                    # ── НОВОЕ ──
+                    "prev_sub_score1": parsed.get("prev_sub_score1", 0),
+                    "prev_sub_score2": parsed.get("prev_sub_score2", 0),
+                    "prev_phase_num":  parsed.get("prev_phase_num", 0),
                     "set_markets": parsed.get("set_markets", {}),
                 }
         return None
@@ -603,17 +619,15 @@ class BetcityFastClient(FastOddsClient):
             "score2": parsed.get("score2", 0),
             "sub_score1": parsed.get("sub_score1", 0),
             "sub_score2": parsed.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": parsed.get("prev_sub_score1", 0),
+            "prev_sub_score2": parsed.get("prev_sub_score2", 0),
+            "prev_phase_num":  parsed.get("prev_phase_num", 0),
             "set_markets": parsed.get("set_markets", {}),
         }
 
     @staticmethod
     def _empty_result(ev_id) -> Dict:
-        """
-        Результат, когда событие НАЙДЕНО, но рынки ещё не пришли
-        (например, только что началась новая четверть).
-        Возвращаем пустой set_markets, чтобы polling не считал
-        это промахом и продолжал ждать появления рынков.
-        """
         return {
             "match_id": str(ev_id),
             "phase_num": 0,
@@ -621,6 +635,10 @@ class BetcityFastClient(FastOddsClient):
             "score2": 0,
             "sub_score1": 0,
             "sub_score2": 0,
+            # ── НОВОЕ ──
+            "prev_sub_score1": 0,
+            "prev_sub_score2": 0,
+            "prev_phase_num": 0,
             "set_markets": {},
         }
 
@@ -902,18 +920,42 @@ class SportbetFastClient(FastOddsClient):
         except Exception:
             s1 = s2 = 0
 
-        sub1 = sub2 = 0
+        # Партии из event.scores: "11:8 9:11 7:5"
         parts = [p for p in (event.get("scores") or "").split() if p.strip()]
-        if parts and ":" in parts[-1]:
-            try:
-                sub1, sub2 = map(int, parts[-1].split(":"))
-            except Exception:
-                pass
+
+        # ── ФИКС 2026-10-16: активной партии может не быть в scores ──
+        # В момент перехода (2-я завершена, 3-я только началась)
+        # parts[-1] = счёт ЗАВЕРШЁННОЙ партии. Раньше отдавали его как
+        # sub → движок видел «партия завершена» → ложный послегол.
+        # Правило: если len(parts) < s1+s2+1 — активной ещё нет,
+        # sub = 0:0, последняя пара = prev_sub.
+        _expected_phases = s1 + s2 + 1
+        sub1 = sub2 = 0
+        prev_sub1 = prev_sub2 = 0
+
+        if parts:
+            if len(parts) >= _expected_phases:
+                if ":" in parts[-1]:
+                    try:
+                        sub1, sub2 = map(int, parts[-1].split(":"))
+                    except Exception:
+                        pass
+                if len(parts) >= 2 and ":" in parts[-2]:
+                    try:
+                        prev_sub1, prev_sub2 = map(int, parts[-2].split(":"))
+                    except Exception:
+                        pass
+            else:
+                if ":" in parts[-1]:
+                    try:
+                        prev_sub1, prev_sub2 = map(int, parts[-1].split(":"))
+                    except Exception:
+                        pass
 
         if sport_key in ("basketball", "cyber_basketball"):
-            phase_num = len(parts) if parts else 1
+            phase_num = _expected_phases if parts else 1
         else:
-            phase_num = s1 + s2 + 1
+            phase_num = _expected_phases
 
         page_key = self._build_page_key(sport_key, phase_num)
         markets_raw = await self._fetch_page_markets(eid, page_key)
@@ -945,6 +987,10 @@ class SportbetFastClient(FastOddsClient):
             "phase_num": phase_num,
             "score1": s1, "score2": s2,
             "sub_score1": sub1, "sub_score2": sub2,
+            # ── НОВОЕ ──
+            "prev_sub_score1": prev_sub1,
+            "prev_sub_score2": prev_sub2,
+            "prev_phase_num":  (phase_num - 1) if phase_num > 1 else 0,
             "set_markets": set_markets,
         }
 
@@ -1279,7 +1325,20 @@ class MarathonFastClient(FastOddsClient):
                 if isinstance(value, dict):
                     cache = self._events_cache.get(expected_tree_id)
                     if cache and cache.get("_raw"):
-                        cache["_raw"]["matchScore"] = value
+                        # ── ФИКС: Marathon шлёт matchScore ЧАСТИЧНО ──
+                        # Не заменяем целиком, а мержим по ключам.
+                        # Иначе main (счёт партий) обнулится, если
+                        # пришёл только parts — и fast_phase_num
+                        # определится неверно.
+                        existing = cache["_raw"].get("matchScore") or {}
+                        if not isinstance(existing, dict):
+                            existing = {}
+                        merged = {**existing}
+                        for _k in ("main", "parts", "penalty",
+                                   "currentServe", "view", "scoreType"):
+                            if _k in value:
+                                merged[_k] = value[_k]
+                        cache["_raw"]["matchScore"] = merged
                 return
 
     def _upsert_event(self, event: dict):
@@ -1318,6 +1377,10 @@ class MarathonFastClient(FastOddsClient):
             "score2": parsed.get("score2", 0),
             "sub_score1": parsed.get("sub_score1", 0),
             "sub_score2": parsed.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": parsed.get("prev_sub_score1", 0),
+            "prev_sub_score2": parsed.get("prev_sub_score2", 0),
+            "prev_phase_num":  parsed.get("prev_phase_num", 0),
             "set_markets": parsed.get("set_markets", {}),
         }
 
@@ -1617,17 +1680,8 @@ class WinlineFastClient(FastOddsClient):
                 continue
             score_raw = (ev.get("score") or "").strip()
             set_scores_raw = (ev.get("setScores") or "").strip()
-            sub1 = sub2 = 0
-            parts_list = []
-            if set_scores_raw:
-                parts_list = [p.strip() for p in set_scores_raw.split(" - ")
-                              if p.strip()]
-            if parts_list and ":" in parts_list[-1]:
-                try:
-                    a, b = parts_list[-1].split(":", 1)
-                    sub1, sub2 = int(a), int(b)
-                except Exception:
-                    pass
+
+            # Счёт партий — из score "2:1"
             score1 = score2 = 0
             if score_raw and ":" in score_raw:
                 try:
@@ -1635,13 +1689,90 @@ class WinlineFastClient(FastOddsClient):
                     score1, score2 = int(a), int(b)
                 except Exception:
                     pass
-            phase_num = len(parts_list) if parts_list else (score1 + score2 + 1)
+
+            # Партии из setScores: "11:8 - 9:11 - 7:5"
+            parts_list = []
+            if set_scores_raw:
+                parts_list = [p.strip() for p in set_scores_raw.split(" - ")
+                              if p.strip()]
+
+            # ── Определяем вид спорта ──
+            # У баскетбола score1/score2 — ОБЩИЕ ОЧКИ (60:59), а не счёт
+            # по четвертям. Формула "score1+score2+1" даёт мусор (120).
+            # Для баскета фаза = len(parts_list) (сколько четвертей стартовало).
+            _sid = ev.get("sportId")
+            _sport_key = {
+                20:  "table_tennis",
+                23:  "volleyball",
+                2:   "basketball",
+                193: "cyber_basketball",
+                153: "cyber_basketball",
+            }.get(_sid, "table_tennis")
+            _is_basket = _sport_key in ("basketball", "cyber_basketball")
+
+            sub1 = sub2 = 0
+            prev_sub1 = prev_sub2 = 0
+
+            if _is_basket:
+                # ── БАСКЕТ: фаза = число стартовавших четвертей ──
+                if parts_list:
+                    # ФИКС: не берем счет прошлой четверти, если текущая только началась
+                    if _expected_phases > len(parts_list):
+                        sub1 = sub2 = 0
+                    else:
+                        if ":" in parts_list[-1]:
+                            try:
+                                a, b = parts_list[-1].split(":", 1)
+                                sub1, sub2 = int(a), int(b)
+                            except Exception:
+                                pass
+                    if len(parts_list) >= 2 and ":" in parts_list[-2]:
+                        try:
+                            a, b = parts_list[-2].split(":", 1)
+                            prev_sub1, prev_sub2 = int(a), int(b)
+                        except (ValueError, IndexError):
+                            pass
+                phase_num = len(parts_list) if parts_list else 1
+            else:
+                # ── НТ / ВОЛЕЙБОЛ: старая логика ──
+                # В момент перехода (2-я завершена, 3-я только началась)
+                # parts_list[-1] = счёт ЗАВЕРШЁННОЙ партии. Если len <
+                # score1+score2+1 — активной ещё нет, sub = 0:0, последняя
+                # пара уходит в prev_sub.
+                _expected_phases = score1 + score2 + 1
+
+                if parts_list:
+                    if len(parts_list) >= _expected_phases:
+                        if ":" in parts_list[-1]:
+                            try:
+                                a, b = parts_list[-1].split(":", 1)
+                                sub1, sub2 = int(a), int(b)
+                            except Exception:
+                                pass
+                        if len(parts_list) >= 2 and ":" in parts_list[-2]:
+                            try:
+                                a, b = parts_list[-2].split(":", 1)
+                                prev_sub1, prev_sub2 = int(a), int(b)
+                            except (ValueError, IndexError):
+                                pass
+                    else:
+                        if ":" in parts_list[-1]:
+                            try:
+                                a, b = parts_list[-1].split(":", 1)
+                                prev_sub1, prev_sub2 = int(a), int(b)
+                            except Exception:
+                                pass
+
+                phase_num = score1 + score2 + 1
+
             self._live_events[ev_id] = {
                 "participants": [str(p) for p in parts],
                 "score1": score1,
                 "score2": score2,
                 "sub_score1": sub1,
                 "sub_score2": sub2,
+                "prev_sub1": prev_sub1,
+                "prev_sub2": prev_sub2,
                 "phase_num": phase_num,
                 "sport_id": ev.get("sportId"),
                 "ts": time.time(),
@@ -1681,6 +1812,11 @@ class WinlineFastClient(FastOddsClient):
             "score2": ev_data.get("score2", 0),
             "sub_score1": ev_data.get("sub_score1", 0),
             "sub_score2": ev_data.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": ev_data.get("prev_sub1", 0),
+            "prev_sub_score2": ev_data.get("prev_sub2", 0),
+            "prev_phase_num": (ev_data.get("phase_num", 0) or 0) - 1
+                              if ev_data.get("phase_num", 0) > 1 else 0,
             "set_markets": set_markets,
         }
 
@@ -1718,6 +1854,11 @@ class WinlineFastClient(FastOddsClient):
             "score2": ev_data.get("score2", 0),
             "sub_score1": ev_data.get("sub_score1", 0),
             "sub_score2": ev_data.get("sub_score2", 0),
+            # ── НОВОЕ ──
+            "prev_sub_score1": ev_data.get("prev_sub1", 0),
+            "prev_sub_score2": ev_data.get("prev_sub2", 0),
+            "prev_phase_num": (ev_data.get("phase_num", 0) or 0) - 1
+                              if ev_data.get("phase_num", 0) > 1 else 0,
             "set_markets": set_markets,
         }
 

@@ -52,6 +52,10 @@ hiddenimports += [
     'core.fast_cookie_collector',
     'core.adspower_launcher',
     'ui.fast_cookie_runner',
+    # ── Логи ──
+    # Импортируется лениво (в _monitor_loop и app.py), поэтому
+    # явно, чтобы PyInstaller не пропустил.
+    'ui.log_paths',
 ]
 
 

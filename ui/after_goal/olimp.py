@@ -332,9 +332,25 @@ class OlimpHandler(BookmakerHandler):
                                   int(m.get('team2', 0) or 0)))
                 except Exception:
                     pairs.append((0, 0))
+
+        # ── ФИКС 2026-10-15: активная партия может отсутствовать в mapsScore ──
+        # Olimp добавляет партию в mapsScore только после того, как она
+        # стартовала. В момент перехода (2-я завершена, 3-я только началась)
+        # mapsScore содержит лишь ЗАВЕРШЁННЫЕ партии, а последняя пара —
+        # счёт уже завершённой партии. Раньше мы отдавали её как sub
+        # активной → движок видел «партия завершена» и ставил ложный послегол.
+        # Правило: если в mapsScore меньше партий, чем score1+score2+1 —
+        # активной там ещё нет, sub = 0:0, последняя пара = prev_sub.
+        _expected_phases = score1 + score2 + 1
         sub1 = sub2 = 0
+        prev_sub1 = prev_sub2 = 0
         if pairs:
-            sub1, sub2 = pairs[-1]
+            if len(pairs) >= _expected_phases:
+                sub1, sub2 = pairs[-1]
+                if len(pairs) >= 2:
+                    prev_sub1, prev_sub2 = pairs[-2]
+            else:
+                prev_sub1, prev_sub2 = pairs[-1]
 
         comment = event.get('comment', '') or ''
 
@@ -535,6 +551,10 @@ class OlimpHandler(BookmakerHandler):
             "phase_num": phase_num,
             "score1": score1, "score2": score2,
             "sub_score1": sub1, "sub_score2": sub2,
+            # ── НОВОЕ ──
+            "prev_sub_score1": prev_sub1,
+            "prev_sub_score2": prev_sub2,
+            "prev_phase_num":  (phase_num - 1) if phase_num > 1 else 0,
             "set_markets": set_markets,
             "outcome_ids": outcome_ids,
         }

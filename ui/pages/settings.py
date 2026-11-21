@@ -872,7 +872,7 @@ class SettingsPage(QWidget):
         self._fast_runner = FastCookieRunner(
             profile_id=profile_id,
             api_key=api_key,
-            headless=True,
+            headless=False,
             bks=selected,
         )
         self._fast_runner.finished.connect(self._on_collect_finished)
@@ -906,7 +906,7 @@ class SettingsPage(QWidget):
         self._fast_runner = FastCookieRunner(
             profile_id=profile_id,
             api_key=api_key,
-            headless=True,
+            headless=False,
             bks=bks_to_collect,
         )
         self._fast_runner.finished.connect(self._on_collect_finished)

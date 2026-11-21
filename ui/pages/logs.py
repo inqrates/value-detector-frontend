@@ -341,7 +341,15 @@ class LogsPage(QWidget):
                 f'[{bk_label}]</span> '
             )
 
-        source_span = f'<span style="color:#7fa1b7;">[{html.escape(e["source"])}]</span>'
+        _source = e.get("source") or ""
+        # Не дублируем `[Betcity] [BETCITY]`, если source = bk.upper()
+        if bk and _source and _source.upper() == bk.upper():
+            source_span = ""
+        else:
+            source_span = (
+                f'<span style="color:#7fa1b7;">'
+                f'[{html.escape(_source)}]</span>'
+            )
         msg = html.escape(e["message"])
 
         if e["level"] == "signal":

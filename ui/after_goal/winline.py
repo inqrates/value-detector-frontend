@@ -214,18 +214,6 @@ class WinlineHandler(BookmakerHandler):
             score_raw = (ev.get("score") or "").strip()
             set_scores_raw = (ev.get("setScores") or "").strip()
 
-            # Очки текущей партии — из последнего куска setScores.
-            # Формат: "11:8 - 9:11 - 7:5" → sub [7, 5].
-            sub1 = sub2 = 0
-            parts_list = [p.strip() for p in set_scores_raw.split(" - ")
-                          if p.strip()] if set_scores_raw else []
-            if parts_list:
-                try:
-                    a, b = parts_list[-1].split(":")
-                    sub1, sub2 = int(a), int(b)
-                except Exception:
-                    pass
-
             # Счёт партий — из score "2:1".
             score1 = score2 = 0
             if score_raw and ":" in score_raw:
@@ -235,9 +223,105 @@ class WinlineHandler(BookmakerHandler):
                 except Exception:
                     pass
 
-            # phase_num = номер текущей партии/сета/четверти.
-            # Приоритет — длина setScores (сколько партий идёт).
-            phase_num = len(parts_list) if parts_list else (score1 + score2 + 1)
+            # Партии из setScores: "11:8 - 9:11 - 7:5"
+            parts_list = [p.strip() for p in set_scores_raw.split(" - ")
+                          if p.strip()] if set_scores_raw else []
+
+            # ── Определяем вид спорта ──
+            # У баскетбола score1/score2 — это ОБЩИЕ ОЧКИ (60:59),
+            # а не счёт по четвертям. Формула "score1+score2+1" для
+            # него даёт мусор (60+59+1 = 120). Для баскетбола фаза =
+            # количество четвертей, стартовавших в setScores.
+            _sid = ev.get("sportId")
+            _sport_key = {
+                20:  "table_tennis",
+                23:  "volleyball",
+                2:   "basketball",
+                193: "cyber_basketball",
+                153: "cyber_basketball",
+            }.get(_sid, "table_tennis")
+            _is_basket = _sport_key in ("basketball", "cyber_basketball")
+
+            # ── ФИКС 2026-10-16: баскет ≠ НТ по логике sub ──
+            # Для баскетбола: фаза = len(parts_list) (сколько четвертей
+            # стартовало), sub = счёт последней стартовавшей четверти.
+            # Для НТ/волейбола: фаза = score1+score2+1, sub = счёт
+            # активной партии, если она есть в parts_list.
+            if _is_basket:
+                _expected_phases = len(parts_list) if parts_list else 1
+            else:
+                _expected_phases = score1 + score2 + 1
+
+            sub1 = sub2 = 0
+            prev_sub1 = prev_sub2 = 0
+
+            if parts_list:
+                if _is_basket:
+                    # Последняя = активная четверть, предпоследняя = завершённая
+                    try:
+                        a, b = parts_list[-1].split(":")
+                        sub1, sub2 = int(a), int(b)
+                    except Exception:
+                        pass
+                    if len(parts_list) >= 2:
+                        try:
+                            a, b = parts_list[-2].split(":", 1)
+                            prev_sub1, prev_sub2 = int(a), int(b)
+                        except (ValueError, IndexError):
+                            pass
+                else:
+                    # НТ/волейбол — старая логика с проверкой длины
+                    if len(parts_list) >= _expected_phases:
+                        try:
+                            a, b = parts_list[-1].split(":")
+                            sub1, sub2 = int(a), int(b)
+                        except Exception:
+                            pass
+                        if len(parts_list) >= 2:
+                            try:
+                                a, b = parts_list[-2].split(":", 1)
+                                prev_sub1, prev_sub2 = int(a), int(b)
+                            except (ValueError, IndexError):
+                                pass
+                    else:
+                        try:
+                            a, b = parts_list[-1].split(":")
+                            prev_sub1, prev_sub2 = int(a), int(b)
+                        except Exception:
+                            pass
+
+            # phase_num = номер текущей фазы
+            if _is_basket:
+                phase_num = _expected_phases
+            else:
+                phase_num = score1 + score2 + 1
+            sub1 = sub2 = 0
+            prev_sub1 = prev_sub2 = 0
+
+            if parts_list:
+                if len(parts_list) >= _expected_phases:
+                    try:
+                        a, b = parts_list[-1].split(":")
+                        sub1, sub2 = int(a), int(b)
+                    except Exception:
+                        pass
+                    if len(parts_list) >= 2:
+                        try:
+                            a, b = parts_list[-2].split(":", 1)
+                            prev_sub1, prev_sub2 = int(a), int(b)
+                        except (ValueError, IndexError):
+                            pass
+                else:
+                    try:
+                        a, b = parts_list[-1].split(":")
+                        prev_sub1, prev_sub2 = int(a), int(b)
+                    except Exception:
+                        pass
+
+            # phase_num = номер ТЕКУЩЕЙ партии (по счёту сетов).
+            # Раньше был len(parts_list) — это ошибка, если активной
+            # партии ещё нет в setScores. Теперь считаем по score.
+            phase_num = score1 + score2 + 1
 
             self._live_events[ev_id] = {
                 "participants": [str(p) for p in parts],
@@ -245,6 +329,8 @@ class WinlineHandler(BookmakerHandler):
                 "score2": score2,
                 "sub_score1": sub1,
                 "sub_score2": sub2,
+                "prev_sub1": prev_sub1,
+                "prev_sub2": prev_sub2,
                 "phase_num": phase_num,
                 "sport_id": ev.get("sportId"),
                 "ts": time.time(),

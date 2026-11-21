@@ -148,13 +148,16 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: rgba(199,214,223,0.62); padding: 4px 12px;")
         self.statusBar().addPermanentWidget(self.status_label)
 
-        self.after_goal_engine = AfterGoalEngine()
+        # ---- WebSocket: создаём ДО движка, чтобы передать его в конструктор ----
+        self.client = SignalClient()
+
+        # ---- Движок: передаём signal_client для WS-пуша match_state ----
+        self.after_goal_engine = AfterGoalEngine(signal_client=self.client)
 
         # ---- Логи: подписываемся на шину ----
         log_bus.entry.connect(self._on_log_entry)
 
-        # ---- WebSocket ----
-        self.client = SignalClient()
+        # ---- WebSocket сигналы ----
         self.client.signal_received.connect(self._on_signal)
         self.client.advisor_received.connect(self._on_advisor)
         self.client.arbitrage_received.connect(self._on_arbitrage)
@@ -165,6 +168,10 @@ class MainWindow(QMainWindow):
         self.client.connect()
         self.client.missed_received.connect(self._on_missed)
         self.client.preopen_received.connect(self._on_preopen)
+        # ── НОВОЕ: приём match_state пушей от сервера ──
+        self.client.match_state_received.connect(
+            self.after_goal_engine.on_match_state
+        )
 
         # ---- Стартовые сообщения ----
         log_bus.info("Система", "Приложение запущено")
@@ -208,11 +215,33 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             super().closeEvent(event)
+            # ── ФИКС: после accept() гарантированно выходим ──
+            try:
+                from PyQt5.QtWidgets import QApplication
+                QApplication.quit()
+            except Exception:
+                pass
             return
 
         # Первая фаза: запускаем graceful shutdown, окно пока не закрываем
         log_bus.info("Система", "Начинаю graceful shutdown...")
         event.ignore()
+
+        # ── ФИКС: страховочный таймер на случай, если _graceful_close
+        # сам не запустится (например, event loop висит) ──
+        import os as _os
+        from PyQt5.QtCore import QTimer
+
+        def _emergency_exit():
+            try:
+                _os._exit(0)
+            except Exception:
+                pass
+
+        try:
+            QTimer.singleShot(15000, _emergency_exit)
+        except Exception:
+            pass
 
         try:
             loop = asyncio.get_event_loop()
@@ -223,10 +252,28 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log_bus.warning("Система", f"Ошибка shutdown: {e}")
             self._closing = True
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                pass
+            _emergency_exit()
 
     async def _graceful_close(self):
-        # 1) Останавливаем движок: все мониторинги, страницы, AdsPower-браузеры
+        import os as _os
+        from PyQt5.QtCore import QTimer
+        from PyQt5.QtWidgets import QApplication
+
+        # ── ФИКС 2026-10-29: гарантированный выход ──
+        # QApplication.quit() не завершает qasync-loop, поэтому
+        # процесс остаётся висеть в диспетчере задач после закрытия.
+        # План:
+        #   1) graceful shutdown (8 сек max)
+        #   2) QApplication.quit() + self.close()
+        #   3) watchdog: через 2.5 сек os._exit(0) — убьёт процесс,
+        #      если graceful не сработал.
+        # Если graceful успеет — watchdog не сработает.
+
+        # 1) Движок
         try:
             await asyncio.wait_for(
                 self.after_goal_engine.shutdown(), timeout=8.0
@@ -240,18 +287,45 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log_bus.warning("Система", f"Ошибка остановки движка: {e}")
 
-        # 2) Отключаем WebSocket
+        # 2) WebSocket
         try:
             self.client.disconnect()
         except Exception:
             pass
 
-        # 3) Ставим флаг и закрываем окно
+        # 3) Останавливаем фоновые QThread/QTimer
+        try:
+            if hasattr(self, '_flush_timer') and self._flush_timer:
+                self._flush_timer.stop()
+        except Exception:
+            pass
+
+        # 4) Ставим флаг, закрываем окно, выходим из QApplication
         self._closing = True
         try:
             self.close()
         except Exception:
             pass
+
+        try:
+            QApplication.quit()
+        except Exception:
+            pass
+
+        # 5) Watchdog: если через 2.5 сек процесс ещё жив — убиваем
+        # принудительно. Это гарантия, что не будет "висящего" в
+        # диспетчере задач. 2.5 сек — с запасом на закрытие
+        # AdsPower-браузеров (Playwright успевает за 1-1.5 сек).
+        def _force_exit():
+            try:
+                _os._exit(0)
+            except Exception:
+                pass
+
+        try:
+            QTimer.singleShot(2500, _force_exit)
+        except Exception:
+            _force_exit()
 
     # ---------- Логи ----------
     def _on_log_entry(self, entry: dict):

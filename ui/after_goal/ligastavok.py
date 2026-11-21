@@ -75,13 +75,16 @@ _FETCH_HOOK_JS = r"""
 
 class LigaStavokHandler(BookmakerHandler):
     def __init__(self, target_match_id: str = None,
-                 target_teams: List[str] = None):
+                 target_teams: List[str] = None,
+                 sport: str = "table_tennis"):
         self.target_match_id = str(target_match_id) if target_match_id else None
         self.target_teams = list(target_teams or [])
+        self._sport = (sport or "table_tennis").lower()
         self._page: Optional[Page] = None
         self._callback: Optional[Callable] = None
 
         self._scores_all: List[dict] = []
+        self._scores_current: Optional[dict] = None
         self._markets: Dict[str, dict] = {}
         self._outcomes: Dict[str, dict] = {}
 
@@ -123,6 +126,7 @@ class LigaStavokHandler(BookmakerHandler):
         self._page = page
 
         self._scores_all = []
+        self._scores_current = None
         self._markets.clear()
         self._outcomes.clear()
         self._phase_parts.clear()
@@ -209,12 +213,26 @@ class LigaStavokHandler(BookmakerHandler):
             all_scores = scores.get("all")
             if isinstance(all_scores, list):
                 self._scores_all = all_scores
+            # ── НОВОЕ: текущая партия ──
+            cur = scores.get("current")
+            if isinstance(cur, dict):
+                self._scores_current = cur
 
         event = result.get("event") or {}
         status_str = (event.get("status") or "").strip()
-        m = re.search(r'(\d+)\s*set', status_str, re.IGNORECASE)
+        status_tr = (event.get("statusTranslated") or "").strip()
+
+        # НТ/волейбол: "3 set". Баскет: "3q". Ещё бывает "3 quarter", "3 period".
+        # Сначала пробуем распарсить status.
+        m = re.search(r'(\d+)\s*(?:set|q|quarter|period)',
+                      status_str, re.IGNORECASE)
         if m:
             self._event_status_phase = int(m.group(1))
+        else:
+            # Fallback: statusTranslated "3-я четверть" / "3-й сет" / "3-я партия"
+            m = re.search(r'(\d+)', status_tr)
+            if m:
+                self._event_status_phase = int(m.group(1))
 
         self._action_line_loaded = True
 
@@ -375,8 +393,14 @@ class LigaStavokHandler(BookmakerHandler):
                 self._scores_all = value
                 continue
 
+            if path == "/scores/current" and isinstance(value, dict):
+                self._scores_current = value
+                continue
+
             if path == "/event/status" and isinstance(value, str):
-                m = re.search(r'(\d+)\s*set', value, re.IGNORECASE)
+                # НТ/волейбол: "4set". Баскет: "3q". Ещё "quarter", "period".
+                m = re.search(r'(\d+)\s*(?:set|q|quarter|period)',
+                              value, re.IGNORECASE)
                 if m:
                     n = int(m.group(1))
                     if n != self._event_status_phase:
@@ -435,7 +459,16 @@ class LigaStavokHandler(BookmakerHandler):
         num = None
 
         if code:
-            m = re.search(r'SET[_-]?(\d+)', code, re.IGNORECASE)
+            # НТ/волейбол: SET_N. Баскет/кибер: QUARTER_N или Q_N или PERIOD_N.
+            # HALFTIME_N не матчится (нет SET/QUARTER/Q/PERIOD в токене) —
+            # правильно, это агрегат, не партия.
+            m = re.search(
+                r'(?:^|[_-])(?:SET|QUARTER|Q|PERIOD)[_-]?(\d+)\b',
+                code, re.IGNORECASE,
+            )
+            if not m:
+                # Fallback для SET_N в начале строки
+                m = re.search(r'^SET[_-]?(\d+)', code, re.IGNORECASE)
             if m:
                 num = int(m.group(1))
 
@@ -538,26 +571,69 @@ class LigaStavokHandler(BookmakerHandler):
             elif field == "marketId":
                 entry["marketId"] = str(value or "")
 
+
     def _determine_active_phase(self) -> int:
-        if self._event_status_phase > 0:
-            return self._event_status_phase
-        if not self._scores_all:
-            return 0
-        active_num = 0
-        for s in self._scores_all:
-            try:
-                n = int(s.get("PartNumber") or 0)
-                s1 = int(s.get("ScoreTeam1") or 0)
-                s2 = int(s.get("ScoreTeam2") or 0)
-            except Exception:
-                continue
-            if n <= 0:
-                continue
-            if s1 > 0 or s2 > 0:
-                active_num = n
-            else:
-                break
-        return active_num
+        p_status = self._event_status_phase
+
+        p_all = 0
+        if self._scores_all:
+            for s in self._scores_all:
+                try:
+                    n = int(s.get("PartNumber") or 0)
+                    if n > p_all:
+                        p_all = n
+                except (ValueError, TypeError):
+                    pass
+
+        phase = max(p_status, p_all)
+
+        # ── Для баскета фаза определяется ТОЛЬКО по status/PartNumber ──
+        # Четверть завершается по времени (10 мин), а не по очкам.
+        # Порог 11 здесь неприменим.
+        if self._sport in ("basketball", "cyber_basketball"):
+            return phase
+
+        # ── НТ/волейбол: если партия завершена, но ещё не сдвинулась ──
+        if phase > 0 and self._scores_all:
+            active = next(
+                (s for s in self._scores_all
+                 if str(s.get("PartNumber")) == str(phase)),
+                None,
+            )
+            if active is not None:
+                try:
+                    s1 = int(active.get("ScoreTeam1") or 0)
+                    s2 = int(active.get("ScoreTeam2") or 0)
+                except (ValueError, TypeError):
+                    s1 = s2 = 0
+                set_done = self._is_set_done(s1, s2, phase)
+                if set_done:
+                    logger.info(
+                        f"LigaStavok: фаза {phase} завершена {s1}:{s2} "
+                        f"→ переключаюсь на {phase + 1}"
+                    )
+                    phase = phase + 1
+
+        return phase
+
+    def _is_set_done(self, s1: int, s2: int, set_num: int) -> bool:
+        """
+        Учитывает вид спорта:
+          - НТ:       порог 11, разрыв 2
+          - Волейбол: порог 25 (5-я — 15), разрыв 2
+          - Баскет:   по очкам не завершается → False (см. _determine_active_phase)
+        """
+        sport = self._sport
+        if sport in ("basketball", "cyber_basketball"):
+            return False
+        if sport in ("volleyball", "beach_volleyball"):
+            thr = 15 if set_num >= 5 else 25
+        else:
+            thr = 11
+        return (
+            (s1 >= thr and s1 - s2 >= 2) or
+            (s2 >= thr and s2 - s1 >= 2)
+        )
 
     # ════════════════════════════════════════════════════════════
     # Парсеры рынков (общие — вызываются и для main, и для race)
@@ -826,37 +902,81 @@ class LigaStavokHandler(BookmakerHandler):
 
         # ── Счёт партий и sub_score ──
         score1 = score2 = sub1 = sub2 = 0
+        prev_sub1 = prev_sub2 = 0
+
+        # sub активной партии — из scores.current (самый свежий источник)
+        if isinstance(self._scores_current, dict):
+            cur_pn = str(self._scores_current.get("PartNumber") or "")
+            if cur_pn == str(phase_num):
+                try:
+                    sub1 = int(self._scores_current.get("ScoreTeam1") or 0)
+                    sub2 = int(self._scores_current.get("ScoreTeam2") or 0)
+                except (ValueError, TypeError):
+                    pass
+
         if self._scores_all:
             for s in self._scores_all:
                 try:
                     s1 = int(s.get("ScoreTeam1") or 0)
                     s2 = int(s.get("ScoreTeam2") or 0)
-                except Exception:
+                    n = int(s.get("PartNumber") or 0)
+                except (ValueError, TypeError):
                     continue
-                if s1 > s2 and s1 >= 11:
-                    score1 += 1
-                elif s2 > s1 and s2 >= 11:
-                    score2 += 1
-            active = next(
-                (s for s in self._scores_all
-                 if str(s.get("PartNumber")) == str(phase_num)),
-                None,
-            )
-            if active:
-                try:
-                    sub1 = int(active.get("ScoreTeam1") or 0)
-                    sub2 = int(active.get("ScoreTeam2") or 0)
-                except Exception:
-                    pass
+
+                # Все партии с PartNumber < phase_num — уже завершены.
+                # Считаем победителя в каждой.
+                if n < phase_num:
+                    if s1 > s2:
+                        score1 += 1
+                    elif s2 > s1:
+                        score2 += 1
+
+            # Если sub ещё не заполнен из current — берём из all
+            if sub1 == 0 and sub2 == 0:
+                active = next(
+                    (s for s in self._scores_all
+                     if str(s.get("PartNumber")) == str(phase_num)),
+                    None,
+                )
+                if active:
+                    try:
+                        sub1 = int(active.get("ScoreTeam1") or 0)
+                        sub2 = int(active.get("ScoreTeam2") or 0)
+                    except (ValueError, TypeError):
+                        pass
+
+            # ── ФИКС 2026-10-16: prev_sub для after-goal ──
+            # Если active найден (sub ≠ 0:0) — prev_sub берём у партии
+            # с номером phase_num - 1.
+            # Если active = None (партия только началась, фаза сдвинута
+            # через _determine_active_phase) — prev_sub = та партия,
+            # которая только что завершилась, т.е. PartNumber = phase_num - 1.
+            prev_phase = phase_num - 1
+            if prev_phase > 0:
+                prev_rec = next(
+                    (s for s in self._scores_all
+                     if str(s.get("PartNumber")) == str(prev_phase)),
+                    None,
+                )
+                if prev_rec:
+                    try:
+                        prev_sub1 = int(prev_rec.get("ScoreTeam1") or 0)
+                        prev_sub2 = int(prev_rec.get("ScoreTeam2") or 0)
+                    except (ValueError, TypeError):
+                        pass
 
         return {
             "match_id":    str(self.target_match_id),
-            "sport":       "any",
+            "sport":       self._sport,
             "phase_num":   phase_num,
             "score1":      score1,
             "score2":      score2,
             "sub_score1":  sub1,
             "sub_score2":  sub2,
+            # ── НОВОЕ ──
+            "prev_sub_score1": prev_sub1,
+            "prev_sub_score2": prev_sub2,
+            "prev_phase_num":  phase_num - 1 if phase_num > 1 else 0,
 
             "set_markets":       main_markets,
             "outcome_ids":       main_ids,
