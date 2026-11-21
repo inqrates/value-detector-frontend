@@ -650,16 +650,9 @@ class SettingsPage(QWidget):
 
         fast_form = QFormLayout()
         fast_form.setSpacing(8)
-
         self.fast_profile_edit = QLineEdit()
         self.fast_profile_edit.setPlaceholderText("Например: k1h5id2p")
-        fast_form.addRow("AdsPower Profile ID:", self.fast_profile_edit)
-
-        self.fast_api_key_edit = QLineEdit()
-        self.fast_api_key_edit.setPlaceholderText("API-ключ AdsPower")
-        self.fast_api_key_edit.setEchoMode(QLineEdit.Password)
-        fast_form.addRow("AdsPower API Key:", self.fast_api_key_edit)
-
+        fast_form.addRow("ID профиля:", self.fast_profile_edit)
         fast_layout.addLayout(fast_form)
 
         # ---- Список БК, что будут использоваться (только для справки) ----
@@ -774,13 +767,10 @@ class SettingsPage(QWidget):
             )
             fc = load_fast_config()
             self.fast_profile_edit.setText(fc.get("profile_id", ""))
-            self.fast_api_key_edit.setText(fc.get("api_key", ""))
-
             last_at = fc.get("last_collect_at", "")
             status = fc.get("last_collect_status", {}) or {}
-
             if not fc.get("profile_id"):
-                self.fast_status_label.setText("Статус: укажите Profile ID и API Key")
+                self.fast_status_label.setText("Статус: укажите ID профиля")
             elif last_at:
                 lines = [f"Последний сбор: {last_at}"]
                 for bk in get_enabled_fast_bks():

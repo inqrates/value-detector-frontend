@@ -22,12 +22,12 @@ from .after_goal import (
     WinlineHandler,
     MarathonHandler,
 )
-from core.adspower_browser import AdsPowerBrowser
+from core.browser_launcher import PatchrightBrowser
 from core.fast_client import (
     get_fast_client, has_fast_client, shutdown_all as fast_clients_shutdown,
 )
 from core.fast_config import (
-    is_fast_configured, get_fast_profile_id, get_fast_api_key,
+    is_fast_configured, get_fast_profile_id,
 )
 from .paths import get_app_data_dir
 from .after_goal.match_urls import build_match_url
@@ -36,7 +36,7 @@ from ui.log_bus import log_bus
 
 import requests
 
-ADSPOWER_API_URL = "http://localhost:50325"
+
 AFTER_GOAL_TIMEOUT = 25
 MONITOR_MAX_LIFETIME = 40.0
 AFTER_GOAL_COOLDOWN = 10
@@ -71,18 +71,62 @@ def _match_id_from_key(key: str) -> str:
         return key.split("__", 1)[0]
     return key
 
+_NORMALIZER_ALIASES = {
+    "адам": "адам",
+    "лукас": "адам",
+    "хецко": "гечко",
+    "гечко": "гечко",
+}
+
+_NORMALIZER_TRANSLIT = {
+    'a': 'а', 'b': 'б', 'v': 'в', 'g': 'г', 'd': 'д',
+    'e': 'е', 'yo': 'ё', 'zh': 'ж', 'z': 'з', 'i': 'и',
+    'j': 'й', 'k': 'к', 'l': 'л', 'm': 'м', 'n': 'н',
+    'o': 'о', 'p': 'п', 'r': 'р', 's': 'с', 't': 'т',
+    'u': 'у', 'f': 'ф', 'kh': 'х', 'ts': 'ц', 'ch': 'ч',
+    'sh': 'ш', 'sch': 'щ', 'y': 'ы', 'yu': 'ю', 'ya': 'я',
+    'h': 'х', 'w': 'в',
+}
+
+def _transliterate_key(name: str) -> str:
+    if not name or not re.search(r'[a-zA-Z]', name):
+        return name
+    result = []
+    i = 0
+    while i < len(name):
+        matched = False
+        for length in (3, 2, 1):
+            chunk = name[i:i + length]
+            if chunk in _NORMALIZER_TRANSLIT:
+                result.append(_NORMALIZER_TRANSLIT[chunk])
+                i += length
+                matched = True
+                break
+        if not matched:
+            result.append(name[i])
+            i += 1
+    return ''.join(result)
+
 def _normalize_key_name(name: str) -> str:
-    """Точная копия core.normalizer.normalize_name, чтобы не тащить импорт с бекенда."""
+    """Синхронизированная копия core.normalizer.normalize_name."""
     if not name:
         return ""
     text = re.sub(r'\(.*?\)', '', name)
     text = re.sub(r'\d+', '', text)
     text = re.sub(r'[^\w\s]', ' ', text)
     text = text.lower()
+    text = _transliterate_key(text)
     words = [w for w in text.split() if len(w) > 1]
     if not words:
         words = text.split()
-    return max(words, key=len) if words else ""
+    words = [_NORMALIZER_ALIASES.get(w, w) for w in words]
+    if not words:
+        return ""
+    lastname = words[-1]
+    for w in words:
+        if len(w) > len(lastname):
+            lastname = w
+    return lastname
 
 HANDLERS = {
     "fonbet": FonbetHandler,
@@ -252,7 +296,7 @@ class AfterGoalEngine:
         # _queue_workers) ключуются СОСТАВНЫМ ключом
         # f"{match_id}__{profile_id}", чтобы один и тот же матч
         # мог параллельно мониториться несколькими стратегиями/профилями.
-        self._browsers: Dict[str, AdsPowerBrowser] = {}
+        self._browsers: Dict[str, PatchrightBrowser] = {}
         self._pages: Dict[str, Page] = {}
         self._handlers: Dict[str, BookmakerHandler] = {}
 
@@ -290,8 +334,7 @@ class AfterGoalEngine:
         self._ws_key_to_internal: Dict[str, str] = {}
         self._fast_markets_poll_tasks: Dict[str, asyncio.Task] = {}
 
-        # ── Fast-профиль AdsPower (для БК без HTTP-клиента: LigaStavok, Zenit) ──
-        self._fast_browser: Optional[AdsPowerBrowser] = None
+        self._fast_browser: Optional[PatchrightBrowser] = None
         self._fast_profile_lock = asyncio.Lock()
         self._fast_pages: Dict[str, Page] = {}
         self._fast_handlers: Dict[str, BookmakerHandler] = {}
@@ -320,8 +363,8 @@ class AfterGoalEngine:
             logger.error(f"❌ Не удалось активировать профиль {profile_id}")
             log_bus.error(
                 "Стратегия",
-                f"Не удалось открыть AdsPower-профиль {profile_id}. "
-                f"Проверьте, что AdsPower запущен."
+                f"Не удалось открыть профиль {profile_id}. "
+                f"Проверьте, что Patchright установлен."
             )
             return
 
@@ -335,8 +378,8 @@ class AfterGoalEngine:
                     logger.info(f"✅ Перешли на лайв-раздел {bk} [{sport}]: {start_url}")
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось перейти на {start_url}: {e}")
-                    log_bus.warning("AdsPower",
-                                    f"Не удалось перейти на лайв-раздел {bk}: {e}")
+                    log_bus.warning("Браузер",
+                                f"Не удалось перейти на лайв-раздел {bk}: {e}")
             else:
                 logger.warning(f"⚠️ Неизвестная БК {bk}, пропускаем переход")
 
@@ -393,7 +436,7 @@ class AfterGoalEngine:
         if wrapper:
             try:
                 await wrapper.stop()
-                logger.info(f"✅ Профиль {profile_id} закрыт (AdsPower stop)")
+                logger.info(f"✅ Профиль {profile_id} закрыт (Patchright stop)")
             except Exception as e:
                 logger.warning(f"wrapper.stop({profile_id}): {e}")
 
@@ -1093,14 +1136,13 @@ class AfterGoalEngine:
     # ============================================================
     # Fast-профиль (вкладка) для БК без HTTP-клиента
     # ============================================================
-    async def _ensure_fast_browser(self) -> Optional[AdsPowerBrowser]:
-        """Запускает fast-профиль AdsPower (из fast_config.json)."""
+    async def _ensure_fast_browser(self) -> Optional[PatchrightBrowser]:
         if not is_fast_configured():
             logger.warning("[FAST-TAB] fast-профиль не настроен")
             return None
 
         profile_id = get_fast_profile_id()
-        api_key = get_fast_api_key()
+        
 
         async with self._fast_profile_lock:
             if self._fast_browser is not None:
@@ -1117,10 +1159,8 @@ class AfterGoalEngine:
                 self._fast_browser = None
 
             try:
-                wrapper = AdsPowerBrowser(
+                wrapper = PatchrightBrowser(
                     profile_id=profile_id,
-                    api_key=api_key,
-                    api_url=ADSPOWER_API_URL,
                     headless=True,
                 )
                 await wrapper.__aenter__()
@@ -1470,11 +1510,7 @@ class AfterGoalEngine:
                 self._winline_preopen_in_progress.discard(profile_id)
             return
 
-        # ── ФИКС 2026-10-29: Winline разлогинивает при открытии
-        # ЛЮБОЙ второй вкладки в профиле (даже матчевой). Поэтому
-        # для Winline используем ТОЛЬКО главную вкладку профиля —
-        # ту, что AdsPower открыл при activate_strategy. Никаких
-        # new_page(). После матча возвращаем её на live-раздел.
+        
         if slow_bk == 'winline':
             page = browser_wrapper.page
             setattr(page, '_is_main_page', True)
@@ -2501,10 +2537,6 @@ class AfterGoalEngine:
             )
         else:
             if page and not page.is_closed():
-                # ── ФИКС: главную вкладку профиля (Winline) НЕ закрываем.
-                # Возвращаем на live-раздел, чтобы следующий матч мог
-                # в ней открыться. Закрытие = потеря профиля = повторный
-                # AdsPower launch (30 сек cooldown).
                 if getattr(page, '_is_main_page', False):
                     _payload_cleanup = self._monitoring_payloads.get(key) or {}
                     _bk_cleanup = _normalize_bk(_payload_cleanup.get('slow_bk') or '')
@@ -2741,36 +2773,16 @@ class AfterGoalEngine:
         _aux_logger.debug("Corridor: пока не реализовано")
         return {"success": False, "error": "Corridor not implemented"}
 
+        # ============================================================
+    # Браузеры (Patchright)
     # ============================================================
-    # AdsPower
-    # ============================================================
-    async def _get_api_key_for_profile(self, profile_id: str) -> Optional[str]:
-        data_dir = get_app_data_dir()
-        path = os.path.join(data_dir, "accounts.json")
-        try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    accounts = json.load(f)
-                for acc in accounts:
-                    if acc.get("ads_power_id") == profile_id:
-                        key = acc.get("api_key")
-                        if key:
-                            return key
-                        logger.warning(f"⚠️ Для профиля {profile_id} api_key пуст")
-                        return None
-                logger.warning(f"⚠️ Профиль {profile_id} не найден в accounts.json")
-            else:
-                logger.error(f"❌ Файл accounts.json не найден по пути {path}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка чтения accounts.json: {e}")
-        return None
 
     async def _get_browser(self, profile_id: str, headless: bool = False) \
-            -> Optional[AdsPowerBrowser]:
+            -> Optional[PatchrightBrowser]:
         if profile_id in self._browsers:
             wrapper = self._browsers[profile_id]
             try:
-                if wrapper.browser and wrapper.browser.is_connected():
+                if wrapper.is_connected():
                     return wrapper
             except Exception:
                 pass
@@ -2808,49 +2820,42 @@ class AfterGoalEngine:
                 del self._browsers[profile_id]
 
             self._profile_launch_attempts[profile_id] = time.time()
-
-            api_key = await self._get_api_key_for_profile(profile_id)
-            if not api_key:
-                logger.error(f"❌ Не найден API-ключ для профиля {profile_id}")
-                return None
-
             try:
-                wrapper = AdsPowerBrowser(
+                wrapper = PatchrightBrowser(
                     profile_id=profile_id,
-                    api_key=api_key,
-                    api_url=ADSPOWER_API_URL,
                     headless=headless,
                 )
+
                 await wrapper.__aenter__()
                 self._browsers[profile_id] = wrapper
                 logger.info(f"✅ Браузер для профиля {profile_id} запущен "
                             f"(headless={headless})")
-                log_bus.success("AdsPower", f"Браузер запущен · профиль {profile_id}")
+                log_bus.success("Браузер", f"Браузер запущен · профиль {profile_id}")
                 return wrapper
             except Exception as e:
                 err_text = str(e)
                 if "Too many request" in err_text or "429" in err_text:
-                    logger.warning(f"⏸ AdsPower rate limit [{profile_id}], "
+                    logger.warning(f"⏸ Rate limit [{profile_id}], "
                                    f"cooldown {self.PROFILE_LAUNCH_COOLDOWN}с")
-                    log_bus.warning("AdsPower",
-                                    f"AdsPower отбивает запросы — пауза "
+                    log_bus.warning("Браузер",
+                                    f"Rate limit — пауза "
                                     f"{self.PROFILE_LAUNCH_COOLDOWN:.0f}с")
                 else:
                     logger.error(
-                        f"❌ Ошибка запуска AdsPower [{profile_id}]: {e}",
+                        f"❌ Ошибка запуска браузера [{profile_id}]: {e}",
                         exc_info=True,
                     )
-                    log_bus.error("AdsPower",
+                    log_bus.error("Браузер",
                                   f"Не удалось запустить профиль {profile_id}: {e}")
                 return None
 
     async def _get_existing_browser(self, profile_id: str) \
-            -> Optional[AdsPowerBrowser]:
+            -> Optional[PatchrightBrowser]:
         wrapper = self._browsers.get(profile_id)
         if not wrapper:
             return None
         try:
-            if wrapper.browser and wrapper.browser.is_connected():
+            if wrapper.is_connected():
                 return wrapper
         except Exception:
             pass
@@ -3524,16 +3529,63 @@ class AfterGoalEngine:
                 fast_sub, fast_score, slow_score
             )
 
+        # ─────────────────────────────────────────────────────────
+        # СИТУАЦИЯ 2: Fast ушёл на 1 партию вперёд.
+        # Slow ещё торгует завершившейся партией.
+        # ─────────────────────────────────────────────────────────
+        elif fast_phase_num == slow_phase_num + 1:
+            prev_s1 = fast_prev_sub[0] if fast_prev_sub else 0
+            prev_s2 = fast_prev_sub[1] if fast_prev_sub else 0
+
+            # ЩИТ 1: Ghost Frame — score по партиям не изменился
+            if fast_score[0] == slow_score[0] and fast_score[1] == slow_score[1]:
+                logger.warning(
+                    f"👻 GHOST FRAME BLOCKED: fast_phase={fast_phase_num} > "
+                    f"slow_phase={slow_phase_num}, но score по партиям "
+                    f"не изменился ({fast_score}). Пропуск."
+                )
+                return None
+
+            # ЩИТ 2: prev_sub должен быть реальным финалом
+            is_prev_done = False
+            if sport == 'table_tennis':
+                is_prev_done = (
+                    (prev_s1 >= 11 and prev_s1 - prev_s2 >= 2) or
+                    (prev_s2 >= 11 and prev_s2 - prev_s1 >= 2)
+                )
+            elif sport in ('volleyball', 'beach_volleyball'):
+                thr = 15 if slow_phase_num >= 5 else 25
+                is_prev_done = (
+                    (prev_s1 >= thr and prev_s1 - prev_s2 >= 2) or
+                    (prev_s2 >= thr and prev_s2 - prev_s1 >= 2)
+                )
+            elif sport in ('basketball', 'cyber_basketball'):
+                is_prev_done = True
+
+            if not is_prev_done:
+                logger.warning(
+                    f"🛑 MATH GUARD: prev_sub {prev_s1}:{prev_s2} — "
+                    f"не завершённая партия. Пропуск."
+                )
+                return None
+
+            logger.info(
+                f"✅ ПОСЛЕГОЛ: Fast в {fast_phase_num}, Slow в "
+                f"{slow_phase_num}. Играем завершившуюся "
+                f"{prev_s1}:{prev_s2}."
+            )
+            actual_prev_phase_name = f"{slow_phase_num}-я партия"
+            confirmed = self._collect_prev_phase_bets(
+                sport, payload, set_markets, fast_prev_sub,
+                actual_prev_phase_name
+            )
+
         # СИТУАЦИЯ 3: Fast ушел на 2+ партии вперед (Slow завис)
         elif fast_phase_num > slow_phase_num + 1:
             logger.info(f"best_bet: Fast ушел далеко ({fast_phase_num} vs {slow_phase_num}). Пропускаем.")
             return None
-            
         else:
             # Slow впереди Fast — аномалия
-            return None
-
-        if not confirmed:
             return None
 
         # Фильтр по порогам (min_score_diff)
