@@ -35,6 +35,7 @@ hiddenimports = [
 
 # Playwright — самая капризная часть, нужны все подмодули и данные драйвера
 hiddenimports += collect_submodules('playwright')
+hiddenimports += collect_submodules('patchright')
 hiddenimports += collect_submodules('pyee')
 hiddenimports += collect_submodules('greenlet')
 hiddenimports += collect_submodules('websockets')
@@ -50,7 +51,9 @@ hiddenimports += [
     'core.fast_client',
     'core.fast_config',
     'core.fast_cookie_collector',
-    'core.adspower_launcher',
+    'core.browser_launcher',
+    'core.profile_config',
+    'core.fingerprint',
     'ui.fast_cookie_runner',
     # ── Логи ──
     # Импортируется лениво (в _monitor_loop и app.py), поэтому
@@ -67,6 +70,7 @@ datas += [('config.json', '.')]
 
 # Playwright driver (без этой папки браузер не запустится)
 datas += collect_data_files('playwright')
+datas += collect_data_files('patchright')
 
 
 # ===== АНАЛИЗ =====

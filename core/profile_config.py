@@ -2,32 +2,37 @@
 Менеджер конфигураций профилей.
 Каждый профиль = папка с user-data-dir + JSON конфиг.
 
-Пример конфигурации профиля:
+Пример profile.json:
 {
   "profile_id": "zenit_1",
+  "config_version": 2,
   "proxy": {"server": "http://proxy:8080", "username": "", "password": ""},
-  "fingerprint": {
-    "seed": 12345,
-    "platform": "windows",
-    "user_agent": "",
-    "timezone": "Europe/Moscow",
-    "locale": "ru-RU",
-    "geolocation": "deny",
-    "screen": "auto",
-    "webgl": "auto",
-    "canvas": "noise",
-    "audio": "noise",
-    "client_rects": "noise",
-    "speech_voices": "noise",
-    "cpu_cores": "auto",
-    "ram_gb": "auto",
-    "webrtc": "proxy_only",
-    "dnt": "default",
-    "hardware_accel": true
-  },
-  "viewport": {"width": 1920, "height": 1080},
+        "fingerprint": {
+            "seed": _generate_seed(),
+            "platform": "windows",
+            "user_agent": "",
+            "timezone": "system",
+            "locale": "system",
+            "geolocation": "default",
+            "screen": "auto",
+            "webgl": "auto",
+            "canvas": "real",
+            "audio": "real",
+            "client_rects": "real",
+            "speech_voices": "real",
+            "cpu_cores": "auto",
+            "ram_gb": "auto",
+            "webrtc": "proxy_only",
+            "dnt": "default",
+            "hardware_accel": True,
+        },
   "headless": false
 }
+
+ГЛАВНЫЙ ПРИНЦИП: по умолчанию НИЧЕГО не подменяем.
+"auto" / "real" / "system" / "default" = реальное значение браузера.
+Любая JS-подмена детектируется через Function.toString() и создаёт
+кросс-слойные нестыковки (UA vs sec-ch-ua, WebGL vs WebGPU).
 """
 import json
 import os
@@ -40,6 +45,10 @@ from ui.paths import get_app_data_dir
 logger = logging.getLogger(__name__)
 
 PROFILES_DIR_NAME = "profiles"
+
+# Версия схемы конфига. При bump старые конфиги автомигрируются.
+# v2: отказ от JS-шумов и ручного UA (детектировались антифродом).
+CONFIG_VERSION = 2
 
 
 def _profiles_dir() -> str:
@@ -66,6 +75,9 @@ def _generate_seed() -> int:
 def _default_profile_config(profile_id: str) -> dict:
     return {
         "profile_id": profile_id,
+        "config_version": CONFIG_VERSION,
+        # auto = Chrome → Edge → встроенный Chromium
+        "browser_channel": "auto",
         "proxy": {
             "server": "",
             "username": "",
@@ -74,25 +86,81 @@ def _default_profile_config(profile_id: str) -> dict:
         "fingerprint": {
             "seed": _generate_seed(),
             "platform": "windows",
-            "user_agent": "",
-            "timezone": "Europe/Moscow",
-            "locale": "ru-RU",
-            "geolocation": "deny",
-            "screen": "auto",
-            "webgl": "auto",
-            "canvas": "noise",
-            "audio": "noise",
-            "client_rects": "noise",
-            "speech_voices": "noise",
+            "user_agent": "",            # пусто = реальный UA Chrome
+            "timezone": "system",        # system = системная таймзона
+            "locale": "system",          # system = системный язык
+            "geolocation": "default",    # default = не трогать
+            "screen": "auto",            # auto = реальный экран
+            "webgl": "auto",             # auto = реальный GPU
+            "canvas": "real",
+            "audio": "real",
+            "client_rects": "real",
+            "speech_voices": "real",
             "cpu_cores": "auto",
             "ram_gb": "auto",
             "webrtc": "proxy_only",
             "dnt": "default",
             "hardware_accel": True,
         },
-        "viewport": {"width": 1920, "height": 1080},
         "headless": False,
     }
+
+
+def _migrate_config(profile_id: str, cfg: dict) -> bool:
+    """
+    Приводит старые конфиги к текущей схеме.
+    Возвращает True, если что-то изменилось (нужно перезаписать файл).
+
+    v1 → v2: старые дефолты включали JS-шумы (canvas/webgl/audio/rects),
+    принудительные timezone/locale и могли содержать ручной User-Agent.
+    Всё это антифрод ловит:
+      - Function.toString() подменённых функций не содержит [native code]
+      - ручной UA расходится с sec-ch-ua реальной версии браузера
+      - locale через CDP даёт Accept-Language без q-весов
+    Сбрасываем на реальные значения.
+    """
+    try:
+        ver = int(cfg.get("config_version", 1))
+    except (TypeError, ValueError):
+        ver = 1
+    if ver >= CONFIG_VERSION:
+        return False
+
+    fp = cfg.setdefault("fingerprint", {})
+    changed = []
+
+    for key in ("canvas", "audio", "client_rects", "speech_voices"):
+        if fp.get(key) == "noise":
+            fp[key] = "real"
+            changed.append(key)
+
+    if fp.get("geolocation") == "deny":
+        fp["geolocation"] = "default"
+        changed.append("geolocation")
+
+    if fp.get("timezone") == "Europe/Moscow":
+        fp["timezone"] = "system"
+        changed.append("timezone")
+
+    if fp.get("locale") == "ru-RU":
+        fp["locale"] = "system"
+        changed.append("locale")
+
+    if (fp.get("user_agent") or "").strip():
+        fp["user_agent"] = ""
+        changed.append("user_agent")
+
+    # WebGL из старого списка профилей тоже подменялся — сбрасываем.
+    if isinstance(fp.get("webgl"), dict):
+        fp["webgl"] = "auto"
+        changed.append("webgl")
+
+    cfg["config_version"] = CONFIG_VERSION
+    logger.warning(
+        f"[profile_config] {profile_id}: конфиг мигрирован v{ver}→v{CONFIG_VERSION}"
+        + (f", сброшено: {', '.join(changed)}" if changed else "")
+    )
+    return True
 
 
 def load_profile_config(profile_id: str) -> dict:
@@ -106,32 +174,46 @@ def load_profile_config(profile_id: str) -> dict:
     try:
         with open(p, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("ожидался JSON-объект")
     except Exception as e:
         logger.error(f"[profile_config] Ошибка чтения {p}: {e}")
         cfg = _default_profile_config(profile_id)
-    # Мягкая валидация
+        save_profile_config(profile_id, cfg)
+        return cfg
+
+    # Мягкая валидация: дозаполняем отсутствующие ключи
     cfg.setdefault("profile_id", profile_id)
     cfg.setdefault("proxy", {"server": "", "username": "", "password": ""})
+    cfg["proxy"].setdefault("server", "")
+    cfg["proxy"].setdefault("username", "")
+    cfg["proxy"].setdefault("password", "")
     cfg.setdefault("fingerprint", {})
-    cfg["fingerprint"].setdefault("seed", _generate_seed())
-    cfg["fingerprint"].setdefault("platform", "windows")
-    cfg["fingerprint"].setdefault("timezone", "Europe/Moscow")
-    cfg["fingerprint"].setdefault("locale", "ru-RU")
-    cfg["fingerprint"].setdefault("geolocation", "deny")
-    cfg["fingerprint"].setdefault("screen", "auto")
-    cfg["fingerprint"].setdefault("webgl", "auto")
-    cfg["fingerprint"].setdefault("canvas", "noise")
-    cfg["fingerprint"].setdefault("audio", "noise")
-    cfg["fingerprint"].setdefault("client_rects", "noise")
-    cfg["fingerprint"].setdefault("speech_voices", "noise")
-    cfg["fingerprint"].setdefault("cpu_cores", "auto")
-    cfg["fingerprint"].setdefault("ram_gb", "auto")
-    cfg["fingerprint"].setdefault("webrtc", "proxy_only")
-    cfg["fingerprint"].setdefault("dnt", "default")
-    cfg["fingerprint"].setdefault("hardware_accel", True)
-    cfg.setdefault("user_agent", "")
-    cfg.setdefault("viewport", {"width": 1920, "height": 1080})
+    fp = cfg["fingerprint"]
+    fp.setdefault("seed", _generate_seed())
+    fp.setdefault("platform", "windows")
+    fp.setdefault("user_agent", "")
+    fp.setdefault("timezone", "system")
+    fp.setdefault("locale", "system")
+    fp.setdefault("geolocation", "default")
+    fp.setdefault("screen", "auto")
+    fp.setdefault("webgl", "auto")
+    fp.setdefault("canvas", "real")
+    fp.setdefault("audio", "real")
+    fp.setdefault("client_rects", "real")
+    fp.setdefault("speech_voices", "real")
+    fp.setdefault("cpu_cores", "auto")
+    fp.setdefault("ram_gb", "auto")
+    fp.setdefault("webrtc", "proxy_only")
+    fp.setdefault("dnt", "default")
+    fp.setdefault("hardware_accel", True)
     cfg.setdefault("headless", False)
+    cfg.setdefault("browser_channel", "auto")
+
+    # Автомиграция старых конфигов (v1 с JS-шумами и ручным UA)
+    if _migrate_config(profile_id, cfg):
+        save_profile_config(profile_id, cfg)
+
     return cfg
 
 
@@ -139,6 +221,7 @@ def save_profile_config(profile_id: str, cfg: dict) -> None:
     """Сохраняет конфиг профиля."""
     p = _config_path(profile_id)
     try:
+        cfg.setdefault("config_version", CONFIG_VERSION)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -191,21 +274,34 @@ def update_fingerprint(profile_id: str, seed: Optional[int] = None,
 
 
 def update_user_agent(profile_id: str, ua: str) -> None:
-    """Обновляет User-Agent для профиля."""
+    """
+    Обновляет User-Agent. Пустая строка = реальный UA браузера.
+    ВНИМАНИЕ: ручной UA расходится с sec-ch-ua — антифрод это ловит.
+    Пишем в fingerprint.user_agent (оттуда читает derive_fingerprint).
+    """
     cfg = load_profile_config(profile_id)
-    cfg["user_agent"] = ua
+    cfg["fingerprint"]["user_agent"] = (ua or "").strip()
     save_profile_config(profile_id, cfg)
 
 
 def update_viewport(profile_id: str, width: int, height: int) -> None:
-    """Обновляет размер окна для профиля."""
+    """
+    Задаёт размер экрана профиля.
+    Пишем в fingerprint.screen (оттуда читает derive_fingerprint).
+    width=0 → 'auto' (реальный экран).
+    """
     cfg = load_profile_config(profile_id)
-    cfg["viewport"] = {"width": width, "height": height}
+    if width and height:
+        cfg["fingerprint"]["screen"] = {
+            "width": int(width), "height": int(height)
+        }
+    else:
+        cfg["fingerprint"]["screen"] = "auto"
     save_profile_config(profile_id, cfg)
 
 
 def regenerate_fingerprint(profile_id: str) -> int:
-    """Новая личность профиля: новый seed (отпечаток изменится целиком)."""
+    """Новая личность профиля: новый seed."""
     cfg = load_profile_config(profile_id)
     new_seed = _generate_seed()
     cfg["fingerprint"]["seed"] = new_seed

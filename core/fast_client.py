@@ -1709,9 +1709,12 @@ class WinlineFastClient(FastOddsClient):
                 153: "cyber_basketball",
             }.get(_sid, "table_tennis")
             _is_basket = _sport_key in ("basketball", "cyber_basketball")
-
             sub1 = sub2 = 0
             prev_sub1 = prev_sub2 = 0
+            # ФИКС: для баскета число четвертей берём из setScores —
+            # из общих очков (60:59) его не вывести. Без этой строки
+            # ниже падает UnboundLocalError на баскет-матчах.
+            _expected_phases = len(parts_list) if _is_basket else (score1 + score2 + 1)
 
             if _is_basket:
                 # ── БАСКЕТ: фаза = число стартовавших четвертей ──

@@ -1,251 +1,257 @@
 """
-Генератор и применение отпечатков профиля.
-Всё детерминировано из seed: один seed = один человек навсегда.
+Конфиги отпечатка и geoip.
+Camoufox применяет отпечаток на уровне C++ движка —
+JS-инъекции не нужны и даже вредны (prototype lies).
 """
 import json
 import logging
-import random
+import time
 import urllib.request
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-UA_TEMPLATES = {
-    "windows": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/{ver} Safari/537.36"),
-    "macos": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/{ver} Safari/537.36"),
-}
-
-WEBGL_PROFILES = [
-    {"vendor": "Google Inc. (NVIDIA)",
-     "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)"},
-    {"vendor": "Google Inc. (NVIDIA)",
-     "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
-    {"vendor": "Google Inc. (Intel)",
-     "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
-    {"vendor": "Google Inc. (AMD)",
-     "renderer": "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+# ══════════════════════════════════════════════════════════
+# Разрешения экрана — по частоте встречаемости (desktop)
+# ══════════════════════════════════════════════════════════
+SCREEN_RESOLUTIONS = [
+    (1920, 1080, "1920×1080 — самое частое"),
+    (1366, 768,  "1366×768 — ноутбуки"),
+    (1536, 864,  "1536×864 — масштаб 125%"),
+    (1440, 900,  "1440×900"),
+    (1280, 720,  "1280×720"),
+    (1600, 900,  "1600×900"),
+    (2560, 1440, "2560×1440 — 2K"),
+    (1280, 1024, "1280×1024 — 5:4 офис"),
+    (1680, 1050, "1680×1050"),
+    (3840, 2160, "3840×2160 — 4K"),
+    (1920, 1200, "1920×1200 — 16:10"),
+    (2560, 1600, "2560×1600 — 16:10"),
+    (3440, 1440, "3440×1440 — ultrawide"),
+    (2560, 1080, "2560×1080 — ultrawide"),
+    (1280, 800,  "1280×800 — ноутбук"),
+    (1024, 768,  "1024×768 — старый ПК"),
 ]
 
-SCREENS = [(1920, 1080), (2560, 1440), (1366, 768), (1536, 864), (1440, 900)]
-CORES = [4, 6, 8, 12, 16]
-RAM = [8, 16, 32]
-TASKBARS = {"windows": 48, "macos": 25}
+TIMEZONES = [
+    "auto", "system",
+    "Europe/Kaliningrad", "Europe/Moscow", "Europe/Samara",
+    "Asia/Yekaterinburg", "Asia/Omsk", "Asia/Krasnoyarsk",
+    "Asia/Irkutsk", "Asia/Yakutsk", "Asia/Vladivostok",
+    "Asia/Magadan", "Asia/Kamchatka",
+    "Europe/Kiev", "Europe/Minsk", "Asia/Almaty",
+    "Asia/Tashkent", "Asia/Tbilisi", "Asia/Yerevan", "Asia/Baku",
+    "Europe/Istanbul", "Europe/Berlin", "Europe/London",
+    "America/New_York", "Asia/Dubai",
+]
+
+LOCALE_BY_COUNTRY = {
+    "RU": "ru-RU", "BY": "ru-RU", "KZ": "ru-RU", "KG": "ru-RU",
+    "UA": "uk-UA", "UZ": "ru-RU", "AZ": "ru-RU", "AM": "ru-RU",
+    "GE": "ru-RU", "MD": "ru-RU", "TR": "tr-TR", "DE": "de-DE",
+    "GB": "en-GB", "US": "en-US", "AE": "en-US",
+}
+
+# ══════════════════════════════════════════════════════════
+# GPU — реальные строки Chrome/Windows (ANGLE + D3D11)
+# Camoufox использует эти же строки в C++ патчах
+# ══════════════════════════════════════════════════════════
+def _nv(model: str) -> dict:
+    return {
+        "vendor": "Google Inc. (NVIDIA)",
+        "renderer": f"ANGLE (NVIDIA, NVIDIA {model} Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    }
+def _intel(model: str) -> dict:
+    return {
+        "vendor": "Google Inc. (Intel)",
+        "renderer": f"ANGLE (Intel, Intel(R) {model} Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    }
+def _amd(model: str) -> dict:
+    return {
+        "vendor": "Google Inc. (AMD)",
+        "renderer": f"ANGLE (AMD, AMD {model} Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    }
+
+WEBGL_PROFILES = [
+    _nv("GeForce GTX 1050 Ti"), _nv("GeForce GTX 1060 6GB"),
+    _nv("GeForce GTX 1650"), _nv("GeForce GTX 1660 SUPER"),
+    _nv("GeForce RTX 2060"), _nv("GeForce RTX 2070 SUPER"),
+    _nv("GeForce RTX 3050"), _nv("GeForce RTX 3060"),
+    _nv("GeForce RTX 3060 Ti"), _nv("GeForce RTX 3070"),
+    _nv("GeForce RTX 3080"), _nv("GeForce RTX 4060"),
+    _nv("GeForce RTX 4060 Ti"), _nv("GeForce RTX 4070"),
+    _nv("GeForce RTX 4070 SUPER"), _nv("GeForce RTX 4080"),
+    _nv("GeForce RTX 4090"),
+    _intel("UHD Graphics 620"), _intel("UHD Graphics 630"),
+    _intel("UHD Graphics 730"), _intel("UHD Graphics 770"),
+    _intel("Iris(R) Xe Graphics"), _intel("Iris(R) Plus Graphics 655"),
+    _amd("Radeon RX 550"), _amd("Radeon RX 570"),
+    _amd("Radeon RX 580"), _amd("Radeon RX 5500 XT"),
+    _amd("Radeon RX 6600"), _amd("Radeon RX 6650 XT"),
+    _amd("Radeon RX 6700 XT"), _amd("Radeon RX 7600"),
+    _amd("Radeon RX 7800 XT"), _amd("Radeon(TM) Vega 8 Graphics"),
+]
+
+# ══════════════════════════════════════════════════════════
+# GeoIP
+# ══════════════════════════════════════════════════════════
+_GEO_CACHE: dict = {}
+_GEO_TTL = 1800.0
 
 
-def resolve_geo_via_proxy(proxy_server: str, timeout: float = 4.0) -> Optional[dict]:
-    """'auto'-поля: таймзона/локаль/координаты по IP прокси."""
-    if not proxy_server:
-        return None
+def resolve_geo(proxy_server: str = "", timeout: float = 5.0) -> Optional[dict]:
+    """Таймзона/локаль/координаты по IP. Работает и без прокси."""
+    key = proxy_server or "__direct__"
+    cached = _GEO_CACHE.get(key)
+    if cached and time.time() - cached[1] < _GEO_TTL:
+        return cached[0]
     try:
-        handler = urllib.request.ProxyHandler(
-            {"http": proxy_server, "https": proxy_server}
-        )
+        if proxy_server:
+            handler = urllib.request.ProxyHandler(
+                {"http": proxy_server, "https": proxy_server}
+            )
+        else:
+            handler = urllib.request.ProxyHandler({})
         opener = urllib.request.build_opener(handler)
-        with opener.open("http://ip-api.com/json/?fields=timezone,lat,lon",
-                         timeout=timeout) as r:
+        url = "http://ip-api.com/json/?fields=status,countryCode,timezone,lat,lon,query"
+        with opener.open(url, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
+        if data.get("status") != "success":
+            logger.warning(f"[fingerprint] geoip: {data}")
+            return None
         tz = data.get("timezone") or ""
-        locale = "ru-RU" if tz.startswith("Europe/Moscow") else "en-US"
-        return {"timezone": tz, "locale": locale,
-                "lat": data.get("lat"), "lon": data.get("lon")}
+        cc = (data.get("countryCode") or "").upper()
+        result = {
+            "timezone": tz,
+            "locale": LOCALE_BY_COUNTRY.get(cc, "en-US"),
+            "lat": data.get("lat"),
+            "lon": data.get("lon"),
+            "ip": data.get("query"),
+            "country": cc,
+        }
+        _GEO_CACHE[key] = (result, time.time())
+        logger.info(
+            f"[fingerprint] geoip: ip={result['ip']} {cc} "
+            f"tz={tz} locale={result['locale']}"
+        )
+        return result
     except Exception as e:
-        logger.debug(f"[fingerprint] geoip: {e}")
+        logger.warning(f"[fingerprint] geoip не сработал: {e}")
         return None
 
 
-def derive_fingerprint(fp_cfg: dict, proxy_server: str = "",
-                       browser_version: str = "") -> dict:
-    """Разворачивает конфиг профиля ('auto'-поля) в конкретные значения."""
+resolve_geo_via_proxy = resolve_geo
+
+
+def derive_fingerprint(fp_cfg: dict, proxy_server: str = "") -> dict:
+    """
+    Возвращает словарь параметров для Camoufox.
+    Camoufox сам применяет их на уровне C++.
+    """
     seed = int(fp_cfg.get("seed") or 1)
-    rnd = random.Random(seed)
     platform = fp_cfg.get("platform", "windows")
 
     geo = None
     if "auto" in (fp_cfg.get("timezone"), fp_cfg.get("locale"),
                   fp_cfg.get("geolocation")):
-        geo = resolve_geo_via_proxy(proxy_server)
+        geo = resolve_geo(proxy_server)
 
-    # ── Экран ──
     scr = fp_cfg.get("screen")
+    screen = None
     if isinstance(scr, dict) and scr.get("width"):
         screen = {"width": int(scr["width"]), "height": int(scr["height"])}
-    else:
-        w, h = rnd.choice(SCREENS)
-        screen = {"width": w, "height": h}
 
-    # ── WebGL ──
     wgl = fp_cfg.get("webgl")
+    webgl = None
     if isinstance(wgl, dict) and wgl.get("renderer"):
         webgl = {"vendor": wgl.get("vendor", "Google Inc."),
                  "renderer": wgl["renderer"]}
-    else:
-        webgl = rnd.choice(WEBGL_PROFILES)
 
-    ver = browser_version or "156.0.6968.0"
-    ua = fp_cfg.get("user_agent") or ""
+    tz_cfg = fp_cfg.get("timezone", "system")
+    if tz_cfg == "auto":
+        timezone = (geo or {}).get("timezone") or None
+        if not timezone:
+            logger.warning("[fingerprint] timezone=auto, но geoip недоступен")
+    elif tz_cfg in ("system", "", None):
+        timezone = None
+    else:
+        timezone = tz_cfg
+
+    loc_cfg = fp_cfg.get("locale", "system")
+    if loc_cfg == "auto":
+        locale = (geo or {}).get("locale") or None
+    elif loc_cfg in ("system", "", None):
+        locale = None
+    else:
+        locale = loc_cfg
+
+    ua = (fp_cfg.get("user_agent") or "").strip()
 
     fp = {
         "seed": seed,
         "platform": platform,
-        "user_agent": ua or UA_TEMPLATES.get(platform, UA_TEMPLATES["windows"]).format(ver=ver),
+        "user_agent": ua,
         "ua_override": bool(ua),
-        "timezone": (geo or {}).get("timezone")
-                      if fp_cfg.get("timezone") == "auto"
-                      else fp_cfg.get("timezone", "Europe/Moscow"),
-        "locale": (geo or {}).get("locale")
-                  if fp_cfg.get("locale") == "auto"
-                  else fp_cfg.get("locale", "ru-RU"),
-        "geo_mode": fp_cfg.get("geolocation", "deny"),
+        "timezone": timezone,
+        "locale": locale,
+        "geo_mode": fp_cfg.get("geolocation", "default"),
         "geo_lat": (geo or {}).get("lat") if fp_cfg.get("geolocation") == "auto" else None,
         "geo_lon": (geo or {}).get("lon") if fp_cfg.get("geolocation") == "auto" else None,
         "screen": screen,
-        "taskbar": TASKBARS.get(platform, 48),
         "webgl": webgl,
-        "canvas": fp_cfg.get("canvas", "noise"),
-        "audio": fp_cfg.get("audio", "noise"),
-        "client_rects": fp_cfg.get("client_rects", "noise"),
-        "speech_voices": fp_cfg.get("speech_voices", "noise"),
-        "cpu_cores": fp_cfg.get("cpu_cores") if isinstance(fp_cfg.get("cpu_cores"), int)
-                     else rnd.choice(CORES),
-        "ram_gb": fp_cfg.get("ram_gb") if isinstance(fp_cfg.get("ram_gb"), int)
-                  else rnd.choice(RAM),
+        "canvas": fp_cfg.get("canvas", "real"),
+        "audio": fp_cfg.get("audio", "real"),
+        "client_rects": fp_cfg.get("client_rects", "real"),
+        "speech_voices": fp_cfg.get("speech_voices", "real"),
+        "cpu_cores": fp_cfg.get("cpu_cores") if isinstance(fp_cfg.get("cpu_cores"), int) else None,
+        "ram_gb": fp_cfg.get("ram_gb") if isinstance(fp_cfg.get("ram_gb"), int) else None,
         "webrtc": fp_cfg.get("webrtc", "proxy_only"),
         "dnt": fp_cfg.get("dnt", "default"),
         "hardware_accel": fp_cfg.get("hardware_accel", True),
-        "rects_eps": round(rnd.uniform(1e-7, 9e-7), 9),
+        # Camoufox-специфичные флаги
+        "camoufox_overrides": {},
     }
     if isinstance(fp_cfg.get("geolocation"), dict):
         fp["geo_mode"] = "coords"
         fp["geo_lat"] = fp_cfg["geolocation"].get("lat")
         fp["geo_lon"] = fp_cfg["geolocation"].get("lon")
+
+    # Оверрайды для Camoufox (применяются в движке)
+    overrides = {}
+    if fp["cpu_cores"]:
+        overrides["navigator.hardwareConcurrency"] = fp["cpu_cores"]
+    if fp["ram_gb"]:
+        overrides["navigator.deviceMemory"] = fp["ram_gb"]
+    if screen:
+        overrides["screen.width"] = screen["width"]
+        overrides["screen.height"] = screen["height"]
+    fp["camoufox_overrides"] = overrides
+
+    # Предупреждение о палимых оверрайдах
+    risky = []
+    if fp["cpu_cores"] or fp["ram_gb"]:
+        risky.append("CPU/RAM")
+    if webgl:
+        risky.append("WebGL")
+    if risky:
+        fp["risk_warning"] = "; ".join(risky)
+
     return fp
 
 
-def build_chromium_args(fp: dict) -> list:
-    args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        f"--window-size={fp['screen']['width']},{fp['screen']['height']}",
-    ]
-    if fp["webrtc"] == "proxy_only":
+def build_chromium_args(fp: dict, has_proxy: bool = False) -> list:
+    """Для fallback на Chromium (если Camoufox не запустится)."""
+    args = ["--no-first-run", "--no-default-browser-check"]
+    scr = fp.get("screen")
+    if isinstance(scr, dict) and scr.get("width"):
+        args.append(f"--window-size={scr['width']},{scr['height']}")
+    else:
+        args.append("--start-maximized")
+    if has_proxy and fp.get("webrtc") == "proxy_only":
         args += [
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--enforce-webrtc-ip-permission-check",
         ]
-    if not fp["hardware_accel"]:
+    if not fp.get("hardware_accel", True):
         args.append("--disable-gpu")
     return args
-
-
-_INIT_JS = r"""
-(() => {
-  const FP = __FP_JSON__;
-  const mulberry32 = (a) => () => {
-    a |= 0; a = a + 0x6D2B79F5 | 0;
-    let t = Math.imul(a ^ a >>> 15, 1 | a);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-  const def = (obj, prop, val) => {
-    try { Object.defineProperty(obj, prop, { get: () => val, configurable: true }); } catch (e) {}
-  };
-  def(Navigator.prototype, 'hardwareConcurrency', FP.cpu_cores);
-  def(Navigator.prototype, 'deviceMemory', FP.ram_gb);
-  if (FP.dnt !== 'default') def(Navigator.prototype, 'doNotTrack', FP.dnt);
-  def(Screen.prototype, 'width', FP.screen.width);
-  def(Screen.prototype, 'height', FP.screen.height);
-  def(Screen.prototype, 'availWidth', FP.screen.width);
-  def(Screen.prototype, 'availHeight', FP.screen.height - FP.taskbar);
-  def(Screen.prototype, 'colorDepth', 24);
-  def(Screen.prototype, 'pixelDepth', 24);
-  def(window, 'devicePixelRatio', 1);
-  def(window, 'outerWidth', FP.screen.width);
-  def(window, 'outerHeight', FP.screen.height);
-
-  if (FP.canvas === 'noise') {
-    const gID = CanvasRenderingContext2D.prototype.getImageData;
-    const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-    const toBlob = HTMLCanvasElement.prototype.toBlob;
-    const noisify = (canvas) => {
-      const ctx = canvas.getContext && canvas.getContext('2d');
-      if (!ctx || !canvas.width || !canvas.height) return;
-      const img = gID.call(ctx, 0, 0, canvas.width, canvas.height);
-      const r = mulberry32(FP.seed ^ 0xC0FFEE);
-      for (let i = 0; i < img.data.length; i += 97) {
-        img.data[i] = (img.data[i] + (r() < 0.5 ? 0 : 1)) & 0xFF;
-      }
-      ctx.putImageData(img, 0, 0);
-    };
-    HTMLCanvasElement.prototype.toDataURL = function (...a) {
-      try { noisify(this); } catch (e) {}
-      return toDataURL.apply(this, a);
-    };
-    HTMLCanvasElement.prototype.toBlob = function (...a) {
-      try { noisify(this); } catch (e) {}
-      return toBlob.apply(this, a);
-    };
-  }
-
-  if (FP.webgl) {
-    const patch = (proto) => {
-      if (!proto) return;
-      const orig = proto.getParameter;
-      proto.getParameter = function (p) {
-        if (p === 0x9245) return FP.webgl.vendor;
-        if (p === 0x9246) return FP.webgl.renderer;
-        return orig.call(this, p);
-      };
-    };
-    patch(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
-    patch(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
-  }
-
-  if (FP.audio === 'noise') {
-    const gcd = AudioBuffer.prototype.getChannelData;
-    AudioBuffer.prototype.getChannelData = function (ch) {
-      const d = gcd.call(this, ch);
-      const r = mulberry32(FP.seed ^ 0xA0D10);
-      for (let i = 0; i < 6; i++) {
-        d[Math.floor(r() * d.length)] += (r() - 0.5) * 1e-6;
-      }
-      return d;
-    };
-  }
-
-  if (FP.client_rects === 'noise') {
-    const e = FP.rects_eps;
-    const orig = Element.prototype.getBoundingClientRect;
-    Element.prototype.getBoundingClientRect = function () {
-      const r = orig.call(this);
-      return new DOMRect(r.x + e, r.y + e, r.width, r.height);
-    };
-  }
-
-  if (FP.speech_voices === 'noise') {
-    const list = [
-      { name: 'Microsoft Irina - Russian (Russia)', lang: 'ru-RU', default: true, localService: true },
-      { name: 'Microsoft Pavel - Russian (Russia)', lang: 'ru-RU', default: false, localService: true },
-      { name: 'Google русский', lang: 'ru-RU', default: false, localService: false },
-    ];
-    if (window.speechSynthesis) {
-      speechSynthesis.getVoices = () => list.map(v =>
-        Object.assign(Object.create(SpeechSynthesisVoice.prototype), v));
-    }
-  }
-
-  if (FP.geo_mode === 'deny' && navigator.geolocation) {
-    const err = (cb) => cb && cb({ code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1 });
-    navigator.geolocation.getCurrentPosition = (ok, e) => err(e);
-    navigator.geolocation.watchPosition = (ok, e) => { err(e); return 0; };
-  }
-})();
-"""
-
-
-def build_init_script(fp: dict) -> str:
-    return _INIT_JS.replace("__FP_JSON__", json.dumps(fp))

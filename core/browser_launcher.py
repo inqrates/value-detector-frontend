@@ -1,15 +1,17 @@
 """
-Запуск браузера через Patchright (вместо AdsPower).
-Тот же интерфейс что у AdsPowerBrowser — замена прозрачная.
+Запуск профиля через Camoufox (Firefox с C++ патчами отпечатка).
+
+Camoufox патчит navigator, WebGL, AudioContext, Canvas, ClientRects,
+SpeechVoices, hardwareConcurrency, deviceMemory — всё на уровне движка.
+Worker видит те же значения, Function.toString() остаётся [native code].
 
 Установка:
-    pip install patchright
-    patchright install chromium
+    pip install camoufox
+    python -m camoufox fetch
 """
+import asyncio
 import logging
 from typing import Optional
-
-from patchright.async_api import async_playwright, Page, BrowserContext
 
 from core.profile_config import load_profile_config, get_user_data_dir
 
@@ -18,172 +20,169 @@ logger = logging.getLogger(__name__)
 
 class PatchrightBrowser:
     """
-    Drop-in замена AdsPowerBrowser на Patchright.
-
-    Использование (точно так же как раньше):
-        wrapper = PatchrightBrowser(profile_id="zenit_1", headless=False)
-        await wrapper.__aenter__()
-        page = wrapper.page
-        new_tab = await wrapper.new_page()
-        await wrapper.stop()
+    Drop-in замена старого PatchrightBrowser.
+    Интерфейс тот же: page / new_page() / stop() / is_connected().
     """
 
     def __init__(
         self,
         profile_id: str,
         headless: bool = False,
-        # Совместимость со старым конструктором (игнорируем):
         api_key: str = "",
         api_url: str = "",
         **kwargs,
     ):
         self.profile_id = profile_id
         self.headless = headless
-        self._playwright = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        self._browser = None
+        self._page = None
+        self._used_channel = "camoufox"
 
     async def __aenter__(self):
         if not self.profile_id:
             raise ValueError("❌ Не указан profile_id")
 
-        logger.info(f"🚀 Запуск профиля {self.profile_id} (Patchright)")
+        logger.info(f"🚀 Запуск профиля {self.profile_id} (Camoufox)")
 
         config = load_profile_config(self.profile_id)
         user_data_dir = get_user_data_dir(self.profile_id)
-
-        from core.fingerprint import (
-            derive_fingerprint, build_chromium_args, build_init_script,
-        )
-
+        fp = config.get("fingerprint", {})
         proxy_cfg = config.get("proxy", {})
-        proxy_server = proxy_cfg.get("server", "")
+
+        # ── Импорт camoufox лениво ──
+        try:
+            from camoufox.async_api import AsyncCamoufox
+        except ImportError:
+            raise RuntimeError(
+                "camoufox не установлен. Выполните:\n"
+                "  pip install camoufox\n"
+                "  python -m camoufox fetch"
+            )
+
+        # ── Прокси ──
         proxy = None
+        proxy_server = proxy_cfg.get("server", "")
         if proxy_server:
-            server = proxy_server
-            username = proxy_cfg.get("username", "")
-            password = proxy_cfg.get("password", "")
-            if username and "://" in server:
-                scheme, rest = server.split("://", 1)
-                server = f"{scheme}://{username}:{password}@{rest}"
-            proxy = {"server": server}
+            proxy = {
+                "server": proxy_server,
+                "username": proxy_cfg.get("username", ""),
+                "password": proxy_cfg.get("password", ""),
+            }
+            if not proxy["username"]:
+                proxy.pop("username", None)
+                proxy.pop("password", None)
             logger.info(f"[{self.profile_id}] Прокси: {proxy_server}")
 
-        # ── Отпечаток: разворачиваем 'auto' из seed ──
-        fp = derive_fingerprint(config.get("fingerprint", {}),
-                                proxy_server=proxy_server)
-
+        # ── Параметры Camoufox ──
+        # geoip=True → таймзона/локаль по IP прокси (или своему)
+        # humanize=True → человекоподобные мышь/клавиатура/скролл
+        # persistent_context=True → куки/сессии сохраняются в user_data_dir
         launch_kwargs = dict(
-            user_data_dir=user_data_dir,
             headless=self.headless,
-            proxy=proxy,
-            args=build_chromium_args(fp),
-            viewport={"width": fp["screen"]["width"],
-                      "height": fp["screen"]["height"]},
-            locale=fp["locale"],
-            timezone_id=fp["timezone"],
-            ignore_default_args=["--enable-automation"],
+            persistent_context=True,
+            user_data_dir=user_data_dir,
+            geoip=bool(proxy_server),
+            humanize=True,
         )
-        if fp["ua_override"]:
-            launch_kwargs["user_agent"] = fp["user_agent"]
-        if fp["geo_mode"] == "coords" and fp["geo_lat"] is not None:
-            launch_kwargs["geolocation"] = {"latitude": fp["geo_lat"],
-                                            "longitude": fp["geo_lon"]}
-            launch_kwargs["permissions"] = ["geolocation"]
-        if fp["dnt"] != "default":
-            launch_kwargs["extra_http_headers"] = {"DNT": fp["dnt"]}
+        if proxy:
+            launch_kwargs["proxy"] = proxy
 
-        self._playwright = await async_playwright().start()
-        try:
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                **launch_kwargs
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка запуска браузера: {e}")
-            if self._playwright:
-                await self._playwright.stop()
-            raise
-
-        # ── JS-слой отпечатка: canvas/webgl/audio/rects/voices/cpu/ram ──
-        await self._context.add_init_script(build_init_script(fp))
-        logger.info(
-            f"[{self.profile_id}] FP: seed={fp['seed']} "
-            f"tz={fp['timezone']} screen={fp['screen']['width']}x{fp['screen']['height']} "
-            f"cpu={fp['cpu_cores']} ram={fp['ram_gb']} gl={fp['webgl']['renderer'][:28]}"
-        )
-
-        if self._context.pages:
-            self._page = self._context.pages[0]
+        # ── Платформа ──
+        platform = fp.get("platform", "windows")
+        if platform == "macos":
+            launch_kwargs["os"] = "macos"
         else:
-            self._page = await self._context.new_page()
+            launch_kwargs["os"] = "windows"
 
-        await self._close_extra_tabs()
+        # ── Стабильный отпечаток через seed ──
+        # Camoufox генерирует отпечаток из seed — один seed = один человек
+        seed = int(fp.get("seed") or 1)
+        launch_kwargs["fingerprint"] = {"seed": seed}
 
-        if not self._page or self._page.is_closed():
-            self._page = await self._context.new_page()
+        # ── Точечные оверрайды (только то, что задано явно) ──
+        # Camoufox применяет их в движке, Worker видит те же значения
+        overrides = {}
+        if isinstance(fp.get("cpu_cores"), int):
+            overrides["navigator.hardwareConcurrency"] = int(fp["cpu_cores"])
+        if isinstance(fp.get("ram_gb"), int):
+            overrides["navigator.deviceMemory"] = int(fp["ram_gb"])
+        scr = fp.get("screen")
+        if isinstance(scr, dict) and scr.get("width"):
+            overrides["screen.width"] = int(scr["width"])
+            overrides["screen.height"] = int(scr["height"])
+        wgl = fp.get("webgl")
+        if isinstance(wgl, dict) and wgl.get("renderer"):
+            launch_kwargs["webgl_config"] = (
+                wgl.get("vendor", "Google Inc."),
+                wgl["renderer"],
+            )
+        if overrides:
+            launch_kwargs["config"] = overrides
 
-        logger.info(f"✅ Браузер для профиля {self.profile_id} готов")
+        # ── Locale / timezone (если заданы явно) ──
+        tz = fp.get("timezone", "system")
+        if tz and tz not in ("system", "auto"):
+            launch_kwargs["timezone"] = tz
+        locale = fp.get("locale", "system")
+        if locale and locale not in ("system", "auto"):
+            launch_kwargs["locale"] = locale
+
+        # ── Запуск ──
+        self._browser = AsyncCamoufox(**launch_kwargs)
+        await self._browser.__aenter__()
+
+        # ── Первая страница ──
+        pages = self._browser.pages if hasattr(self._browser, "pages") else []
+        self._page = pages[0] if pages else await self._browser.new_page()
+
+        # ── UA лог ──
+        try:
+            ua = await self._page.evaluate("navigator.userAgent")
+            logger.info(
+                f"[{self.profile_id}] Camoufox UA: {ua[:80]}..."
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"✅ профиль {self.profile_id} готов "
+            f"(seed={seed}, platform={platform}, "
+            f"proxy={'да' if proxy else 'нет'})"
+        )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.stop()
 
-    # ── Свойства (совместимость с AdsPowerBrowser) ──
-
     @property
-    def page(self) -> Page:
+    def page(self):
         return self._page
 
     @property
     def browser(self):
-        """
-        Возвращает обёртку самого себя, чтобы код вида
-        `wrapper.browser.is_connected()` продолжал работать.
-        """
         return self
 
+    @property
+    def used_channel(self):
+        return self._used_channel
+
     def is_connected(self) -> bool:
-        """Жив ли контекст браузера."""
         try:
-            return self._context is not None and not self._context.is_closed()
+            return self._browser is not None and self._page is not None
         except Exception:
             return False
 
-    # ── Методы ──
-
-    async def new_page(self) -> Page:
-        """Открывает НОВУЮ вкладку в существующем контексте профиля."""
-        if not self._context:
-            raise RuntimeError("PatchrightBrowser: context не инициализирован")
-        new_p = await self._context.new_page()
-        logger.debug(f"📄 Открыта новая вкладка профиля {self.profile_id}")
-        return new_p
+    async def new_page(self):
+        if not self._browser:
+            raise RuntimeError("browser не инициализирован")
+        return await self._browser.new_page()
 
     async def stop(self):
-        """Закрывает браузер и освобождает ресурсы."""
-        if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-            self._context = None
-        if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
-        logger.info(f"🧹 Профиль {self.profile_id} закрыт (Patchright)")
-
-    async def _close_extra_tabs(self):
-        """Закрывает все вкладки кроме последней."""
-        if not self._context:
-            return
-        pages = self._context.pages
-        if len(pages) > 1:
-            logger.debug(f"🧹 Закрываем {len(pages) - 1} лишних вкладок...")
-            for page in pages[:-1]:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+        try:
+            if self._browser:
+                await self._browser.__aexit__(None, None, None)
+        except Exception:
+            pass
+        self._browser = None
+        self._page = None
+        logger.info(f"🧹 профиль {self.profile_id} закрыт (Camoufox)")

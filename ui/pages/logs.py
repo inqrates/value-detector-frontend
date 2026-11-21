@@ -96,7 +96,7 @@ class LogsPage(QWidget):
             "Только сигналы",
             "Только ошибки",
             "Только успехи",
-            "AdsPower",
+            "Браузер",
             "Стратегии",
             "Ставки",
         ])
@@ -264,7 +264,7 @@ class LogsPage(QWidget):
             return False
         if f == "Только успехи" and entry["level"] != "success":
             return False
-        if f == "AdsPower" and entry["source"] != "AdsPower":
+        if f == "Браузер" and entry["source"] != "Браузер":
             return False
         if f == "Стратегии" and entry["source"] != "Стратегия":
             return False
