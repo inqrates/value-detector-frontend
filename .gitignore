@@ -36,6 +36,7 @@ logs/
 .env
 secrets.json
 accounts.json
+*.enc
 
 # OS
 .DS_Store
@@ -44,3 +45,22 @@ Thumbs.db
 # Тестовые
 test_bet.py
 test_betcity.py
+stdout_test.txt
+
+# Защищённая сборка (артефакты Nuitka/PyInstaller)
+build_pyd/
+build_staging/
+build_src/
+build_obf/
+_nt/
+_bt/
+_bt_out/
+
+# Рабочие конфиги (живут в %APPDATA%\ValueDetectorPro\)
+config.json
+strategies.json
+
+# Certificates (private keys never in git)
+certs/*.key
+certs/server.crt
+!certs/ca.pem

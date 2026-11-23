@@ -33,6 +33,8 @@ from .paths import get_app_data_dir
 from .after_goal.match_urls import build_match_url
 from .config_loader import load_config
 from ui.log_bus import log_bus
+from core.names import normalize_bk, normalize_name, transliterate
+from .after_goal import sports
 
 import requests
 
@@ -57,7 +59,7 @@ _aux_logger.setLevel(logging.WARNING)
 
 
 def _normalize_bk(name: str) -> str:
-    return (name or "").lower().replace(" ", "").replace("-", "").replace("_", "")
+    return normalize_bk(name)
 
 
 def _make_key(match_id: str, profile_id: str) -> str:
@@ -71,62 +73,15 @@ def _match_id_from_key(key: str) -> str:
         return key.split("__", 1)[0]
     return key
 
-_NORMALIZER_ALIASES = {
-    "адам": "адам",
-    "лукас": "адам",
-    "хецко": "гечко",
-    "гечко": "гечко",
-}
-
-_NORMALIZER_TRANSLIT = {
-    'a': 'а', 'b': 'б', 'v': 'в', 'g': 'г', 'd': 'д',
-    'e': 'е', 'yo': 'ё', 'zh': 'ж', 'z': 'з', 'i': 'и',
-    'j': 'й', 'k': 'к', 'l': 'л', 'm': 'м', 'n': 'н',
-    'o': 'о', 'p': 'п', 'r': 'р', 's': 'с', 't': 'т',
-    'u': 'у', 'f': 'ф', 'kh': 'х', 'ts': 'ц', 'ch': 'ч',
-    'sh': 'ш', 'sch': 'щ', 'y': 'ы', 'yu': 'ю', 'ya': 'я',
-    'h': 'х', 'w': 'в',
-}
 
 def _transliterate_key(name: str) -> str:
-    if not name or not re.search(r'[a-zA-Z]', name):
-        return name
-    result = []
-    i = 0
-    while i < len(name):
-        matched = False
-        for length in (3, 2, 1):
-            chunk = name[i:i + length]
-            if chunk in _NORMALIZER_TRANSLIT:
-                result.append(_NORMALIZER_TRANSLIT[chunk])
-                i += length
-                matched = True
-                break
-        if not matched:
-            result.append(name[i])
-            i += 1
-    return ''.join(result)
+    """Оставлено для совместимости — реализация в core.names."""
+    return transliterate(name)
+
 
 def _normalize_key_name(name: str) -> str:
-    """Синхронизированная копия core.normalizer.normalize_name."""
-    if not name:
-        return ""
-    text = re.sub(r'\(.*?\)', '', name)
-    text = re.sub(r'\d+', '', text)
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = text.lower()
-    text = _transliterate_key(text)
-    words = [w for w in text.split() if len(w) > 1]
-    if not words:
-        words = text.split()
-    words = [_NORMALIZER_ALIASES.get(w, w) for w in words]
-    if not words:
-        return ""
-    lastname = words[-1]
-    for w in words:
-        if len(w) > len(lastname):
-            lastname = w
-    return lastname
+    """Единая нормализация (core.names) — см. шапку модуля names."""
+    return normalize_name(name)
 
 HANDLERS = {
     "fonbet": FonbetHandler,
@@ -191,8 +146,8 @@ LOAD_WAIT_DEFAULT = 500
 
 MAX_ACCEPTABLE_DELAY = 30.0
 
-PHASE_END_BY_SCORE = {"table_tennis", "volleyball", "beach_volleyball"}
-PHASE_END_BY_TIME = {"basketball", "cyber_basketball"}
+PHASE_END_BY_SCORE = sports.PHASE_END_BY_SCORE
+PHASE_END_BY_TIME = sports.PHASE_END_BY_TIME
 
 
 LIVE_URLS = {
@@ -269,18 +224,7 @@ LIVE_URLS = {
 
 
 # ── Маппинг код manual_markets → базовый рынок (для порогов) ──
-_MARKET_CODE_TO_BASE = {
-    "winner_1": "winner",
-    "winner_2": "winner",
-    "total_over": "total",
-    "total_under": "total",
-    "handicap_1": "handicap",
-    "handicap_2": "handicap",
-    "it1_over": "it",
-    "it1_under": "it",
-    "it2_over": "it",
-    "it2_under": "it",
-}
+_MARKET_CODE_TO_BASE = sports.MARKET_CODE_TO_BASE
 
 
 class AfterGoalEngine:
@@ -490,10 +434,18 @@ class AfterGoalEngine:
         )
 
         fail_count = 0
+        # ── SSL: доверяем нашему CA (certs/ca.pem), если есть ──
+        try:
+            from ui.ssl_cert import build_requests_verify
+            _verify = build_requests_verify()
+        except Exception:
+            _verify = True
+
         while self._monitoring_active.get(key, False):
             try:
                 resp = await asyncio.to_thread(
-                    requests.get, url, params=params, timeout=3
+                    requests.get, url, params=params, timeout=3,
+                    verify=_verify,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -895,14 +847,7 @@ class AfterGoalEngine:
     # Пороги отставания по рынкам
     # ============================================================
     def _get_market_threshold(self, strategy: dict, market: str) -> int:
-        thresholds = strategy.get('market_thresholds') or {}
-        val = thresholds.get(market)
-        if val is None:
-            val = strategy.get('min_score_diff', 2)
-        try:
-            return max(1, int(val))
-        except Exception:
-            return 2
+        return sports.get_market_threshold(strategy, market)
 
     def _get_min_threshold(self, strategy: dict) -> int:
         """
@@ -911,34 +856,7 @@ class AfterGoalEngine:
         manual — берём пороги только по рынкам, отмеченным в manual_markets.
         auto   — минимум по всем четырём базовым рынкам.
         """
-        thresholds = strategy.get('market_thresholds') or {}
-        default = strategy.get('min_score_diff', 2)
-
-        def _safe_int(v, d):
-            try:
-                return max(1, int(v))
-            except Exception:
-                return d
-
-        mode = strategy.get('market_mode', 'auto')
-
-        if mode == 'manual':
-            manual = strategy.get('manual_markets') or []
-            base_markets = set()
-            for code in manual:
-                m = _MARKET_CODE_TO_BASE.get(code)
-                if m:
-                    base_markets.add(m)
-            if not base_markets:
-                return _safe_int(default, 2)
-            values = [_safe_int(thresholds.get(m, default), default)
-                      for m in base_markets]
-            return min(values)
-
-        values = []
-        for m in ('winner', 'total', 'handicap', 'it'):
-            values.append(_safe_int(thresholds.get(m, default), default))
-        return min(values) if values else _safe_int(default, 2)
+        return sports.get_min_threshold(strategy)
 
     # ============================================================
     # Рынки manual_markets ↔ внутренний формат
@@ -946,37 +864,12 @@ class AfterGoalEngine:
     @staticmethod
     def _market_code(market: str, side: str) -> Optional[str]:
         """(market, side) → код в manual_markets."""
-        if market == 'winner':
-            return f'winner_{side}'            # winner_1 / winner_2
-        if market == 'total':
-            return f'total_{side}'             # total_over / total_under
-        if market == 'handicap':
-            return f'handicap_{side}'          # handicap_1 / handicap_2
-        if market == 'it':
-            # side = '1_over' / '2_under' → it1_over / it2_under
-            if '_' in side:
-                player, dirn = side.split('_', 1)
-                return f'it{player}_{dirn}'
-            return None
-        if market == 'odd':
-            return 'odd'                        # одна галочка
-        if market == 'point':
-            return 'point'                      # одна галочка
-        return None
+        return sports.market_code(market, side)
 
     def _is_market_allowed(self, market: str, side: str,
                            manual: set) -> bool:
         """Разрешён ли исход по настройкам manual_markets."""
-        is_race = market.startswith('race_')
-        base = market[5:] if is_race else market
-
-        if is_race and 'race' not in manual:
-            return False
-
-        code = self._market_code(base, side)
-        if not code:
-            return False
-        return code in manual
+        return sports.is_market_allowed(market, side, manual)
 
     # ============================================================
     # RE-CHECK задержки прямо сейчас
@@ -2760,7 +2653,7 @@ class AfterGoalEngine:
         except Exception as e:
             logger.warning(f"Ошибка закрытия страницы: {e}")
         try:
-            new_page = await browser_wrapper._context.new_page()
+            new_page = await browser_wrapper.new_page()
             browser_wrapper._page = new_page
         except Exception as e:
             logger.error(f"Не удалось пересоздать страницу: {e}")
@@ -3038,102 +2931,29 @@ class AfterGoalEngine:
     # ============================================================
     def _phase_end(self, sport: str, s1: int, s2: int, set_number: int) \
             -> Tuple[bool, Optional[str]]:
-        if sport == "table_tennis":
-            if s1 >= 11 and s1 - s2 >= 2:
-                return True, '1'
-            if s2 >= 11 and s2 - s1 >= 2:
-                return True, '2'
-            return False, None
-        if sport in ("volleyball", "beach_volleyball"):
-            threshold = 15 if set_number >= 5 else 25
-            if s1 >= threshold and s1 - s2 >= 2:
-                return True, '1'
-            if s2 >= threshold and s2 - s1 >= 2:
-                return True, '2'
-            return False, None
-        return False, None
+        return sports.phase_end(sport, s1, s2, set_number)
 
     def _is_set_done(self, sport: str, a: int, b: int, set_number: int,
                      fast_phase: int) -> bool:
-        if sport in ('basketball', 'cyber_basketball'):
-            return fast_phase > set_number
-        if sport == 'table_tennis':
-            return (a >= 11 and a - b >= 2) or (b >= 11 and b - a >= 2)
-        if sport in ('volleyball', 'beach_volleyball'):
-            thr = 15 if set_number >= 5 else 25
-            return (a >= thr and a - b >= 2) or (b >= thr and b - a >= 2)
-        return False
+        return sports.is_set_done(sport, a, b, set_number, fast_phase)
 
     @staticmethod
     def _parse_phase_num(phase_name: str) -> int:
-        if not phase_name:
-            return 0
-        m = re.search(r'(\d+)', str(phase_name))
-        if not m:
-            return 0
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return 0
+        return sports.parse_phase_num(phase_name)
 
     def _resolve_phase_context(self, sport: str, payload: dict,
                                 data: dict, set_markets: dict,
                                 fast_score: List[int],
                                 slow_score: List[int]) -> Tuple[int, int]:
-        fast_phase_num = self._parse_phase_num(payload.get('fast_phase', ''))
-
-        if not fast_phase_num and sport in PHASE_END_BY_SCORE:
-            fast_phase_num = fast_score[0] + fast_score[1] + 1
-
-        slow_phase_num = int(data.get('phase_num') or 0)
-
-        if not slow_phase_num:
-            if sport in PHASE_END_BY_SCORE:
-                slow_phase_num = slow_score[0] + slow_score[1] + 1
-            else:
-                nums = []
-                for k in set_markets.keys():
-                    if isinstance(k, str) and k.startswith('set_'):
-                        try:
-                            nums.append(int(k.split('_', 1)[1]))
-                        except Exception:
-                            pass
-                slow_phase_num = max(nums) if nums else 1
-
-        return fast_phase_num, slow_phase_num
+        return sports.resolve_phase_context(
+            sport, payload, data, set_markets, fast_score, slow_score)
 
     def _max_phase_total(self, sport: str, set_number: int) -> int:
-        if sport == 'table_tennis':
-            return 40
-        if sport in ('volleyball', 'beach_volleyball'):
-            return 32 if set_number >= 5 else 52
-        if sport in ('basketball', 'cyber_basketball'):
-            return 80
-        return 100
+        return sports.max_phase_total(sport, set_number)
 
     def _is_phase_line_sane(self, sport: str, market: str,
                             line: float, set_number: int) -> bool:
-        if line is None:
-            return False
-        try:
-            abs_line = abs(float(line))
-        except (ValueError, TypeError):
-            return False
-
-        if market == 'total':
-            max_line = self._max_phase_total(sport, set_number)
-        elif market in ('handicap', 'it'):
-            max_line = self._max_phase_total(sport, set_number) // 2
-        else:
-            return True
-
-        if abs_line > max_line:
-            logger.debug(
-                f"[sanity] {sport} {market} line={abs_line} > {max_line} "
-                f"(set {set_number}) — не партийная, пропуск"
-            )
-            return False
-        return True
+        return sports.is_phase_line_sane(sport, market, line, set_number)
 
     def _verify_delay_still_open(self, data: dict, payload: dict, strategy: dict,
                                  fast_state: Optional[dict],
@@ -3205,240 +3025,21 @@ class AfterGoalEngine:
     # ============================================================
     def _collect_confirmed_bets(self, sport, payload, markets, set_number,
                                  fast_sub, fast_score, slow_score):
-        confirmed = []
-        a = fast_sub[0] if fast_sub else 0
-        b = fast_sub[1] if fast_sub else 0
-
-        fast_phase_for_done = self._parse_phase_num(payload.get('fast_phase', ''))
-        fast_set_done = self._is_set_done(sport, a, b, set_number, fast_phase_for_done)
-
-        fast_total = a + b
-        total = markets.get('total', {}) or {}
-        line = total.get('line', 0) or 0
-        it_markets = markets.get('it', {}) or {}
-
-        total_sane = line > 0 and self._is_phase_line_sane(
-            sport, 'total', line, set_number
-        )
-
-        # ── 1) РЕЖИМ "ПАРТИЯ ИДЁТ": OVER тотала, ИТ OVER ──
-        odd_over = total.get('over', 0)
-        if odd_over > 0 and total_sane and fast_total > line:
-            confirmed.append((
-                'total', 'over', odd_over,
-                f'set {set_number}: {fast_total} > {line} (100%)',
-                set_number,
-            ))
-
-        for player in ('1', '2'):
-            p_market = it_markets.get(player, {}) or {}
-            if not p_market:
-                continue
-            line_it = p_market.get('line', 0) or 0
-            odd_it_over = p_market.get('over', 0)
-            ind = a if player == '1' else b
-            if (odd_it_over > 0 and line_it > 0
-                    and self._is_phase_line_sane(sport, 'it', line_it, set_number)
-                    and ind > line_it):
-                confirmed.append((
-                    'it', f'{player}_over', odd_it_over,
-                    f'set {set_number}: ИТ{player} {ind} > {line_it} (100%)',
-                    set_number,
-                ))
-
-        # ── 2) Партия ещё идёт → стоп ──
-        if not fast_set_done:
-            return confirmed
-
-        # ── 3) ПАРТИЯ ЗАВЕРШЕНА: under, winner, фора ──
-        if total_sane and fast_total < line:
-            odd_under = total.get('under', 0)
-            if odd_under > 0:
-                confirmed.append((
-                    'total', 'under', odd_under,
-                    f'set {set_number} done: {fast_total} < {line} (100%)',
-                    set_number,
-                ))
-
-        for player in ('1', '2'):
-            p_market = it_markets.get(player, {}) or {}
-            if not p_market:
-                continue
-            line_it = p_market.get('line', 0) or 0
-            odd_it_under = p_market.get('under', 0)
-            ind = a if player == '1' else b
-            if (odd_it_under > 0 and line_it > 0
-                    and self._is_phase_line_sane(sport, 'it', line_it, set_number)
-                    and ind < line_it):
-                confirmed.append((
-                    'it', f'{player}_under', odd_it_under,
-                    f'set {set_number} done: ИТ{player} {ind} < {line_it} (100%)',
-                    set_number,
-                ))
-
-        winner_side = None
-        if a > b:
-            winner_side = '1'
-        elif b > a:
-            winner_side = '2'
-        if winner_side:
-            w = markets.get('winner', {}) or {}
-            odd = w.get(winner_side, 0)
-            if odd > 0:
-                confirmed.append((
-                    'winner', winner_side, odd,
-                    f'set {set_number} done {a}:{b} (100%)',
-                    set_number,
-                ))
-
-        margin1 = a - b
-        margin2 = b - a
-        h = markets.get('handicap', {}) or {}
-        for side, margin in (('1', margin1), ('2', margin2)):
-            h_side = h.get(side, {}) or {}
-            if not h_side:
-                continue
-            line_h = h_side.get('line', 0) or 0
-            odd_h = h_side.get('odd', 0)
-            if (odd_h > 0
-                    and self._is_phase_line_sane(sport, 'handicap', line_h, set_number)
-                    and (margin + line_h) > 0):
-                confirmed.append((
-                    'handicap', side, odd_h,
-                    f'set {set_number} done: П{side} margin '
-                    f'{margin} + line {line_h} (100%)',
-                    set_number,
-                ))
-
-        return confirmed
+        from .after_goal import decisions
+        return decisions.collect_confirmed_bets(
+            sport, payload, markets, set_number,
+            fast_sub, fast_score, slow_score)
 
     def _collect_prev_phase_bets(self, sport, payload, set_markets,
                                   fast_prev_sub: List[int], prev_phase_name: str):
-        if not prev_phase_name:
-            return []
-        m = re.search(r'(\d+)', prev_phase_name)
-        if not m:
-            return []
-        prev_num = int(m.group(1))
-
-        prev_s1 = fast_prev_sub[0] if fast_prev_sub else 0
-        prev_s2 = fast_prev_sub[1] if fast_prev_sub else 0
-        if prev_s1 == 0 and prev_s2 == 0:
-            return []
-
-        set_key = f"set_{prev_num}"
-        markets = set_markets.get(set_key, {})
-        if not markets:
-            return []
-
-        confirmed = []
-        prev_total = prev_s1 + prev_s2
-
-        total = markets.get('total', {}) or {}
-        line = total.get('line', 0) or 0
-        if line > 0 and self._is_phase_line_sane(sport, 'total', line, prev_num):
-            if prev_total > line:
-                odd = total.get('over', 0)
-                if odd > 0:
-                    confirmed.append((
-                        'total', 'over', odd,
-                        f'prev {prev_phase_name}: {prev_total} > {line}',
-                        prev_num,
-                    ))
-            elif prev_total < line:
-                odd = total.get('under', 0)
-                if odd > 0:
-                    confirmed.append((
-                        'total', 'under', odd,
-                        f'prev {prev_phase_name}: {prev_total} < {line}',
-                        prev_num,
-                    ))
-
-        it_markets = markets.get('it', {}) or {}
-        for player in ('1', '2'):
-            p_market = it_markets.get(player, {}) or {}
-            if not p_market:
-                continue
-            line_it = p_market.get('line', 0) or 0
-            ind = prev_s1 if player == '1' else prev_s2
-            if line_it <= 0:
-                continue
-            if not self._is_phase_line_sane(sport, 'it', line_it, prev_num):
-                continue
-            if ind > line_it:
-                odd = p_market.get('over', 0)
-                if odd > 0:
-                    confirmed.append((
-                        'it', f'{player}_over', odd,
-                        f'prev ИТ{player} {ind} > {line_it}',
-                        prev_num,
-                    ))
-            elif ind < line_it:
-                odd = p_market.get('under', 0)
-                if odd > 0:
-                    confirmed.append((
-                        'it', f'{player}_under', odd,
-                        f'prev ИТ{player} {ind} < {line_it}',
-                        prev_num,
-                    ))
-
-        winner_side = None
-        if prev_s1 > prev_s2:
-            winner_side = '1'
-        elif prev_s2 > prev_s1:
-            winner_side = '2'
-
-        if winner_side:
-            w = markets.get('winner', {}) or {}
-            odd = w.get(winner_side, 0)
-            if odd > 0:
-                confirmed.append((
-                    'winner', winner_side, odd,
-                    f'prev {prev_phase_name} {prev_s1}:{prev_s2}',
-                    prev_num,
-                ))
-
-        margin1 = prev_s1 - prev_s2
-        margin2 = prev_s2 - prev_s1
-        h = markets.get('handicap', {}) or {}
-        for side, margin in (('1', margin1), ('2', margin2)):
-            h_side = h.get(side, {}) or {}
-            if not h_side:
-                continue
-            line_h = h_side.get('line', 0) or 0
-            odd_h = h_side.get('odd', 0)
-            if (odd_h > 0
-                    and self._is_phase_line_sane(sport, 'handicap', line_h, prev_num)
-                    and (margin + line_h) > 0):
-                confirmed.append((
-                    'handicap', side, odd_h,
-                    f'prev П{side} margin {margin} + line {line_h}',
-                    prev_num,
-                ))
-
-        return confirmed
+        from .after_goal import decisions
+        return decisions.collect_prev_phase_bets(
+            sport, payload, set_markets, fast_prev_sub, prev_phase_name)
 
     def _filter_confirmed_by_strategy(self, confirmed, strategy, payload):
-        mode = strategy.get('market_mode', 'auto')
-        if mode != 'manual':
-            return confirmed
-
-        manual = set(strategy.get('manual_markets') or [])
-        if not manual:
-            return confirmed
-
-        result = []
-        for c in confirmed:
-            market, side, odd, reason, set_number = c
-            if self._is_market_allowed(market, side, manual):
-                result.append(c)
-
-        if not result:
-            logger.debug(
-                f"_filter_confirmed_by_strategy: все исходы отсеяны "
-                f"manual_markets={sorted(manual)}"
-            )
-        return result
+        from .after_goal import decisions
+        return decisions.filter_confirmed_by_strategy(
+            confirmed, strategy, payload)
 
     def _choose_best_bet(self, data, strategy, payload,
                          fast_sub: List[int],
@@ -3673,129 +3274,18 @@ class AfterGoalEngine:
                      phase_done: bool,
                      sport: str = "table_tennis",
                      set_number: int = 1) -> bool:
-        """
-        True, если fast уже показывает, что наш исход выигрывает по счёту.
-        Используется в live-value, чтобы не ставить «лотерейные» value,
-        где кэф у slow просто устарел, но fast не подтверждает наш исход.
+        from .after_goal import decisions
+        return decisions.fast_favors(
+            market, side, line, fast_sub1, fast_sub2,
+            phase_done, sport, set_number)
 
-        Логика по рынкам:
-          winner 1/2   — тот, у кого больше очков на fast
-          total over   — fast-сумма уже >= line
-          total under  — fast-сумма + max-возможное-до-конца < line
-          it_over      — fast-очки игрока >= line
-          it_under     — fast-очки игрока + max < line
-          handicap     — margin + line > 0 на fast
-          odd/even     — fast_total чётный/нечётный И партия завершена
-          point        — не гарантируется, всегда False
-        """
-        try:
-            if market == 'winner':
-                if side == '1':
-                    return fast_sub1 > fast_sub2
-                else:
-                    return fast_sub2 > fast_sub1
-
-            if market == 'total':
-                total = fast_sub1 + fast_sub2
-                if side == 'over':
-                    if total >= line:
-                        return True
-                    if phase_done:
-                        return total >= line
-                    # оценим минимально-возможный финал
-                    if sport == 'table_tennis':
-                        return (11 + min(fast_sub1, fast_sub2)) >= line
-                    if sport in ('volleyball', 'beach_volleyball'):
-                        thr = 15 if set_number >= 5 else 25
-                        return (thr + min(fast_sub1, fast_sub2)) >= line
-                    return False
-                else:  # under
-                    if phase_done:
-                        return total < line
-                    return False
-
-            if market == 'it':
-                player, direction = side.split('_', 1)
-                ind = fast_sub1 if player == '1' else fast_sub2
-                if direction == 'over':
-                    return ind >= line
-                else:  # under
-                    if phase_done:
-                        return ind < line
-                    return False
-
-            if market == 'handicap':
-                margin = fast_sub1 - fast_sub2 if side == '1' \
-                    else fast_sub2 - fast_sub1
-                if phase_done:
-                    return (margin + line) > 0
-                # партия идёт — не гарантируем
-                return False
-
-            if market == 'odd':
-                if not phase_done:
-                    return False
-                total = fast_sub1 + fast_sub2
-                if side == 'odd':
-                    return total % 2 == 1
-                return total % 2 == 0
-
-            if market == 'point':
-                # следующее очко не гарантируется
-                return False
-
-        except Exception:
-            return False
-        return False
-    # ============================================================
-    # Проверка: исход УЖЕ проиграл на fast? (ставить нельзя)
-    # ============================================================
     @staticmethod
     def _is_outcome_dead(market: str, side: str, line: float,
                          fast_sub1: int, fast_sub2: int,
                          phase_done: bool) -> bool:
-        try:
-            if market == 'it':
-                player, direction = str(side).split('_', 1)
-                ind = fast_sub1 if player == '1' else fast_sub2
-                if direction == 'under':
-                    if ind >= line:
-                        return True
-                    if phase_done and ind >= line:
-                        return True
-                else:  # over
-                    if phase_done and ind < line:
-                        return True
-                return False
-
-            if market == 'total':
-                total = fast_sub1 + fast_sub2
-                if side == 'under':
-                    if total >= line:
-                        return True
-                    if phase_done and total >= line:
-                        return True
-                else:  # over
-                    if phase_done and total < line:
-                        return True
-                return False
-
-            if market == 'handicap':
-                margin = fast_sub1 - fast_sub2 if side == '1' \
-                    else fast_sub2 - fast_sub1
-                if phase_done and (margin + line) <= 0:
-                    return True
-                return False
-
-            if market == 'winner':
-                if phase_done:
-                    winner = '1' if fast_sub1 > fast_sub2 else '2'
-                    return side != winner
-                return False
-
-        except Exception:
-            return False
-        return False
+        from .after_goal import decisions
+        return decisions.is_outcome_dead(
+            market, side, line, fast_sub1, fast_sub2, phase_done)
 
     # ============================================================
     # Live-value: сравнение кэфов fast и slow

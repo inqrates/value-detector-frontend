@@ -42,7 +42,7 @@ try:
     _err_handler.setFormatter(_FORMAT)
     _handlers.append(_err_handler)
 except Exception as _e:
-    print(f"⚠️ Не удалось открыть файл лога: {_e}")
+    print(f"[!] Не удалось открыть файл лога: {_e}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,12 +123,30 @@ def main():
     # ---- Single-instance через QLockFile ----
     # Не даём запустить второй экземпляр, пока жив первый.
     # QLockFile сам определяет stale lock (умерший процесс).
+    # ---- Компоненты: первый запуск ----
+    from ui.first_run_dialog import ensure_camoufox_installed
+    from PyQt5.QtWidgets import QMessageBox
+
+    while True:
+        if ensure_camoufox_installed():
+            break
+        reply = QMessageBox.question(
+            None,
+            "Компоненты не установлены",
+            "Не удалось установить необходимые компоненты.\n\n"
+            "Повторить попытку? (проверьте подключение к интернету)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            print("[X] Компоненты не установлены. Приложение не может работать без них.")
+            sys.exit(1)
     lock_path = os.path.join(tempfile.gettempdir(), "value_detector_pro.lock")
     lock = QLockFile(lock_path)
     lock.setStaleLockTime(0)  # 0 = считать stale немедленно при смерти процесса
 
     if not lock.tryLock(100):
-        print("⚠️ Приложение уже запущено.")
+        print("[!] Приложение уже запущено.")
         print("   Закройте старое окно (или снимите задачу в диспетчере) и попробуйте снова.")
         sys.exit(1)
 
@@ -141,7 +159,7 @@ def main():
         loop = qasync.QEventLoop(app)
         asyncio.set_event_loop(loop)
     except ImportError:
-        print("❌ Не установлен qasync — автоставки работать не будут.")
+        print("[X] Не установлен qasync — автоставки работать не будут.")
         print("   Установите командой: pip install qasync")
         loop = None
 
@@ -163,10 +181,10 @@ def main():
         from ui.session_store import try_restore_session
         restored = try_restore_session()
     except Exception as e:
-        print(f"⚠️ Ошибка восстановления сессии: {e}")
+        print(f"[!] Ошибка восстановления сессии: {e}")
 
     if restored:
-        print("🔓 Автовход по сохранённой сессии")
+        print("[OK] Автовход по сохранённой сессии")
         on_login_success()
     else:
         login_win.show()

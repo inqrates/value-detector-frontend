@@ -298,4 +298,4 @@ class DashboardPage(QWidget):
             if hasattr(main, 'after_goal_engine'):
                 asyncio.create_task(main.after_goal_engine.activate_strategy(st))
             else:
-                print("⚠️ after_goal_engine не найден, пропускаем активацию профиля")
+                print("[!] after_goal_engine не найден, пропускаем активацию профиля")

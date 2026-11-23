@@ -58,7 +58,7 @@ class FastCookieCollector:
     Использование:
         collector = FastCookieCollector(
             profile_id="zenit_1",
-            headless=False,     # ← рекомендуется False: Qrator палит headless
+            headless=True,      # окно браузера не показывается пользователю
             progress_cb=print,
         )
         status = await collector.collect_all(["fonbet", "ligastavok"])
@@ -66,7 +66,7 @@ class FastCookieCollector:
     def __init__(
         self,
         profile_id: str,
-        headless: bool = False,
+        headless: bool = True,
         progress_cb: Optional[Callable[[str], None]] = None,
     ):
         self.profile_id = (profile_id or "").strip()
@@ -89,11 +89,6 @@ class FastCookieCollector:
             return {bk: "error: нет profile_id" for bk in bks}
 
         self._progress(f"🚀 Запуск профиля {self.profile_id} (headless={self.headless})...")
-        if self.headless:
-            logger.warning(
-                "[fast_collector] ⚠️ headless=True — Qrator и другие "
-                "антиботы могут не пропустить. Рекомендуется headless=False."
-            )
 
         # Запускаем браузер через Patchright
         wrapper = PatchrightBrowser(

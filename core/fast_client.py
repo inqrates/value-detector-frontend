@@ -39,19 +39,21 @@ logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════
-# Нормализация имён (fallback-поиск)
+# Нормализация имён — единая реализация (core/names.py)
 # ════════════════════════════════════════════════════════════
+from core.names import normalize_name as _normalize_name_shared
+from core.names import players_match as _players_match_shared
+
+
 def _normalize_name(name: str) -> str:
-    if not name:
-        return ""
-    text = re.sub(r"\(.*?\)", "", name)
-    text = re.sub(r"\d+", "", text)
-    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    text = text.lower()
-    words = [w for w in text.split() if len(w) > 1]
-    if not words:
-        return text.strip()
-    return max(words, key=len)
+    """
+    Совместимость со старым поведением: без транслита и алиасов,
+    при равной длине — первое слово. См. core/names.py.
+    """
+    return _normalize_name_shared(
+        name, transliterate_=False, aliases=False,
+        prefer_last_on_tie=False, fallback_to_raw=True,
+    )
 
 
 def _close_token(a: str, b: str) -> bool:
@@ -65,16 +67,7 @@ def _close_token(a: str, b: str) -> bool:
 
 
 def _players_match(p1a: str, p2a: str, p1b: str, p2b: str) -> bool:
-    na1 = _normalize_name(p1a)
-    na2 = _normalize_name(p2a)
-    nb1 = _normalize_name(p1b)
-    nb2 = _normalize_name(p2b)
-    if not (na1 and na2 and nb1 and nb2):
-        return False
-
-    direct = _close_token(na1, nb1) and _close_token(na2, nb2)
-    cross = _close_token(na1, nb2) and _close_token(na2, nb1)
-    return direct or cross
+    return _players_match_shared(p1a, p2a, p1b, p2b)
 
 
 def _strip_outcome_ids(parsed: Optional[dict]) -> Optional[dict]:

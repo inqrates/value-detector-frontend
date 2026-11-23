@@ -1,40 +1,44 @@
 """
-Конфиги отпечатка и geoip.
-Camoufox применяет отпечаток на уровне C++ движка —
-JS-инъекции не нужны и даже вредны (prototype lies).
+Отпечатки профилей на основе записанных пресетов Camoufox.
+
+ГЛАВНЫЙ ПРИНЦИП: личность профиля — это ОДИН записанный пресет
+(реальное устройство, снятое с настоящего Firefox). Он хранится
+в profile.json и передаётся в Camoufox как fingerprint_preset.
+
+Почему так, а не «сгенерировать случайно при каждом запуске»:
+  * fpgen при каждом запуске рисует НОВЫЙ отпечаток (другой экран,
+    другое число ядер) — для сайта это признак подмены;
+  * пресет даёт побайтово одинаковый конфиг между запусками
+    (проверено: хеш CAMOU_CONFIG совпадает), то есть одно устройство
+    ведёт себя как одно устройство;
+  * пресетов много (71 windows / 25 macos / 17 linux), поэтому
+    у каждого профиля может быть своя уникальная личность.
+
+Ручная правка UA/WebGL/экрана здесь сознательно НЕ поддерживается:
+эти поля должны совпадать друг с другом, иначе антифрод видит
+рассинхрон. Ротация личности = выбор другого пресета.
 """
+import hashlib
 import json
 import logging
-import time
-import urllib.request
-from typing import Optional
+import random
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════
-# Разрешения экрана — по частоте встречаемости (desktop)
-# ══════════════════════════════════════════════════════════
-SCREEN_RESOLUTIONS = [
-    (1920, 1080, "1920×1080 — самое частое"),
-    (1366, 768,  "1366×768 — ноутбуки"),
-    (1536, 864,  "1536×864 — масштаб 125%"),
-    (1440, 900,  "1440×900"),
-    (1280, 720,  "1280×720"),
-    (1600, 900,  "1600×900"),
-    (2560, 1440, "2560×1440 — 2K"),
-    (1280, 1024, "1280×1024 — 5:4 офис"),
-    (1680, 1050, "1680×1050"),
-    (3840, 2160, "3840×2160 — 4K"),
-    (1920, 1200, "1920×1200 — 16:10"),
-    (2560, 1600, "2560×1600 — 16:10"),
-    (3440, 1440, "3440×1440 — ultrawide"),
-    (2560, 1080, "2560×1080 — ultrawide"),
-    (1280, 800,  "1280×800 — ноутбук"),
-    (1024, 768,  "1024×768 — старый ПК"),
+# Поддерживаемые ОС (по ним есть записанные пресеты)
+OS_CHOICES = [
+    ("windows", "Windows"),
+    ("macos", "macOS"),
+    ("linux", "Linux"),
 ]
 
+# Режимы геолокации/языка/таймзоны
+GEO_AUTO = "auto"        # по IP прокси (рекомендуется)
+GEO_MANUAL = "manual"    # задать таймзону и язык вручную
+GEO_DEFAULT = "default"  # не трогать
+
 TIMEZONES = [
-    "auto", "system",
     "Europe/Kaliningrad", "Europe/Moscow", "Europe/Samara",
     "Asia/Yekaterinburg", "Asia/Omsk", "Asia/Krasnoyarsk",
     "Asia/Irkutsk", "Asia/Yakutsk", "Asia/Vladivostok",
@@ -45,213 +49,211 @@ TIMEZONES = [
     "America/New_York", "Asia/Dubai",
 ]
 
-LOCALE_BY_COUNTRY = {
-    "RU": "ru-RU", "BY": "ru-RU", "KZ": "ru-RU", "KG": "ru-RU",
-    "UA": "uk-UA", "UZ": "ru-RU", "AZ": "ru-RU", "AM": "ru-RU",
-    "GE": "ru-RU", "MD": "ru-RU", "TR": "tr-TR", "DE": "de-DE",
-    "GB": "en-GB", "US": "en-US", "AE": "en-US",
-}
-
-# ══════════════════════════════════════════════════════════
-# GPU — реальные строки Chrome/Windows (ANGLE + D3D11)
-# Camoufox использует эти же строки в C++ патчах
-# ══════════════════════════════════════════════════════════
-def _nv(model: str) -> dict:
-    return {
-        "vendor": "Google Inc. (NVIDIA)",
-        "renderer": f"ANGLE (NVIDIA, NVIDIA {model} Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    }
-def _intel(model: str) -> dict:
-    return {
-        "vendor": "Google Inc. (Intel)",
-        "renderer": f"ANGLE (Intel, Intel(R) {model} Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    }
-def _amd(model: str) -> dict:
-    return {
-        "vendor": "Google Inc. (AMD)",
-        "renderer": f"ANGLE (AMD, AMD {model} Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    }
-
-WEBGL_PROFILES = [
-    _nv("GeForce GTX 1050 Ti"), _nv("GeForce GTX 1060 6GB"),
-    _nv("GeForce GTX 1650"), _nv("GeForce GTX 1660 SUPER"),
-    _nv("GeForce RTX 2060"), _nv("GeForce RTX 2070 SUPER"),
-    _nv("GeForce RTX 3050"), _nv("GeForce RTX 3060"),
-    _nv("GeForce RTX 3060 Ti"), _nv("GeForce RTX 3070"),
-    _nv("GeForce RTX 3080"), _nv("GeForce RTX 4060"),
-    _nv("GeForce RTX 4060 Ti"), _nv("GeForce RTX 4070"),
-    _nv("GeForce RTX 4070 SUPER"), _nv("GeForce RTX 4080"),
-    _nv("GeForce RTX 4090"),
-    _intel("UHD Graphics 620"), _intel("UHD Graphics 630"),
-    _intel("UHD Graphics 730"), _intel("UHD Graphics 770"),
-    _intel("Iris(R) Xe Graphics"), _intel("Iris(R) Plus Graphics 655"),
-    _amd("Radeon RX 550"), _amd("Radeon RX 570"),
-    _amd("Radeon RX 580"), _amd("Radeon RX 5500 XT"),
-    _amd("Radeon RX 6600"), _amd("Radeon RX 6650 XT"),
-    _amd("Radeon RX 6700 XT"), _amd("Radeon RX 7600"),
-    _amd("Radeon RX 7800 XT"), _amd("Radeon(TM) Vega 8 Graphics"),
+LOCALES = [
+    "ru-RU", "en-US", "en-GB", "uk-UA", "de-DE", "tr-TR",
+    "kk-KZ", "uz-UZ", "ka-GE", "hy-AM", "az-AZ", "be-BY",
 ]
 
-# ══════════════════════════════════════════════════════════
-# GeoIP
-# ══════════════════════════════════════════════════════════
-_GEO_CACHE: dict = {}
-_GEO_TTL = 1800.0
 
-
-def resolve_geo(proxy_server: str = "", timeout: float = 5.0) -> Optional[dict]:
-    """Таймзона/локаль/координаты по IP. Работает и без прокси."""
-    key = proxy_server or "__direct__"
-    cached = _GEO_CACHE.get(key)
-    if cached and time.time() - cached[1] < _GEO_TTL:
-        return cached[0]
+# ══════════════════════════════════════════════════════════
+# Пресеты
+# ══════════════════════════════════════════════════════════
+def _load_presets() -> Dict[str, List[dict]]:
+    """Записанные отпечатки, сгруппированные по ОС."""
     try:
-        if proxy_server:
-            handler = urllib.request.ProxyHandler(
-                {"http": proxy_server, "https": proxy_server}
-            )
-        else:
-            handler = urllib.request.ProxyHandler({})
-        opener = urllib.request.build_opener(handler)
-        url = "http://ip-api.com/json/?fields=status,countryCode,timezone,lat,lon,query"
-        with opener.open(url, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        if data.get("status") != "success":
-            logger.warning(f"[fingerprint] geoip: {data}")
-            return None
-        tz = data.get("timezone") or ""
-        cc = (data.get("countryCode") or "").upper()
-        result = {
-            "timezone": tz,
-            "locale": LOCALE_BY_COUNTRY.get(cc, "en-US"),
-            "lat": data.get("lat"),
-            "lon": data.get("lon"),
-            "ip": data.get("query"),
-            "country": cc,
-        }
-        _GEO_CACHE[key] = (result, time.time())
-        logger.info(
-            f"[fingerprint] geoip: ip={result['ip']} {cc} "
-            f"tz={tz} locale={result['locale']}"
-        )
-        return result
+        from camoufox.fingerprints import load_presets
+        data = load_presets() or {}
+        presets = data.get("presets") or {}
+        return {k: list(v) for k, v in presets.items() if isinstance(v, list)}
     except Exception as e:
-        logger.warning(f"[fingerprint] geoip не сработал: {e}")
+        logger.error(f"[fingerprint] не удалось загрузить пресеты: {e}")
+        return {}
+
+
+def preset_signature(preset: dict) -> str:
+    """
+    Короткий хеш личности. Два пресета с одинаковой сигнатурой
+    неразличимы для сайта — их нельзя давать разным профилям.
+    """
+    try:
+        key = json.dumps(
+            {
+                "n": preset.get("navigator", {}),
+                "s": preset.get("screen", {}),
+                "w": preset.get("webgl", {}),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+    except Exception:
+        key = str(preset)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def available_presets(os_name: str = "windows") -> List[dict]:
+    """Все пресеты для ОС (с дублями — для подсчёта ёмкости)."""
+    return _load_presets().get(os_name, [])
+
+
+def unique_preset_count(os_name: str = "windows") -> int:
+    """Сколько РАЗНЫХ личностей доступно для этой ОС."""
+    seen = set()
+    for p in available_presets(os_name):
+        seen.add(preset_signature(p))
+    return len(seen)
+
+
+def pick_identity_preset(
+    os_name: str = "windows",
+    used_signatures: Optional[set] = None,
+) -> Optional[dict]:
+    """
+    Выбирает записанный отпечаток, по возможности не совпадающий
+    с уже занятыми профилями.
+
+    used_signatures — сигнатуры личностей, уже выданных другим профилям.
+    Если все уникальные заняты, начинается повторное использование
+    (лучше повторить личность, чем выдать синтетическую).
+    """
+    presets = available_presets(os_name)
+    if not presets:
+        logger.error(f"[fingerprint] нет пресетов для ОС '{os_name}'")
         return None
 
+    used = set(used_signatures or ())
 
-resolve_geo_via_proxy = resolve_geo
+    # 1) сначала — только уникальные и не занятые
+    seen = set()
+    fresh = []
+    for p in presets:
+        sig = preset_signature(p)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        if sig not in used:
+            fresh.append(p)
+
+    if fresh:
+        return random.choice(fresh)
+
+    # 2) все уникальные заняты — берём наименее используемую сигнатуру
+    unique = []
+    seen = set()
+    for p in presets:
+        sig = preset_signature(p)
+        if sig not in seen:
+            seen.add(sig)
+            unique.append(p)
+    logger.warning(
+        f"[fingerprint] уникальные личности для '{os_name}' закончились "
+        f"({len(unique)} шт.), начинаю повторное использование"
+    )
+    return random.choice(unique)
 
 
-def derive_fingerprint(fp_cfg: dict, proxy_server: str = "") -> dict:
-    """
-    Возвращает словарь параметров для Camoufox.
-    Camoufox сам применяет их на уровне C++.
-    """
-    seed = int(fp_cfg.get("seed") or 1)
-    platform = fp_cfg.get("platform", "windows")
-
-    geo = None
-    if "auto" in (fp_cfg.get("timezone"), fp_cfg.get("locale"),
-                  fp_cfg.get("geolocation")):
-        geo = resolve_geo(proxy_server)
-
-    scr = fp_cfg.get("screen")
-    screen = None
-    if isinstance(scr, dict) and scr.get("width"):
-        screen = {"width": int(scr["width"]), "height": int(scr["height"])}
-
-    wgl = fp_cfg.get("webgl")
-    webgl = None
-    if isinstance(wgl, dict) and wgl.get("renderer"):
-        webgl = {"vendor": wgl.get("vendor", "Google Inc."),
-                 "renderer": wgl["renderer"]}
-
-    tz_cfg = fp_cfg.get("timezone", "system")
-    if tz_cfg == "auto":
-        timezone = (geo or {}).get("timezone") or None
-        if not timezone:
-            logger.warning("[fingerprint] timezone=auto, но geoip недоступен")
-    elif tz_cfg in ("system", "", None):
-        timezone = None
-    else:
-        timezone = tz_cfg
-
-    loc_cfg = fp_cfg.get("locale", "system")
-    if loc_cfg == "auto":
-        locale = (geo or {}).get("locale") or None
-    elif loc_cfg in ("system", "", None):
-        locale = None
-    else:
-        locale = loc_cfg
-
-    ua = (fp_cfg.get("user_agent") or "").strip()
-
-    fp = {
-        "seed": seed,
-        "platform": platform,
-        "user_agent": ua,
-        "ua_override": bool(ua),
-        "timezone": timezone,
-        "locale": locale,
-        "geo_mode": fp_cfg.get("geolocation", "default"),
-        "geo_lat": (geo or {}).get("lat") if fp_cfg.get("geolocation") == "auto" else None,
-        "geo_lon": (geo or {}).get("lon") if fp_cfg.get("geolocation") == "auto" else None,
-        "screen": screen,
-        "webgl": webgl,
-        "canvas": fp_cfg.get("canvas", "real"),
-        "audio": fp_cfg.get("audio", "real"),
-        "client_rects": fp_cfg.get("client_rects", "real"),
-        "speech_voices": fp_cfg.get("speech_voices", "real"),
-        "cpu_cores": fp_cfg.get("cpu_cores") if isinstance(fp_cfg.get("cpu_cores"), int) else None,
-        "ram_gb": fp_cfg.get("ram_gb") if isinstance(fp_cfg.get("ram_gb"), int) else None,
-        "webrtc": fp_cfg.get("webrtc", "proxy_only"),
-        "dnt": fp_cfg.get("dnt", "default"),
-        "hardware_accel": fp_cfg.get("hardware_accel", True),
-        # Camoufox-специфичные флаги
-        "camoufox_overrides": {},
+def preset_summary(preset: Optional[dict]) -> dict:
+    """Человекочитаемая карточка личности для UI."""
+    if not preset:
+        return {}
+    nav = preset.get("navigator", {}) or {}
+    scr = preset.get("screen", {}) or {}
+    wgl = preset.get("webgl", {}) or {}
+    return {
+        "os": nav.get("platform", "—"),
+        "user_agent": nav.get("userAgent", "—"),
+        "cpu_cores": nav.get("hardwareConcurrency"),
+        "touch_points": nav.get("maxTouchPoints"),
+        "screen": (
+            f"{scr.get('width')}×{scr.get('height')}"
+            if scr.get("width") else "—"
+        ),
+        "dpr": scr.get("devicePixelRatio", 1),
+        "color_depth": scr.get("colorDepth"),
+        "gpu_vendor": wgl.get("unmaskedVendor", "—"),
+        "gpu_renderer": wgl.get("unmaskedRenderer", "—"),
+        "voices": len(preset.get("speechVoices") or []),
+        "signature": preset_signature(preset),
     }
-    if isinstance(fp_cfg.get("geolocation"), dict):
-        fp["geo_mode"] = "coords"
-        fp["geo_lat"] = fp_cfg["geolocation"].get("lat")
-        fp["geo_lon"] = fp_cfg["geolocation"].get("lon")
-
-    # Оверрайды для Camoufox (применяются в движке)
-    overrides = {}
-    if fp["cpu_cores"]:
-        overrides["navigator.hardwareConcurrency"] = fp["cpu_cores"]
-    if fp["ram_gb"]:
-        overrides["navigator.deviceMemory"] = fp["ram_gb"]
-    if screen:
-        overrides["screen.width"] = screen["width"]
-        overrides["screen.height"] = screen["height"]
-    fp["camoufox_overrides"] = overrides
-
-    # Предупреждение о палимых оверрайдах
-    risky = []
-    if fp["cpu_cores"] or fp["ram_gb"]:
-        risky.append("CPU/RAM")
-    if webgl:
-        risky.append("WebGL")
-    if risky:
-        fp["risk_warning"] = "; ".join(risky)
-
-    return fp
 
 
-def build_chromium_args(fp: dict, has_proxy: bool = False) -> list:
-    """Для fallback на Chromium (если Camoufox не запустится)."""
-    args = ["--no-first-run", "--no-default-browser-check"]
-    scr = fp.get("screen")
-    if isinstance(scr, dict) and scr.get("width"):
-        args.append(f"--window-size={scr['width']},{scr['height']}")
+# ══════════════════════════════════════════════════════════
+# Параметры запуска Camoufox
+# ══════════════════════════════════════════════════════════
+def build_launch_kwargs(cfg: dict) -> dict:
+    """
+    Собирает kwargs для AsyncCamoufox из конфига профиля.
+
+    Возвращает только «безопасные» настройки: личность берётся
+    из пресета целиком, а прокси/гео/WebRTC — из конфига.
+    """
+    identity = cfg.get("identity") or {}
+    fp = cfg.get("fingerprint") or {}
+    proxy_cfg = cfg.get("proxy") or {}
+
+    os_name = identity.get("os") or fp.get("platform") or "windows"
+    preset = identity.get("preset")
+
+    kwargs: dict = {
+        "os": os_name,
+        "headless": bool(cfg.get("headless", False)),
+        "humanize": True,              # человекоподобные движения мыши/клавиатуры
+        "i_know_what_im_doing": True,  # мы сознательно фиксируем отпечаток
+        # Держим число ядер ровно как в пресете, иначе движок подставит
+        # ядра хоста и личность рассыплется (проверено: 6 -> 12 без флага)
+        "pin_cpu_cores": True,
+    }
+
+    if preset:
+        kwargs["fingerprint_preset"] = preset
     else:
-        args.append("--start-maximized")
-    if has_proxy and fp.get("webrtc") == "proxy_only":
-        args += [
-            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-            "--enforce-webrtc-ip-permission-check",
-        ]
-    if not fp.get("hardware_accel", True):
-        args.append("--disable-gpu")
-    return args
+        logger.warning(
+            "[fingerprint] у профиля нет пресета — Camoufox сгенерирует "
+            "новый отпечаток при каждом запуске (нестабильная личность)"
+        )
+
+    # ── Прокси ──
+    server = (proxy_cfg.get("server") or "").strip()
+    if server:
+        proxy = {"server": server}
+        user = (proxy_cfg.get("username") or "").strip()
+        if user:
+            proxy["username"] = user
+            proxy["password"] = proxy_cfg.get("password") or ""
+        kwargs["proxy"] = proxy
+
+    # ── Геолокация / язык / таймзона ──
+    geo_mode = fp.get("geo_mode", GEO_AUTO)
+    if geo_mode == GEO_AUTO:
+        # Camoufox сам определит таймзону, локаль и координаты по IP
+        # (через прокси, если он задан) — это самый согласованный вариант
+        kwargs["geoip"] = True
+    elif geo_mode == GEO_MANUAL:
+        tz = (fp.get("timezone") or "").strip()
+        if tz and tz != "system":
+            kwargs["timezone"] = tz
+        loc = (fp.get("locale") or "").strip()
+        if loc and loc != "system":
+            kwargs["locale"] = loc
+
+    # ── WebRTC ──
+    # block_webrtc полностью выключает media.peerconnection — сайт
+    # не может узнать локальный IP в обход прокси
+    if fp.get("webrtc", "block") in ("block", "proxy_only"):
+        kwargs["block_webrtc"] = True
+
+    return kwargs
+
+
+def describe_geo_risk(geo_mode: str, has_proxy: bool) -> Optional[str]:
+    """Предупреждение о рассогласовании гео и IP (для UI)."""
+    if geo_mode == GEO_DEFAULT and has_proxy:
+        return (
+            "Гео не переопределяется: таймзона и язык останутся системными "
+            "и могут не совпасть с IP прокси."
+        )
+    if geo_mode == GEO_MANUAL and has_proxy:
+        return (
+            "Ручная таймзона/язык: убедитесь, что они совпадают со страной прокси, "
+            "иначе это признак подмены."
+        )
+    return None

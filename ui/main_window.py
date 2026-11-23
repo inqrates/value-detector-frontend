@@ -401,7 +401,7 @@ class MainWindow(QMainWindow):
                 "sport": payload.get('sport', 'table_tennis'),
                 "fast_phase": payload.get('fast_phase', ''),
                 "tournament": payload.get('tournament', ''),
-                "match_url": payload.get('match_url', ''),
+                # ── БЕЗОПАСНОСТЬ: match_url НЕ логируем (ссылка на БК) ──
                 "fast_score": payload.get('fast_score', payload.get('score', [0, 0])),
                 "fast_sub_score": payload.get('fast_sub_score', payload.get('sub_score', [0, 0])),
                 "fast_odds": payload.get('fast_odds', [0, 0]),

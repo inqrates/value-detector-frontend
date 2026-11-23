@@ -2,16 +2,44 @@
 Конфиг fast-профиля для live-value стратегии.
 Хранится в %APPDATA%/ValueDetectorPro/fast_config.json.
 Пользователь вводит только Profile ID — всё остальное система делает сама.
+
+Cookies хранятся в зашифрованном виде (%APPDATA%/fast_cookies/*.enc).
 """
 import json
 import logging
 import os
 import time
+import hashlib
+import base64
+import glob
 from typing import Optional, List, Dict
 
 from ui.paths import get_app_data_dir
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# Ключ шифрования cookies (локальный мастер-ключ через DPAPI)
+# ============================================================
+def _derive_cookies_key() -> bytes:
+    """
+    Возвращает Fernet-ключ из локального мастер-ключа (DPAPI).
+    Секрета в коде НЕТ — ключ хранится в %APPDATA%\\.key.
+    """
+    from ui.secure_key import get_fernet_key
+    return get_fernet_key()
+
+def _encrypt_cookies(data: str) -> bytes:
+    """Шифрует JSON-строку cookies."""
+    from cryptography.fernet import Fernet
+    f = Fernet(_derive_cookies_key())
+    return f.encrypt(data.encode("utf-8"))
+
+def _decrypt_cookies(raw: bytes) -> str:
+    """Расшифровывает cookies из bytes."""
+    from cryptography.fernet import Fernet
+    f = Fernet(_derive_cookies_key())
+    return f.decrypt(raw).decode("utf-8")
 
 # ============================================================
 # Список всех fast БК (фиксированный, не настраивается)
@@ -52,9 +80,17 @@ def _cookies_dir() -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
-def cookies_path(bk: str) -> str:
-    """Путь к файлу cookies для БК."""
+def cookies_path_encrypted(bk: str) -> str:
+    """Путь к зашифрованному файлу cookies."""
+    return os.path.join(_cookies_dir(), f"{bk.lower()}.enc")
+
+def cookies_path_plaintext(bk: str) -> str:
+    """Путь к старому plaintext-файлу (для миграции)."""
     return os.path.join(_cookies_dir(), f"{bk.lower()}.json")
+
+def cookies_path(bk: str) -> str:
+    """Возвращает зашифрованный путь (с поддержкой миграции)."""
+    return cookies_path_encrypted(bk)
 
 # ============================================================
 # Загрузка / сохранение конфига
@@ -137,29 +173,71 @@ def bks_without_cookies() -> List[str]:
     return [bk for bk, meta in FAST_BKS_ALL.items() if not meta.get("needs_cookies")]
 
 # ============================================================
-# Cookies: сохранение / загрузка / возраст
+# Cookies: шифрованное сохранение / загрузка / возраст
 # ============================================================
 def save_cookies(bk: str, cookies: list) -> None:
+    """Сохраняет cookies в зашифрованном виде."""
     try:
-        with open(cookies_path(bk), "w", encoding="utf-8") as f:
-            json.dump({"cookies": cookies}, f, ensure_ascii=False, indent=2)
-        logger.info(f"[fast_cookies] {bk}: сохранено {len(cookies)} cookies")
+        json_data = json.dumps({"cookies": cookies}, ensure_ascii=False, indent=2)
+        encrypted = _encrypt_cookies(json_data)
+        
+        enc_path = cookies_path_encrypted(bk)
+        with open(enc_path, "wb") as f:
+            f.write(encrypted)
+        
+        # Удаляем старый plaintext-файл если есть
+        old_path = cookies_path_plaintext(bk)
+        if os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except Exception:
+                pass
+        
+        logger.info(f"[fast_cookies] {bk}: сохранено {len(cookies)} cookies (encrypted)")
     except Exception as e:
         logger.error(f"[fast_cookies] {bk}: {e}")
 
 def load_cookies(bk: str) -> list:
-    p = cookies_path(bk)
-    if not os.path.exists(p):
-        return []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f).get("cookies", [])
-    except Exception:
-        return []
+    """Загружает cookies с поддержкой миграции (шифрованные → plaintext)."""
+    enc_path = cookies_path_encrypted(bk)
+    old_path = cookies_path_plaintext(bk)
+    
+    cookies_data = None
+    
+    # 1) Пробуем зашифрованный файл
+    if os.path.exists(enc_path):
+        try:
+            with open(enc_path, "rb") as f:
+                raw = f.read()
+            decrypted = _decrypt_cookies(raw)
+            data = json.loads(decrypted)
+            cookies_data = data.get("cookies", [])
+        except Exception as e:
+            logger.warning(f"[fast_cookies] {bk}: не удалось расшифровать: {e}")
+            cookies_data = None
+    
+    # 2) Fallback: старый plaintext
+    if cookies_data is None and os.path.exists(old_path):
+        try:
+            with open(old_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cookies_data = data.get("cookies", [])
+            # Мигрируем в зашифрованный формат
+            save_cookies(bk, cookies_data)
+            logger.info(f"[fast_cookies] {bk}: мигрировано из plaintext")
+        except Exception as e:
+            logger.warning(f"[fast_cookies] {bk}: не удалось прочитать plaintext: {e}")
+            cookies_data = []
+    
+    return cookies_data or []
 
 def cookies_age_hours(bk: str) -> Optional[float]:
     """Сколько часов назад сняли cookies. None если файла нет."""
-    p = cookies_path(bk)
+    enc_path = cookies_path_encrypted(bk)
+    old_path = cookies_path_plaintext(bk)
+    
+    # Проверяем зашифрованный файл
+    p = enc_path if os.path.exists(enc_path) else old_path
     if not os.path.exists(p):
         return None
     try:

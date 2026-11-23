@@ -2,6 +2,7 @@
 import hashlib
 import uuid
 import winreg
+import os
 import requests
 import wmi
 from PyQt5.QtWidgets import (
@@ -17,25 +18,90 @@ from ui.config_loader import load_config
 
 # ---- Функция получения HWID ----
 def get_hwid() -> str:
-    """Собирает уникальный идентификатор железа."""
+    """
+    Собирает уникальный идентификатор железа из множества источников.
+    
+    Источники (чем больше — тем уникальнее):
+      1. Серийный номер диска C:
+      2. CPU ProcessorId
+      3. MAC-адрес
+      4. ProductID Windows
+      5. ComputerName
+      6. BIOS Serial Number
+      7. GUID установки Windows
+    
+    Хэшируется в SHA-256 — необратимо.
+    """
+    parts = []
+
+    # 1) Серийный номер диска C:
     try:
         c = wmi.WMI()
         disk = c.Win32_LogicalDisk(DeviceID="C:")[0]
-        volume_serial = disk.VolumeSerialNumber
-        cpu = c.Win32_Processor()[0].ProcessorId
-        mac = uuid.getnode()
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
-        product_id = winreg.QueryValueEx(key, "ProductId")[0]
-        data = f"{volume_serial}{cpu}{mac}{product_id}".encode()
-        return hashlib.sha256(data).hexdigest()
+        parts.append(disk.VolumeSerialNumber or "")
     except Exception:
-        # Безопасный fallback — не используем volume_serial,
-        # т.к. он может быть не определён
+        parts.append("")
+
+    # 2) CPU ProcessorId
+    try:
+        c = wmi.WMI()
+        proc = c.Win32_Processor()[0]
+        parts.append(proc.ProcessorId or "")
+    except Exception:
+        parts.append("")
+
+    # 3) MAC-адрес
+    try:
+        parts.append(str(uuid.getnode()))
+    except Exception:
+        parts.append("0")
+
+    # 4) ProductID Windows
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        )
+        product_id = winreg.QueryValueEx(key, "ProductId")[0]
+        parts.append(product_id)
+    except Exception:
+        parts.append("")
+
+    # 5) Имя компьютера
+    try:
+        parts.append(os.environ.get("COMPUTERNAME", ""))
+    except Exception:
+        parts.append("")
+
+    # 6) BIOS Serial Number
+    try:
+        c = wmi.WMI()
+        bios = c.Win32_BIOS()[0]
+        parts.append(bios.SerialNumber.strip() or "")
+    except Exception:
+        parts.append("")
+
+    # 7) GUID установки Windows (unique per install, survives reinstall if disk intact)
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography"
+        )
+        guid = winreg.QueryValueEx(key, "MachineGuid")[0]
+        parts.append(guid)
+    except Exception:
+        parts.append("")
+
+    # Безопасный fallback — хотя бы MAC
+    if all(p == "" for p in parts):
         try:
             mac = uuid.getnode()
         except Exception:
             mac = 0
         return hashlib.sha256(f"fallback-{mac}".encode()).hexdigest()
+
+    data = "|".join(parts).encode()
+    return hashlib.sha256(data).hexdigest()
 
 
 class LoginWindow(QWidget):
@@ -247,11 +313,26 @@ class LoginWindow(QWidget):
             backend_url = config.get('backend_url', 'http://localhost:8000')
 
             hwid = get_hwid()
+
+            # ── Защита от MITM: доверяем только нашему CA (certs/ca.pem) ──
+            # Если ca.pem не найден — используем системные CA.
+            try:
+                from ui.ssl_cert import build_requests_verify
+                verify_target = build_requests_verify()
+            except Exception:
+                verify_target = True
+
             response = requests.post(
                 f"{backend_url}/auth/login",
                 json={"login": login, "password": password, "hwid": hwid},
-                timeout=5
+                timeout=5,
+                headers={
+                    "User-Agent": "ValueDetectorPro/1.0",
+                    "Content-Type": "application/json",
+                },
+                verify=verify_target,
             )
+            response.raise_for_status()  # Бросит HTTPError для 4xx/5xx
             data = response.json()
             if data.get("success"):
                 user_data = data.get("user", {})
@@ -261,6 +342,20 @@ class LoginWindow(QWidget):
                     days_left=user_data.get("days_left", 30),
                     days_total=user_data.get("days_total", 30),
                 )
+
+                # ── Сохраняем JWT токены ──
+                access_token = data.get("access_token", "")
+                refresh_token = data.get("refresh_token", "")
+                if access_token:
+                    try:
+                        from ui.session_store import save_session_tokens
+                        save_session_tokens(
+                            login=user_session.login,
+                            access_token=access_token,
+                            refresh_token=refresh_token,
+                        )
+                    except Exception as e:
+                        print(f"[!] Не удалось сохранить JWT: {e}")
 
                 # ── Сохраняем сессию если «Запомнить меня» ──
                 if self.remember_cb.isChecked():
@@ -273,7 +368,7 @@ class LoginWindow(QWidget):
                             days_total=user_session.days_total,
                         )
                     except Exception as e:
-                        print(f"⚠️ Не удалось сохранить сессию: {e}")
+                        print(f"[!] Не удалось сохранить сессию: {e}")
 
                 self.error_label.hide()
                 self.login_success.emit()
@@ -283,6 +378,13 @@ class LoginWindow(QWidget):
                 self.error_label.show()
         except requests.exceptions.ConnectionError:
             self.error_label.setText("Не удалось подключиться к серверу")
+            self.error_label.show()
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response else "?"
+            self.error_label.setText(f"Ошибка сервера: {code}")
+            self.error_label.show()
+        except requests.exceptions.Timeout:
+            self.error_label.setText("Таймаут подключения к серверу")
             self.error_label.show()
         except Exception as e:
             self.error_label.setText(f"Ошибка: {str(e)}")
