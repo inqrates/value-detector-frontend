@@ -47,12 +47,15 @@ class PatchrightBrowser:
 
         try:
             from camoufox.async_api import AsyncCamoufox
-        except ImportError:
+        except ImportError as exc:
+            # В релизной сборке Camoufox — встроенный компонент, а не
+            # зависимость, которую пользователь должен ставить через pip.
+            logger.exception("Не удалось загрузить встроенный компонент Camoufox")
             raise RuntimeError(
-                "camoufox не установлен. Выполните:\n"
-                "  pip install camoufox\n"
-                "  python -m camoufox fetch"
-            )
+                "Не удалось загрузить компонент браузера. "
+                "Перезапустите приложение; если ошибка повторится, "
+                "переустановите приложение или обратитесь в поддержку."
+            ) from exc
 
         # ── Параметры запуска: личность из пресета + прокси/гео/WebRTC ──
         launch_kwargs = build_launch_kwargs(config)

@@ -178,6 +178,18 @@ def build_exe() -> Path:
     src = STAGING / "dist" / "ValueDetector"
     if not src.is_dir():
         raise RuntimeError(f"нет результата: {src}")
+
+    # Camoufox использует динамические импорты, которые PyInstaller не всегда
+    # видит по графу зависимостей. Не выпускаем сборку, где остались только
+    # metadata пакета без модуля, иначе EXE выдаст пользователю ложное
+    # сообщение, что Camoufox не установлен.
+    camoufox_api = src / "_internal" / "camoufox" / "async_api.py"
+    if not camoufox_api.is_file():
+        raise RuntimeError(
+            "в сборку не попал camoufox/async_api.py; "
+            "проверьте ValueDetector.spec и окружение сборки"
+        )
+
     dst = DIST / "ValueDetector"
     if dst.exists():
         shutil.rmtree(dst)

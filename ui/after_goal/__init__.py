@@ -10,6 +10,7 @@ from .betcity import BetcityHandler
 from .marathon import MarathonHandler
 from .zenit import ZenitHandler
 from .sportbet import SportbetHandler
+from .onewin import OnewinHandler
 
 __all__ = [
     "BookmakerHandler",
@@ -23,4 +24,5 @@ __all__ = [
     "ZenitHandler",
     "SportbetHandler",
     "PariHandler",
+    "OnewinHandler",
 ]

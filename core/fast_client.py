@@ -34,6 +34,8 @@ from ui.after_goal.marathon import MarathonHandler
 from ui.after_goal.sportbet import SportbetHandler
 from ui.after_goal.fonbet import FonbetHandler
 from ui.after_goal.pari import PariHandler
+from ui.after_goal import onewin as _onewin
+from ui.after_goal.onewin import OnewinHandler
 
 logger = logging.getLogger(__name__)
 
@@ -1915,6 +1917,366 @@ class WinlineFastClient(FastOddsClient):
 
 
 # ════════════════════════════════════════════════════════════
+# Onewin — WS Socket.IO push-server-v2, разбор в OnewinHandler
+# ════════════════════════════════════════════════════════════
+class OnewinFastClient(FastOddsClient):
+    """
+    Прямое WS-подключение к api-gateway.top-parser.com/push-server-v2
+    (Engine.IO v4 / Socket.IO) — без браузера.
+
+    Транспорт здесь, РАЗБОР общий с браузерным хендлером: на каждый
+    match_id держим экземпляр OnewinHandler и кормим его сырыми
+    пакетами через feed_frame(). Если 1win поменяет формат групп —
+    правим один файл, ui/after_goal/onewin.py.
+
+    Подписка точечная: только те matchId, что запросил движок
+    (match_state бекенда). На подписку сервер шлёт *-snapshot,
+    дальше — инкременты.
+
+    Куки нужны для авторизации WS (см. parsers/onewin_api.py бекенда) —
+    берём из cookies/onewin.json, их обновляет fast_cookie_collector.
+    """
+
+    bk = "onewin"
+
+    WS_URL = _onewin.WS_URL
+    ORIGIN = _onewin.SITE_ORIGIN
+    USER_AGENT = _onewin.USER_AGENT
+
+    WS_RECONNECT_DELAY = 2.0
+    WS_RECONNECT_DELAY_MAX = 30.0
+    HANDSHAKE_TIMEOUT = 10.0
+    SILENCE_RECONNECT = 90.0      # тишина по всем матчам → реконнект
+    SNAPSHOT_WAIT = 4.0           # сколько ждём snapshot после подписки
+    MATCH_STALE = 120.0           # кадр по матчу древнее → данные не годятся
+    HANDLER_TTL = 1800.0          # матч не трогаем 30 мин → выбрасываем
+    MAX_HANDLERS = 24
+    SUBSCRIBE_BATCH = 50
+
+    def __init__(self):
+        super().__init__(timeout=15.0)
+        self._ws = None
+        self._ws_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # {match_id: OnewinHandler}
+        self._handlers: Dict[str, OnewinHandler] = {}
+        # {match_id: когда движок последний раз просил этот матч}
+        self._touched_at: Dict[str, float] = {}
+        self._subscribed: set = set()
+        self._cookie_header = ""
+        self._connected = False
+        self._last_frame_at = 0.0
+
+    # ── жизненный цикл ──
+    async def start(self):
+        if self._ws_task and not self._ws_task.done():
+            return
+        self._cookie_header = self._build_cookie_header()
+        self._ws_task = asyncio.create_task(self._ws_loop())
+        self._watchdog_task = asyncio.create_task(self._silence_watchdog())
+        # Ждём handshake, чтобы первый get_markets не вернул None
+        for _ in range(20):
+            if self._connected:
+                break
+            await asyncio.sleep(0.25)
+
+    async def stop(self):
+        for task in (self._watchdog_task, self._ws_task):
+            if task and not task.done():
+                task.cancel()
+        self._ws_task = None
+        self._watchdog_task = None
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+        self._connected = False
+        self._subscribed.clear()
+        self._touched_at.clear()
+        self._handlers.clear()
+
+    def _build_cookie_header(self) -> str:
+        try:
+            from core.fast_config import load_cookies
+            cookies = load_cookies("onewin")
+        except Exception as e:
+            logger.warning(f"[onewin_fast] cookies: {e}")
+            return ""
+        pairs = [f"{c['name']}={c['value']}" for c in cookies
+                 if c.get("name") and c.get("value")]
+        if not pairs:
+            logger.warning(
+                "[onewin_fast] 🍪 cookies пусты — WS может не авторизоваться"
+            )
+        else:
+            logger.info(f"[onewin_fast] 🍪 отобрано {len(pairs)} cookies")
+        return "; ".join(pairs)
+
+    # ── базовые заглушки: HTTP-пути по именам у onewin нет ──
+    async def _build_session(self):
+        return None
+
+    async def _fetch_raw(self):
+        return None
+
+    def _find_match(self, raw, p1, p2):
+        return None
+
+    def _parse(self, raw, event):
+        return None
+
+    # ── WS ──
+    async def _ws_loop(self):
+        delay = self.WS_RECONNECT_DELAY
+        while True:
+            try:
+                await self._connect_and_listen()
+                delay = self.WS_RECONNECT_DELAY
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug(
+                    f"[onewin_fast] WS: {type(e).__name__}: {e}"
+                )
+                delay = min(delay * 2, self.WS_RECONNECT_DELAY_MAX)
+            self._ws = None
+            self._connected = False
+            await asyncio.sleep(delay)
+
+    async def _connect_and_listen(self):
+        headers = [
+            ("User-Agent", self.USER_AGENT),
+            ("Origin", self.ORIGIN),
+            ("Referer", f"{self.ORIGIN}/"),
+            ("Accept-Language", "ru-RU,ru;q=0.9"),
+            ("Sec-WebSocket-Extensions",
+             "permessage-deflate; client_max_window_bits"),
+        ]
+        if self._cookie_header:
+            headers.append(("Cookie", self._cookie_header))
+
+        logger.info("[onewin_fast] 🔌 WS подключаемся...")
+        # ping_interval=None — Engine.IO v4 пингует сам (пакет "2" → "3")
+        async with websockets.connect(
+            self.WS_URL,
+            additional_headers=headers,
+            max_size=50 * 1024 * 1024,
+            ping_interval=None,
+            ping_timeout=None,
+            close_timeout=5,
+            open_timeout=15,
+        ) as ws:
+            self._ws = ws
+
+            # 1. open-пакет "0{...}"
+            open_pkt = self._to_text(
+                await asyncio.wait_for(ws.recv(), self.HANDSHAKE_TIMEOUT)
+            )
+            if not open_pkt.startswith("0"):
+                raise RuntimeError(f"первый пакет не open: {open_pkt[:80]!r}")
+
+            # 2. CONNECT namespace "/" → "40"
+            await ws.send("40")
+
+            # 3. подтверждение "40{...sid...}"
+            ack = self._to_text(
+                await asyncio.wait_for(ws.recv(), self.HANDSHAKE_TIMEOUT)
+            )
+            if ack.startswith("44"):
+                raise RuntimeError(f"Socket.IO connect_error: {ack[:150]!r}")
+            if not ack.startswith("40"):
+                logger.warning(
+                    f"[onewin_fast] ⚠️ ожидался '40...', получено {ack[:80]!r}"
+                )
+
+            self._connected = True
+            self._last_frame_at = time.time()
+            logger.info("[onewin_fast] 🤝 Socket.IO сессия установлена")
+
+            # Новая сессия → старые кэши невалидны, переподписываемся
+            self._subscribed.clear()
+            for handler in self._handlers.values():
+                handler.reset_caches()
+            await self._resubscribe_all()
+
+            async for message in ws:
+                await self._on_text(self._to_text(message))
+
+    @staticmethod
+    def _to_text(message) -> str:
+        if isinstance(message, (bytes, bytearray)):
+            return bytes(message).decode("utf-8", errors="replace")
+        return str(message)
+
+    async def _on_text(self, msg: str):
+        self._last_frame_at = time.time()
+
+        if msg.startswith("2"):          # серверный ping → pong
+            try:
+                await self._ws.send("3")
+            except Exception:
+                pass
+            return
+        if msg.startswith("44"):
+            logger.error(f"[onewin_fast] ❌ connect_error: {msg[:200]}")
+            return
+        if not msg.startswith("42"):     # 0/40/3/41 — служебные
+            return
+
+        for handler in list(self._handlers.values()):
+            try:
+                handler.feed_frame(msg)
+            except Exception as e:
+                logger.debug(f"[onewin_fast] feed_frame: {e}")
+
+    async def _resubscribe_all(self):
+        ids = sorted(self._handlers.keys())
+        for i in range(0, len(ids), self.SUBSCRIBE_BATCH):
+            await self._subscribe(ids[i:i + self.SUBSCRIBE_BATCH])
+
+    async def _subscribe(self, match_ids: List[str]) -> bool:
+        ws = self._ws
+        if ws is None or not self._connected:
+            return False
+        batch = [int(x) for x in match_ids if str(x).isdigit()]
+        if not batch:
+            return False
+        ids_json = json.dumps(batch, separators=(",", ":"))
+        try:
+            await ws.send(
+                '42["subscribe",{"messageType":"subscribe-match-info",'
+                f'"data":{{"matchIds":{ids_json}}}}}]'
+            )
+            await ws.send(
+                '42["subscribe",{"messageType":"subscribe-match-odds",'
+                f'"data":{{"matchIds":{ids_json},"isBaseOddsGroups":true}}}}]'
+            )
+        except Exception as e:
+            logger.debug(f"[onewin_fast] subscribe {batch}: {e}")
+            return False
+        self._subscribed.update(str(x) for x in batch)
+        logger.info(f"[onewin_fast] ✅ подписка: {batch}")
+        return True
+
+    async def _silence_watchdog(self):
+        while True:
+            try:
+                await asyncio.sleep(10.0)
+                await self._check_silence()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug(f"[onewin_fast] watchdog: {e}")
+
+    async def _check_silence(self) -> bool:
+        """
+        Тишина дольше SILENCE_RECONNECT — соединение, скорее всего
+        живое, но мёртвое (сервер перестал слать данные). Закрываем
+        сокет: _ws_loop тут же переподключится и перепишет подписки.
+        True — сокет закрыт из-за тишины.
+        """
+        if not self._connected or self._ws is None:
+            return False
+        silence = time.time() - self._last_frame_at
+        if silence > self.SILENCE_RECONNECT:
+            logger.warning(
+                f"[onewin_fast] ⏱ тишина {silence:.0f}с — переподключаюсь"
+            )
+            self._last_frame_at = time.time()
+            await self._ws.close()
+            return True
+        return False
+
+    # ── кэш хендлеров ──
+    def _get_handler(self, match_id: str) -> OnewinHandler:
+        handler = self._handlers.get(match_id)
+        if handler is None:
+            handler = OnewinHandler(target_match_id=match_id)
+            handler._emit_enabled = False
+            self._handlers[match_id] = handler
+        self._touched_at[match_id] = time.time()
+        if len(self._handlers) > self.MAX_HANDLERS:
+            self._evict_handlers()
+        return handler
+
+    def _evict_handlers(self):
+        """
+        Память под контролем: режем матчи, которыми движок давно не
+        интересовался. По _last_frame_at хендлера судить нельзя — у
+        только что созданного он нулевой, и мы бы выбросили его же.
+        """
+        now = time.time()
+        for mid in [m for m, t in self._touched_at.items()
+                    if now - t > self.HANDLER_TTL]:
+            self._handlers.pop(mid, None)
+            self._touched_at.pop(mid, None)
+            self._subscribed.discard(mid)
+
+        overflow = len(self._handlers) - self.MAX_HANDLERS
+        if overflow <= 0:
+            return
+        by_age = sorted(self._touched_at.items(), key=lambda kv: kv[1])
+        for mid, _t in by_age[:overflow]:
+            self._handlers.pop(mid, None)
+            self._touched_at.pop(mid, None)
+            self._subscribed.discard(mid)
+
+    # ── публичный API ──
+    async def get_markets_by_native_id(self, native_id) -> Optional[Dict]:
+        await self.start()
+        mid = str(native_id or "").strip()
+        if not mid.isdigit():
+            logger.debug(f"[onewin_fast] native_id не число: {native_id!r}")
+            return None
+
+        handler = self._get_handler(mid)
+
+        if mid not in self._subscribed:
+            if await self._subscribe([mid]):
+                # Ждём match-info + match-odds snapshot
+                deadline = time.time() + self.SNAPSHOT_WAIT
+                while time.time() < deadline:
+                    if handler._match_info and handler._odds:
+                        break
+                    await asyncio.sleep(0.2)
+
+        if not handler._match_info:
+            return None
+
+        # Матч завершился → сервер по нему молчит → данные протухли
+        age = time.time() - (handler._last_frame_at or 0)
+        if age > self.MATCH_STALE:
+            logger.debug(
+                f"[onewin_fast] {mid}: последний кадр {age:.0f}с назад — "
+                f"считаю данные устаревшими"
+            )
+            return None
+
+        parsed = _strip_outcome_ids(handler.snapshot())
+        if not parsed:
+            return None
+
+        logger.debug(
+            f"[onewin_fast] {mid}: OK "
+            f"phase={parsed.get('phase_num')} "
+            f"score={parsed.get('score1')}:{parsed.get('score2')} "
+            f"sub={parsed.get('sub_score1')}:{parsed.get('sub_score2')} "
+            f"sets={list((parsed.get('set_markets') or {}).keys())}"
+        )
+        return parsed
+
+    async def get_markets(self, sport: str, p1: str, p2: str) -> Optional[Dict]:
+        """
+        По именам не ищем: WS onewin не присылает названия команд
+        (их бекенд берёт из HTTP matches/get-many). Движок и не просит —
+        match_state приходит с нативным match_id, идём через него.
+        """
+        return None
+
+
+# ════════════════════════════════════════════════════════════
 # Реестр
 # ════════════════════════════════════════════════════════════
 _CLIENTS: Dict[str, FastOddsClient] = {}
@@ -1927,6 +2289,7 @@ _CLASSES = {
     "sportbet": SportbetFastClient,
     "marathon": MarathonFastClient,
     "winline":  WinlineFastClient,
+    "onewin":   OnewinFastClient,
 }
 
 

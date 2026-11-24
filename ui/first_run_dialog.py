@@ -68,17 +68,13 @@ class _FetchWorker(QThread):
                     "Проверьте сеть и попробуйте снова.",
                 )
                 return
-            # Camoufox сам скачает браузер при первом импорте AsyncCamoufox,
-            # но мы форсируем через fetch с колбэком.
-            try:
-                from camoufox.fetcher import fetch_browser  # type: ignore[import]
-                # fetch_browser(progress_cb=...) — если есть в твоей версии
-                fetch_browser(progress_cb=lambda msg: self.progress.emit(msg))
-            except ImportError:
-                # Fallback: просто импортируем — компоненты скачаются сами
-                self.progress.emit("Скачивание компонентов...")
-                from camoufox import AsyncCamoufox  # noqa: F401
-                self.progress.emit("Проверка компонентов...")
+            # camoufox_path — публичный API Camoufox: проверяет совместимую
+            # версию браузера и скачивает её только при отсутствии. Импорта
+            # AsyncCamoufox для этого недостаточно: он сам ничего не ставит.
+            self.progress.emit("Скачивание компонентов...")
+            from camoufox.pkgman import camoufox_path
+            camoufox_path(download_if_missing=True)
+            self.progress.emit("Проверка компонентов...")
             self.done.emit(True, "Компоненты успешно установлены")
         except Exception as e:
             logger.error(f"Camoufox fetch error: {e}", exc_info=True)

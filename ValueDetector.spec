@@ -28,6 +28,9 @@ hiddenimports = [
     'curl_cffi',
     'requests',
     'websockets',
+    # camoufox.utils / camoufox.locales импортируют numpy напрямую —
+    # без него в сборке падает import camoufox.async_api
+    'numpy',
 
     # Шифрование (cookies + session)
     'cryptography',
@@ -54,7 +57,14 @@ hiddenimports = [
 # Playwright — самая капризная часть, нужны все подмодули и данные драйвера
 hiddenimports += collect_submodules('playwright')
 hiddenimports += collect_submodules('camoufox')
-hiddenimports += ['camoufox.fetcher', 'camoufox.async_api']
+hiddenimports += ['camoufox.async_api']
+# Прямые зависимости camoufox (импортируются внутри pkgman/utils/locales)
+hiddenimports += ['requests', 'rich', 'platformdirs', 'typing_extensions',
+                  'orjson', 'yaml', 'numpy', 'ua_parser', 'ua_parser_builtins']
+hiddenimports += collect_submodules('ua_parser')
+hiddenimports += collect_submodules('ua_parser_builtins')
+# language_tags (зависимость camoufox.locales) читает свои JSON-данные с диска
+hiddenimports += collect_submodules('language_tags')
 hiddenimports += collect_submodules('pyee')
 hiddenimports += collect_submodules('greenlet')
 hiddenimports += collect_submodules('websockets')
@@ -106,10 +116,15 @@ datas = []
 # Playwright driver (без этой папки браузер не запустится)
 datas += collect_data_files('playwright')
 
-# Camoufox: JSON/YAML-базы (пресеты отпечатков, шрифты, голоса, GeoIP).
-# Без fingerprint-presets.json профиль останется без личности —
-# отпечаток будет случайным при каждом запуске.
-datas += collect_data_files('camoufox')
+# Camoufox динамически импортирует часть собственных модулей при запуске.
+# collect_submodules добавляет их в PYZ, но в собранном EXE это оказалось
+# недостаточно: пакет camoufox целиком не попадал в _internal. Поэтому
+# включаем и .py-файлы пакета как данные. Это также сохраняет его JSON/YAML
+# базы (пресеты отпечатков, шрифты, голоса, GeoIP).
+datas += collect_data_files('camoufox', include_py_files=True)
+
+# language_tags (зависимость camoufox.locales) читает data/json/*.json с диска
+datas += collect_data_files('language_tags')
 
 # PyArmor runtime — как данные (pyd-файл должен лежать рядом с кодом)
 for _rt in _pyarmor_runtimes:
@@ -136,8 +151,9 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Что точно не нужно — уменьшает размер
-        'matplotlib', 'numpy', 'pandas', 'scipy',
+        # Что точно не нужно — уменьшает размер.
+        # ВАЖНО: numpy НЕ исключать — его импортирует camoufox.utils/locales.
+        'matplotlib', 'pandas', 'scipy',
         'tkinter', 'PIL.ImageQt',
     ],
     noarchive=False,

@@ -230,7 +230,7 @@ live-value стратегии.</b> Они используют тот же fast-
   <tr><th>Без cookies (работают сразу)</th><th>Нужны cookies</th></tr>
   <tr>
     <td>Fonbet, Pari, Olimp, Sportbet</td>
-    <td>Betcity, Leon, Marathon, LigaStavok, Winline, Zenit</td>
+    <td>Betcity, Leon, Marathon, LigaStavok, Winline, Zenit, Onewin</td>
   </tr>
 </table>
 

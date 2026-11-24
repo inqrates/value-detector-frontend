@@ -21,6 +21,7 @@ from .after_goal import (
     LigaStavokHandler,
     WinlineHandler,
     MarathonHandler,
+    OnewinHandler,
 )
 from core.browser_launcher import PatchrightBrowser
 from core.fast_client import (
@@ -94,12 +95,13 @@ HANDLERS = {
     "ligastavok": LigaStavokHandler,
     "winline": WinlineHandler,
     "marathon": MarathonHandler,
+    "onewin": OnewinHandler,
 }
 
 INSTANCE_BASED_HANDLERS = {
     BetcityHandler, OlimpHandler, FonbetHandler, SportbetHandler,
     ZenitHandler, LeonHandler, MarathonHandler, WinlineHandler, LigaStavokHandler,
-    PariHandler,
+    PariHandler, OnewinHandler,
 }
 
 AUTOBET_ENABLED_SPORTS_BY_BK = {
@@ -111,6 +113,7 @@ AUTOBET_ENABLED_SPORTS_BY_BK = {
     "marathon":   {"table_tennis", "volleyball", "basketball", "cyber_basketball"},
     "winline":    {"table_tennis", "volleyball", "basketball", "cyber_basketball"},
     "pari":       {"table_tennis", "volleyball", "basketball", "cyber_basketball"},
+    "onewin":     {"table_tennis", "volleyball", "basketball", "cyber_basketball"},
 }
 
 SIGNAL_TTL_BY_BK = {
@@ -124,6 +127,7 @@ SIGNAL_TTL_BY_BK = {
     "sportbet":   25.0,
     "marathon":   30.0,
     "zenit":      20.0,
+    "onewin":     20.0,
 }
 SIGNAL_TTL_DEFAULT = 25.0
 
@@ -141,6 +145,7 @@ LOAD_WAIT_BY_BK = {
     "ligastavok": 2500,
     "sportbet":   2500,
     "olimp":      3000,
+    "onewin":     3000,
 }
 LOAD_WAIT_DEFAULT = 500
 
@@ -219,6 +224,13 @@ LIVE_URLS = {
         'basketball': 'https://pari.ru/live/basketball',
         'cyber_basketball': 'https://pari.ru/live/basketball',
         'any': 'https://pari.ru/live',
+    },
+    'onewin': {
+        'table_tennis': 'https://one-vv7078.com/betting/live',
+        'volleyball': 'https://one-vv7078.com/betting/live',
+        'basketball': 'https://one-vv7078.com/betting/live',
+        'cyber_basketball': 'https://one-vv7078.com/betting/live',
+        'any': 'https://one-vv7078.com/betting/live',
     },
 }
 
@@ -4202,6 +4214,10 @@ class AfterGoalEngine:
             elif bk == 'winline':
                 bet_data['outcome_id'] = outcome_info.get('id')
                 bet_data['kf'] = best_bet['odd']
+            elif bk == 'onewin':
+                bet_data['outcome_id'] = outcome_info.get('id')
+                bet_data['kf'] = best_bet['odd']
+                bet_data['event_id'] = data.get('match_id')
             else:
                 logger.error(f"Отправка для БК {bk} не реализована")
                 return

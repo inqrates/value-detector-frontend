@@ -77,13 +77,25 @@ class SignalClient(QObject):
     def _get_ws_url_with_token(self) -> str:
         """
         Формирует URL с JWT-токеном: ws://host/ws?token=JWT
+        Если токен просрочен — продлевает по refresh.
         Если токен не найден — возвращает без токена.
         """
         try:
-            from ui.session_store import get_saved_tokens
+            from ui.session_store import (
+                get_saved_tokens, access_token_valid, refresh_access_token,
+            )
             tokens = get_saved_tokens()
             if tokens:
                 access_token, refresh_token = tokens
+                if not access_token_valid(access_token):
+                    # Продлеваем по refresh-токену
+                    new = refresh_access_token()
+                    if new:
+                        access_token = new
+                    else:
+                        # Refresh не удался — fallback без токена
+                        return self.url
+
                 sep = "&" if "?" in self.url else "?"
                 return f"{self.url}{sep}token={access_token}"
         except Exception as e:

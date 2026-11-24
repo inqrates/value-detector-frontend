@@ -32,6 +32,7 @@ LIVE_URLS: Dict[str, str] = {
     "ligastavok": "https://www.ligastavok.ru/live",
     "winline":    "https://winline.ru/live",
     "zenit":      "https://zenit.win/live",
+    "onewin":     "https://one-vv7078.com/betting/live",
 }
 
 # БК, для которых критично пройти Qrator (или аналогичный антибот)

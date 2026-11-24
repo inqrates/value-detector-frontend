@@ -51,6 +51,7 @@ BK_FILTER_VALUES = {
     "marathon":  "marathon",
     "zenit":     "zenit",
     "sportbet":  "sportbet",
+    "onewin":    "onewin",
 }
 
 BK_LABEL = {
@@ -64,6 +65,7 @@ BK_LABEL = {
     "marathon": "Marathon",
     "zenit": "Zenit",
     "sportbet": "Sportbet",
+    "onewin": "Onewin",
 }
 
 

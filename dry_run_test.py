@@ -180,7 +180,7 @@ def patch_all_handlers(only_bks: list = None):
     from ui.after_goal import (
         FonbetHandler, PariHandler, OlimpHandler, BetcityHandler,
         LeonHandler, ZenitHandler, LigaStavokHandler, WinlineHandler,
-        MarathonHandler, SportbetHandler,
+        MarathonHandler, SportbetHandler, OnewinHandler,
     )
     handlers = {
         "fonbet": FonbetHandler,
@@ -193,6 +193,7 @@ def patch_all_handlers(only_bks: list = None):
         "winline": WinlineHandler,
         "marathon": MarathonHandler,
         "sportbet": SportbetHandler,
+        "onewin": OnewinHandler,
     }
 
     patched = []

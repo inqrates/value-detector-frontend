@@ -27,7 +27,8 @@ from ui.profile_settings_dialog import ProfileSettingsDialog
 logger = logging.getLogger(__name__)
 
 BOOKMAKER_CHOICES = ["Fonbet", "Pari", "Winline", "Liga Stavok", "Leon",
-                     "Marathon", "Sportbet", "Olimp", "Betcity", "Zenit"]
+                     "Marathon", "Sportbet", "Olimp", "Betcity", "Zenit",
+                     "Onewin"]
 
 # Куда открывать вкладку при ручном открытии профиля (для логина в БК)
 BK_START_URLS = {
@@ -41,6 +42,7 @@ BK_START_URLS = {
     "olimp":      "https://www.olimp.bet/",
     "betcity":    "https://betcity.ru/ru/",
     "zenit":      "https://zenit.win/",
+    "onewin":     "https://one-vv7078.com/",
 }
 
 
@@ -240,7 +242,17 @@ class AccountsPage(QWidget):
     # ---------- Действия ----------
     def _on_save(self):
         login = self.login_edit.text().strip()
-        if not login:
+        profile = self.profile_edit.text().strip()
+
+        # Логин/пароль не обязательны: в БК мы логинимся в браузере
+        # профиля, а не формой отсюда. Для части БК (например Onewin)
+        # учётная запись нужна только как метка. Но хоть один из двух
+        # идентификаторов должен быть, иначе аккаунт нерабочий.
+        if not login and not profile:
+            QMessageBox.warning(
+                self, "Аккаунт",
+                "Укажи логин или ID профиля — иначе аккаунт не сохранится."
+            )
             return
 
         acc = {
@@ -249,7 +261,7 @@ class AccountsPage(QWidget):
             "password": self.pass_edit.text(),
             # Ключ сохранён для совместимости со strategies/dashboard.
             # Теперь это ID папки профиля Patchright, не AdsPower.
-            "ads_power_id": self.profile_edit.text().strip(),
+            "ads_power_id": profile,
         }
 
         if 0 <= self.edit_index < len(self.store.accounts):

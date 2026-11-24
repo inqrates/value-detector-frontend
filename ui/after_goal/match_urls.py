@@ -34,6 +34,13 @@ _SPORT_SLUGS = {
         "volleyball":       "volleyball",
         "basketball":       "basketball",
     },
+    "onewin": {
+        # 1win: матч открывается по ID, раздел спорта не обязателен
+        "table_tennis":     "live",
+        "volleyball":       "live",
+        "basketball":       "live",
+        "cyber_basketball": "live",
+    },
 }
 
 
@@ -77,5 +84,8 @@ def build_match_url(bk: str, payload: dict) -> Optional[str]:
     if bk == "sportbet":
         return (f"https://sportbet.ru/live/{sport_slug}/x--x/"
                 f"x-vs-x--{mid}?isTime=1&h=all&page=main")
+
+    if bk == "onewin":
+        return f"https://one-vv7078.com/betting/live/event/{mid}"
 
     return None

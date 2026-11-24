@@ -63,6 +63,7 @@ FAST_BKS_ALL: Dict[str, dict] = {
     "ligastavok": {"needs_cookies": True,   "method": "http_ws", "label": "LigaStavok"},
     "winline":    {"needs_cookies": True,   "method": "ws",      "label": "Winline"},
     "zenit":      {"needs_cookies": True,   "method": "http_ws", "label": "Zenit"},
+    "onewin":     {"needs_cookies": True,   "method": "http_ws", "label": "Onewin"},
 }
 
 ALL_FAST_BKS = FAST_BKS_ALL

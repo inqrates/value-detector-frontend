@@ -107,6 +107,15 @@ BK_MARKET_CAPABILITIES = {
         "it1_over", "it1_under", "it2_over", "it2_under",
         "odd", "point",
     },
+    "onewin": {
+        # По дампам 2026-11-24: winner/total/handicap/it/odd по фазам,
+        # point ("Ставки на очки"), race ("Первый до N").
+        "winner_1", "winner_2",
+        "total_over", "total_under",
+        "handicap_1", "handicap_2",
+        "it1_over", "it1_under", "it2_over", "it2_under",
+        "odd", "point", "race",
+    },
     "leon": {
         # Leon пока парсит только winner.
         "winner_1", "winner_2",

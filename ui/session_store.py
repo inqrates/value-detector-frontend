@@ -149,6 +149,105 @@ def clear_tokens() -> None:
         logger.warning(f"Не удалось удалить токены: {e}")
 
 
+# ════════════════════════════════════════════════════════════
+# Продление access-токена
+# ════════════════════════════════════════════════════════════
+# Access живёт 2 часа, WS-клиент ходит с ним вечно → через 2 часа
+# сервер отвечает 403 (Starlette отдаёт 403, когда обработчик закрывает
+# соединение до accept). Без продления приложение «ожидает» сигналы,
+# которых не приходит, и выглядит как упавший бэкенд.
+# Refresh-токен живёт столько же, сколько SESSION_TTL_SEC, поэтому
+# продление возможно весь срок жизни сохранённой сессии.
+
+ACCESS_REFRESH_MARGIN_SEC = 120      # продлеваем заранее, а не в ноль
+_last_refresh_at: float = 0.0
+REFRESH_MIN_INTERVAL_SEC = 30.0      # не дёргать /auth/refresh чаще
+
+
+def jwt_expires_at(token: str) -> int:
+    """exp из payload. Подпись НЕ проверяем — нам нужен только срок."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return int(data.get("exp", 0) or 0)
+    except Exception:
+        return 0
+
+
+def access_token_valid(token: str,
+                       margin: int = ACCESS_REFRESH_MARGIN_SEC) -> bool:
+    """True, если access-токен годен ещё дольше margin секунд."""
+    exp = jwt_expires_at(token)
+    return bool(exp) and exp > time.time() + margin
+
+
+def refresh_access_token() -> Optional[str]:
+    """
+    Продлевает access по сохранённому refresh-токену.
+    Возвращает свежий access (и сохраняет его) либо None — тогда
+    нужна повторная авторизация.
+    """
+    global _last_refresh_at
+
+    tokens = get_saved_tokens()
+    if not tokens:
+        return None
+    access, refresh = tokens
+    if access_token_valid(access):
+        return access
+    if not refresh:
+        return None
+
+    # Защита от штурма сервера, если refresh стабильно отклоняют
+    now = time.time()
+    if now - _last_refresh_at < REFRESH_MIN_INTERVAL_SEC:
+        return None
+    _last_refresh_at = now
+
+    try:
+        import requests
+        from ui.config_loader import load_config
+        backend_url = load_config().get(
+            "backend_url", "http://localhost:8000")
+
+        try:
+            from ui.ssl_cert import build_requests_verify
+            verify_target = build_requests_verify()
+        except Exception:
+            verify_target = True
+
+        r = requests.post(
+            f"{backend_url}/auth/refresh",
+            json={"refresh_token": refresh},
+            timeout=5,
+            headers={
+                "User-Agent": "ValueDetectorPro/1.0",
+                "Content-Type": "application/json",
+            },
+            verify=verify_target,
+        )
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"JWT refresh запрос не прошёл: {e}")
+        return None
+
+    new_access = data.get("access_token", "") if data.get("success") else ""
+    if not new_access:
+        logger.warning(
+            f"JWT refresh отклонён сервером: {data.get('message', '')!r}"
+        )
+        return None
+
+    save_session_tokens(
+        login=user_session.login or data.get("login", ""),
+        access_token=new_access,
+        refresh_token=refresh,
+    )
+    logger.info("JWT access-токен продлён")
+    return new_access
+
+
 def try_restore_session() -> bool:
     """
     Пытается восстановить сессию при старте.
